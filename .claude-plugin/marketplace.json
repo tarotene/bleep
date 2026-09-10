@@ -1,0 +1,12 @@
+{
+  "name": "publish-guard",
+  "owner": {
+    "name": "Kentaro Sugimoto"
+  },
+  "plugins": [
+    {
+      "name": "publish-guard",
+      "source": "./"
+    }
+  ]
+}
