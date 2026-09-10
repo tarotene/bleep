@@ -17,5 +17,8 @@ jobs:
           scandir: '.'
           severity: error
 
-      - name: selftest
+      - name: selftest (core CLI)
         run: ./publish-guard selftest
+
+      - name: selftest (Claude plugin adapter)
+        run: ./hooks/claude-adapter.sh --selftest

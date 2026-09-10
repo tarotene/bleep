@@ -1,0 +1,14 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash|mcp__.*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/claude-adapter.sh",
+          "timeout": 20
+        }
+      ]
+    }
+  ]
+}
