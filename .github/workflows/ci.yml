@@ -22,3 +22,9 @@ jobs:
 
       - name: selftest (Claude plugin adapter)
         run: ./hooks/claude-adapter.sh --selftest
+
+      - name: selftest (Codex adapter)
+        run: ./adapters/codex-adapter.sh --selftest
+
+      - name: selftest (Copilot adapter)
+        run: ./adapters/copilot-adapter.sh --selftest
