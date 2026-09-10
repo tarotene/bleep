@@ -1,0 +1,6 @@
+# OS / editor noise
+.DS_Store
+*.swp
+
+# selftest scratch (selftest uses mktemp -d, but guard stray local runs)
+/.tmp/
