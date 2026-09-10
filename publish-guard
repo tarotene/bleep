@@ -1,0 +1,797 @@
+#!/usr/bin/env bash
+# publish-guard — 会社/private リポジトリの実名が PUBLIC な面(git push・
+# gh pr/issue の create/edit/comment・任意テキスト)に漏れるのを防ぐための
+# エージェント非依存の判定エンジン。
+#
+# これは security boundary ではない。制約される当事者(エージェント、または
+# 手打ちする人間)が github.com に直接ブラウザで打ち込む経路はどう転んでも
+# 仲介できないし、hook のタイムアウトや PUBLISH_GUARD_ALLOW=1 で無効化もできる。
+# 事故とエージェントの滑りに対するガードレールとして使うこと。詳細は README。
+#
+# 判定は3段階(exit code で表現):
+#   0 = pass  — denylist に一致しない
+#   1 = ask   — denylist 上の org 名が裸の単語で単体出現(メールドメイン等の
+#               正当な用途と衝突しうるため deny にしない)
+#   2 = deny  — "org/repo" 形式(URL も含む)、または denylist に登録された
+#               具体的なリポジトリ名の裸の単語一致(ほぼ確実に意図しない漏洩)
+# ask/deny では stdout に理由を1行印字する。pass では何も印字しない。
+#
+# denylist は一切コミットしない(「ツールは公開・データはローカル」原則):
+#   $XDG_CONFIG_HOME/publish-guard/orgs.txt   — 1行1 org 名(手書きが必要なのは
+#                                               実質これだけ)
+#   $XDG_CONFIG_HOME/publish-guard/repos.txt  — 1行1 "org/repo"(任意)
+#   自分の private/internal リポジトリ名は、orgs.txt に書いた org 名 +
+#   (PUBLISH_GUARD_OWNER が空なら `gh api user` で自動導出する)現在の
+#   gh 認証ユーザから、各自の credential で live 導出して TTL 付きで
+#   キャッシュする。リポジトリ名のリストそのものは誰も持ち運ばない。
+#
+# 誤検知の受け皿(gitleaks の [[allowlists]] と同型の3軸):
+#   $XDG_CONFIG_HOME/publish-guard/allow-stopwords.txt — 単語単位で denylist
+#     から除外する(組み込みで ".github" を既定値として持つ — GitHub の
+#     org-wide デフォルト用の特殊リポジトリで、ファイルパスや URL の断片
+#     としてどこにでも出現するため)。
+#   $XDG_CONFIG_HOME/publish-guard/allow-regexes.txt   — この正規表現が
+#     scan 対象テキストにマッチしたら ask 判定だけを無効化する(deny は
+#     無効化しない — 「ほぼ確実に意図しない漏洩」の強さを緩めないため)。
+#   $XDG_CONFIG_HOME/publish-guard/allow-paths.txt      — audit 対象から
+#     除外するファイルパスの正規表現。
+#
+# 縮退(ADR-0005 の binary-existence gating に倣う): fail-loud に寄せている。
+# 判定不能を無言の pass にはしない(下記の各関数のコメント参照)。ただし
+# hook のタイムアウトで停止した場合はこのプロセス自体が動かないため防げない
+# — これは構造的な限界であり README に明記する。
+#
+# 使い方:
+#   publish-guard scan [FILE]              stdin(既定)または FILE の内容を
+#                                           そのまま denylist と突き合わせる。
+#                                           MCP tool_input 等、任意のテキスト向け。
+#   publish-guard scan-push                cwd の git リポジトリで、これから
+#                                           push する差分(diff + commit log)
+#                                           を検査する。対象リポジトリが
+#                                           PRIVATE/INTERNAL と判明していれば
+#                                           検査自体をスキップする。
+#   publish-guard scan-bash-command CMD     シェルコマンド文字列を検査する。
+#                                           "gh pr|issue create/edit/comment"
+#                                           形は CMD 全体を、"git push" 形は
+#                                           scan-push と同じ diff+log を検査
+#                                           する。他の形は無検査で pass。
+#   publish-guard audit [path...] [--remote]
+#                                           指定ファイル(省略時は git ls-files
+#                                           全体)を同じ denylist で検査する。
+#                                           --remote で open な Issue/PR の
+#                                           title/body も対象に含める。
+#   publish-guard refresh-cache            private/internal リポジトリ一覧
+#                                           キャッシュを強制更新する。
+#   publish-guard selftest                 回帰テスト(スタブ gh/git)。
+set -euo pipefail
+
+SELF="$(realpath "$0")"
+TEST_TMP=''
+
+# init_vars: env から派生変数を(再)計算する。selftest が env を export した
+# 「後」に呼び直せるよう関数化してある — トップレベルで一度だけ計算すると、
+# selftest 内で export した値が既に評価済みの変数に反映されない。
+init_vars() {
+  CONFIG_DIR="${PUBLISH_GUARD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/publish-guard}"
+  STATE_DIR="${PUBLISH_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/publish-guard}"
+  ORGS_FILE="${PUBLISH_GUARD_ORGS_FILE:-$CONFIG_DIR/orgs.txt}"
+  REPOS_FILE="${PUBLISH_GUARD_REPOS_FILE:-$CONFIG_DIR/repos.txt}"
+  ALLOW_STOPWORDS_FILE="${PUBLISH_GUARD_ALLOW_STOPWORDS_FILE:-$CONFIG_DIR/allow-stopwords.txt}"
+  ALLOW_REGEXES_FILE="${PUBLISH_GUARD_ALLOW_REGEXES_FILE:-$CONFIG_DIR/allow-regexes.txt}"
+  ALLOW_PATHS_FILE="${PUBLISH_GUARD_ALLOW_PATHS_FILE:-$CONFIG_DIR/allow-paths.txt}"
+  OWNER="${PUBLISH_GUARD_OWNER:-}"
+  GH_BIN="${PUBLISH_GUARD_GH_BIN:-gh}"
+  CACHE_TTL="${PUBLISH_GUARD_CACHE_TTL:-86400}"
+  PRIVATE_CACHE="$STATE_DIR/private-repos-cache.txt"
+  VIS_CACHE="$STATE_DIR/visibility-cache.tsv"
+  OWNER_CACHE="$STATE_DIR/owner-login-cache.txt"
+}
+init_vars
+
+usage() {
+  cat <<'EOF'
+usage: publish-guard <scan [FILE]|scan-push|scan-bash-command CMD|
+                       audit [path...] [--remote]|refresh-cache|selftest>
+
+エージェント非依存の denylist 判定エンジン。scan/scan-push/scan-bash-command
+は exit code で判定を返す: 0=pass, 1=ask(理由を stdout に1行), 2=deny(同)。
+PUBLISH_GUARD_ALLOW=1 で3つの scan* サブコマンドを意識的に bypass できる
+(README にのみ記載 — 判定結果の理由文には出さない)。
+
+設定は $XDG_CONFIG_HOME/publish-guard/ 以下、一切コミットしない:
+  orgs.txt / repos.txt / allow-stopwords.txt / allow-regexes.txt / allow-paths.txt
+EOF
+}
+
+read_lines() { # $1=file; コメント行・空行を除いて出力。ファイル無しは無出力。
+  [[ -f "$1" ]] || return 0
+  grep -Ev '^[[:space:]]*(#|$)' "$1"
+}
+
+# ---- allowlist(gitleaks の [[allowlists]] と同型の3軸)----------------------
+
+DEFAULT_STOPWORDS=(.github)
+ALLOW_STOPWORDS=()
+ALLOW_REGEXES=()
+ALLOW_PATHS=()
+
+load_allowlist() {
+  ALLOW_STOPWORDS=("${DEFAULT_STOPWORDS[@]}")
+  local w
+  while IFS= read -r w; do
+    [[ -n $w ]] && ALLOW_STOPWORDS+=("$w")
+  done < <(read_lines "$ALLOW_STOPWORDS_FILE")
+
+  ALLOW_REGEXES=()
+  while IFS= read -r w; do
+    [[ -n $w ]] && ALLOW_REGEXES+=("$w")
+  done < <(read_lines "$ALLOW_REGEXES_FILE")
+
+  ALLOW_PATHS=()
+  while IFS= read -r w; do
+    [[ -n $w ]] && ALLOW_PATHS+=("$w")
+  done < <(read_lines "$ALLOW_PATHS_FILE")
+}
+
+is_stopword() { # $1=word
+  local w
+  for w in "${ALLOW_STOPWORDS[@]}"; do
+    [[ "$1" == "$w" ]] && return 0
+  done
+  return 1
+}
+
+# filter_stopwords: nameref 経由で配列から ALLOW_STOPWORDS に載っている
+# 要素を除く(bash 4.3+ の -n を使う。mapfile/BASH_REMATCH 等、既存コードが
+# 既に前提する bash バージョンの範囲内)。
+filter_stopwords() { # $1=array の変数名
+  local -n arr="$1"
+  local -a kept=()
+  local w
+  for w in "${arr[@]}"; do
+    is_stopword "$w" || kept+=("$w")
+  done
+  arr=("${kept[@]}")
+}
+
+# text_allow_suppressed: scan 対象テキスト全体に allow-regexes のいずれかが
+# マッチしたら 0 を返す。match_verdict() は ask 判定だけをこれで無効化する
+# — deny(org/repo 明示参照・具体リポ名一致)は「ほぼ確実に意図しない漏洩」
+# なので、周辺文脈の正規表現一致では緩めない。
+text_allow_suppressed() { # $1=text
+  local text="$1" re
+  ((${#ALLOW_REGEXES[@]} > 0)) || return 1
+  for re in "${ALLOW_REGEXES[@]}"; do
+    grep -Eq -- "$re" <<< "$text" && return 0
+  done
+  return 1
+}
+
+path_allow_suppressed() { # $1=path
+  local path="$1" re
+  ((${#ALLOW_PATHS[@]} > 0)) || return 1
+  for re in "${ALLOW_PATHS[@]}"; do
+    grep -Eq -- "$re" <<< "$path" && return 0
+  done
+  return 1
+}
+
+# ---- org/repo のライブ導出 --------------------------------------------------
+
+# resolve_owner_login: PUBLISH_GUARD_OWNER が空なら、現在の gh 認証ユーザの
+# login を `gh api user` から live 導出して TTL 付きでキャッシュする。これで
+# 「手書きが必要なのは orgs.txt の org 名だけ」になる — 自分のリポジトリの
+# 検査は誰にとっても導入即有効。
+resolve_owner_login() {
+  if [[ -n $OWNER ]]; then
+    printf '%s' "$OWNER"
+    return 0
+  fi
+  local now mtime
+  now="$(date +%s)"
+  if [[ -f $OWNER_CACHE ]]; then
+    mtime="$(stat -c %Y "$OWNER_CACHE" 2>/dev/null || stat -f %m "$OWNER_CACHE" 2>/dev/null || printf 0)"
+    if (( now - mtime < CACHE_TTL )); then
+      cat "$OWNER_CACHE"
+      return 0
+    fi
+  fi
+  local login
+  login="$("$GH_BIN" api user --jq .login 2>/dev/null)" || return 1
+  [[ -n $login ]] || return 1
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$login" > "$OWNER_CACHE"
+  printf '%s' "$login"
+}
+
+# refresh_private_repo_cache: 自分の owner 一件 + orgs.txt に書かれた org 名
+# それぞれについて、private と internal(gh repo list の --visibility は
+# 単一値しか取らないため2回に分ける)のリポジトリ名を live 取得してキャッシュ
+# する(プレーンテキスト、1行1名。jq 不要 — gh の --jq は内蔵の gojq を使う
+# ため、ローカル jq バイナリに依存しない)。1件でも取得できれば成功とし、
+# 全滅した場合だけ失敗を返す(呼び出し側は古いキャッシュにフォールバック)。
+refresh_private_repo_cache() {
+  mkdir -p "$STATE_DIR"
+  local -a owners=()
+  local owner org
+  owner="$(resolve_owner_login)" && [[ -n $owner ]] && owners+=("$owner")
+  while IFS= read -r org; do
+    [[ -n $org ]] || continue
+    owners+=("$org")
+  done < <(read_lines "$ORGS_FILE")
+  ((${#owners[@]} > 0)) || return 1
+
+  local tmp got_any=false o vis names
+  tmp="$(mktemp "$STATE_DIR/private-repos-cache.txt.XXXXXX")"
+  : > "$tmp"
+  for o in "${owners[@]}"; do
+    for vis in private internal; do
+      if names="$("$GH_BIN" repo list "$o" --visibility "$vis" --limit 500 --json name --jq '.[].name' 2>/dev/null)"; then
+        [[ -n $names ]] && { printf '%s\n' "$names" >> "$tmp"; got_any=true; }
+      fi
+    done
+  done
+  if [[ $got_any == true ]]; then
+    sort -u "$tmp" -o "$tmp"
+    mv "$tmp" "$PRIVATE_CACHE"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# private_repo_names: キャッシュが TTL 内ならそれを、無ければ live 取得して
+# 出力する。live 取得に失敗し、古いキャッシュも無ければ何も出力しない
+# (denylist が空になるだけで、検査自体は他の denylist で継続する — orgs.txt/
+# repos.txt が空でなければそれらは引き続き効く)。
+private_repo_names() {
+  local now mtime
+  now="$(date +%s)"
+  if [[ -f $PRIVATE_CACHE ]]; then
+    mtime="$(stat -c %Y "$PRIVATE_CACHE" 2>/dev/null || stat -f %m "$PRIVATE_CACHE" 2>/dev/null || printf 0)"
+    if (( now - mtime < CACHE_TTL )); then
+      cat "$PRIVATE_CACHE"
+      return 0
+    fi
+  fi
+  refresh_private_repo_cache || true
+  [[ -f $PRIVATE_CACHE ]] && cat "$PRIVATE_CACHE"
+  return 0
+}
+
+# ---- denylist パターン構築 + 判定 ------------------------------------------
+
+# build_patterns: denylist 3種を集めて3つのパターン配列をグローバル変数に積み、
+# allow-stopwords で WORD_HARD/WORD_WARN をフィルタする。
+#   PLAIN_PATTERNS  — スラッシュを含む固定文字列。-w は使わない(末尾が "/" の
+#                     パターンは -w だと理論上一致し得ない — \> は直前の文字が
+#                     word 文字であることを要求するため、"/" 終端では常に不成立)。
+#                     stopwords は適用しない — "org/repo" 形の明示参照は
+#                     単語単体より曖昧性が無いため。
+#   WORD_HARD       — 裸のリポ名(単語境界一致、hard-deny)。
+#   WORD_WARN       — 裸の org 名(単語境界一致、ask)。
+PLAIN_PATTERNS=()
+WORD_HARD=()
+WORD_WARN=()
+build_patterns() {
+  PLAIN_PATTERNS=() WORD_HARD=() WORD_WARN=()
+  local org nwo repo
+  while IFS= read -r org; do
+    [[ -n $org ]] || continue
+    PLAIN_PATTERNS+=("${org}/")
+    WORD_WARN+=("$org")
+  done < <(read_lines "$ORGS_FILE")
+
+  while IFS= read -r nwo; do
+    [[ -n $nwo ]] || continue
+    PLAIN_PATTERNS+=("$nwo")
+    repo="${nwo#*/}"
+    [[ -n $repo && $repo != "$nwo" ]] && WORD_HARD+=("$repo")
+  done < <(read_lines "$REPOS_FILE")
+
+  while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    WORD_HARD+=("$repo")
+  done < <(private_repo_names)
+
+  load_allowlist
+  filter_stopwords WORD_HARD
+  filter_stopwords WORD_WARN
+}
+
+# match_verdict: $1 の中身を denylist と突き合わせ、"deny"/"ask" を印字して
+# 0 を返す。どちらにも一致しなければ何も印字せず非 0 を返す。
+match_verdict() {
+  local text="$1"
+  if ((${#PLAIN_PATTERNS[@]} > 0)) && grep -Fqf <(printf '%s\n' "${PLAIN_PATTERNS[@]}") <<< "$text"; then
+    printf 'deny'
+    return 0
+  fi
+  if ((${#WORD_HARD[@]} > 0)) && grep -Fwqf <(printf '%s\n' "${WORD_HARD[@]}") <<< "$text"; then
+    printf 'deny'
+    return 0
+  fi
+  if ((${#WORD_WARN[@]} > 0)) && grep -Fwqf <(printf '%s\n' "${WORD_WARN[@]}") <<< "$text"; then
+    text_allow_suppressed "$text" && return 1
+    printf 'ask'
+    return 0
+  fi
+  return 1
+}
+
+verdict_reason() { # $1=deny|ask -> 理由文(bypass 手段はここに書かない。README 参照)
+  case "$1" in
+    deny) printf 'denylist に登録された company/private リポジトリの参照と一致しました。' ;;
+    ask) printf 'denylist に登録された org 名の裸の単体出現と一致しました。正当な用途(例: メールドメイン)か確認してください。' ;;
+  esac
+}
+
+emit_verdict() { # $1=deny|ask $2=reason -> 理由を印字し、対応する exit code で終了
+  printf '%s\n' "$2"
+  case "$1" in
+    deny) exit 2 ;;
+    ask) exit 1 ;;
+  esac
+}
+
+# ---- push 差分 / リポジトリ可視性 ------------------------------------------
+
+# resolve_default_branch: scripts/git-audit-worktrees(dotfiles)の同名関数と
+# 同じ idiom。cwd のリポジトリに対して行う。
+resolve_default_branch() {
+  local ref b
+  ref="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || ref=""
+  if [[ -n $ref ]]; then
+    printf '%s' "${ref#origin/}"
+    return 0
+  fi
+  for b in main master; do
+    git show-ref --verify --quiet "refs/heads/$b" && { printf '%s' "$b"; return 0; }
+  done
+  printf ''
+}
+
+# compute_push_diff_text: これから push する範囲のファイル差分 + コミット
+# メッセージを連結して出力する。default branch / merge-base が解決できない
+# 場合は非 0 を返し、PUSH_DIFF_FAIL_REASON に理由をセットする(fail-loud —
+# 呼び出し側はこれを ask にエスカレートする。無言の pass にはしない)。
+PUSH_DIFF_FAIL_REASON=''
+compute_push_diff_text() {
+  PUSH_DIFF_FAIL_REASON=''
+  local default_branch base
+  default_branch="$(resolve_default_branch)"
+  if [[ -z $default_branch ]]; then
+    PUSH_DIFF_FAIL_REASON='default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。'
+    return 1
+  fi
+  base="$(git merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
+  if [[ -z $base ]]; then
+    PUSH_DIFF_FAIL_REASON="origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性)。"
+    return 1
+  fi
+  git diff "$base"..HEAD 2>/dev/null
+  git log --format=%B "$base"..HEAD 2>/dev/null
+  return 0
+}
+
+# resolve_repo_nwo: $1(省略可)がシェルコマンド文字列なら --repo/-R 明示
+# 指定を優先し、無ければ(または $1 が空なら)cwd の origin リモートから
+# owner/repo を導出する。どちらも取れなければ非 0。
+resolve_repo_nwo() {
+  local cmd="${1-}"
+  if [[ -n $cmd ]] && [[ $cmd =~ (--repo|-R)[=\ ]+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  local url
+  url="$(git remote get-url origin 2>/dev/null)" || return 1
+  url="${url%.git}"
+  url="${url#git@github.com:}"
+  url="${url#https://github.com/}"
+  url="${url#ssh://git@github.com/}"
+  [[ -n $url && $url == */* ]] || return 1
+  printf '%s' "$url"
+}
+
+# repo_visibility: $1=owner/repo -> PUBLIC/PRIVATE/INTERNAL/UNKNOWN。
+# TTL 付きキャッシュ(TSV: nwo, visibility, checked-at epoch)。取得に失敗したら
+# UNKNOWN を返す — 呼び出し側は UNKNOWN を PUBLIC と同じ扱い(検査続行)にする
+# (判定不能を「検査しない理由」にしない fail-loud の一環)。
+repo_visibility() {
+  local nwo="$1" now line r v t
+  now="$(date +%s)"
+  if [[ -f $VIS_CACHE ]]; then
+    while IFS=$'\t' read -r r v t; do
+      [[ $r == "$nwo" ]] || continue
+      if (( now - t < CACHE_TTL )); then
+        printf '%s' "$v"
+        return 0
+      fi
+      break
+    done < "$VIS_CACHE"
+  fi
+  local vis
+  vis="$("$GH_BIN" repo view "$nwo" --json visibility --jq .visibility 2>/dev/null)" || vis=""
+  [[ -n $vis ]] || { printf 'UNKNOWN'; return 0; }
+  mkdir -p "$STATE_DIR"
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/visibility-cache.tsv.XXXXXX")"
+  { [[ -f $VIS_CACHE ]] && awk -F'\t' -v r="$nwo" '$1 != r' "$VIS_CACHE"
+    printf '%s\t%s\t%s\n' "$nwo" "$vis" "$now"; } > "$tmp"
+  mv "$tmp" "$VIS_CACHE"
+  printf '%s' "$vis"
+}
+
+# ---- サブコマンド -----------------------------------------------------------
+
+# cmd_scan: 任意のテキスト(stdin または FILE)を denylist と突き合わせる。
+# MCP tool_input など、シェルコマンド文字列でない入力全般が対象。stdin/FILE
+# を読めなければ ask にエスカレートする(以前は無言 exit 0 だった)。
+cmd_scan() {
+  local src="${1--}" text
+  if [[ $src == "-" || -z $src ]]; then
+    if ! text="$(cat)"; then
+      printf 'stdin を読み取れませんでした。\n'
+      exit 1
+    fi
+  else
+    if ! text="$(cat "$src" 2>/dev/null)"; then
+      printf '%s を読み取れませんでした。\n' "$src"
+      exit 1
+    fi
+  fi
+  build_patterns
+  local verdict
+  if verdict="$(match_verdict "$text")"; then
+    emit_verdict "$verdict" "$(verdict_reason "$verdict")"
+  fi
+  exit 0
+}
+
+# cmd_scan_push: cwd の git リポジトリで、これから push する差分を検査する。
+# 対象リポジトリが PRIVATE/INTERNAL と判明していれば検査自体をスキップする
+# (これは「検査しない」という正当な判定であり、fail-loud の対象ではない)。
+# diff/log 自体が計算できない場合は ask にエスカレートする(以前は無言 exit 0)。
+cmd_scan_push() {
+  local nwo vis
+  nwo="$(resolve_repo_nwo)" || nwo=""
+  if [[ -n $nwo ]]; then
+    vis="$(repo_visibility "$nwo")"
+    [[ $vis == PRIVATE || $vis == INTERNAL ]] && exit 0
+  fi
+
+  local text
+  if ! text="$(compute_push_diff_text)"; then
+    printf 'push 差分を検査できませんでした: %s\n' "$PUSH_DIFF_FAIL_REASON"
+    exit 1
+  fi
+  build_patterns
+  local verdict
+  if verdict="$(match_verdict "$text")"; then
+    emit_verdict "$verdict" "$(verdict_reason "$verdict")"
+  fi
+  exit 0
+}
+
+# cmd_scan_bash_command: シェルコマンド文字列の形を見て、"gh pr|issue
+# create/edit/comment" なら CMD 全体を、"git push" なら scan-push と同じ
+# diff+log を検査する。どちらの形でもなければ無検査で pass(フォールスルー
+# — jq や gh を一切叩かない高速経路)。Claude/Codex/Copilot の Bash 系
+# adapter が共通で呼ぶ、シェルコマンド用の唯一の判定入口。
+cmd_scan_bash_command() {
+  local cmd="${1-}"
+  [[ -n $cmd ]] || { usage >&2; exit 2; }
+
+  if [[ $cmd =~ (^|[^[:alnum:]_])gh[[:space:]]+(pr|issue)[[:space:]]+(create|edit|comment)([^[:alnum:]_]|$) ]]; then
+    local nwo vis
+    nwo="$(resolve_repo_nwo "$cmd")" || nwo=""
+    if [[ -n $nwo ]]; then
+      vis="$(repo_visibility "$nwo")"
+      [[ $vis == PRIVATE || $vis == INTERNAL ]] && exit 0
+    fi
+    build_patterns
+    local verdict
+    if verdict="$(match_verdict "$cmd")"; then
+      emit_verdict "$verdict" "$(verdict_reason "$verdict")"
+    fi
+    exit 0
+  fi
+
+  if [[ $cmd =~ (^|[^[:alnum:]_])git[[:space:]]+push([^[:alnum:]_]|$) ]]; then
+    cmd_scan_push
+    return
+  fi
+
+  exit 0
+}
+
+audit() {
+  local remote=false
+  local -a paths=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remote) remote=true ;;
+      *) paths+=("$1") ;;
+    esac
+    shift
+  done
+
+  build_patterns
+  local hit=0 verdict content
+
+  if ((${#paths[@]} == 0)); then
+    mapfile -t paths < <(git ls-files 2>/dev/null)
+  fi
+  local f
+  for f in "${paths[@]}"; do
+    [[ -f $f ]] || continue
+    path_allow_suppressed "$f" && continue
+    content="$(cat "$f" 2>/dev/null)"
+    if verdict="$(match_verdict "$content")"; then
+      printf '%s: file=%s\n' "$verdict" "$f"
+      hit=1
+    fi
+  done
+
+  if [[ $remote == true ]] && command -v "$GH_BIN" > /dev/null 2>&1; then
+    local n title body
+    while IFS=$'\t' read -r n title body; do
+      [[ -n $n ]] || continue
+      if verdict="$(match_verdict "$title"$'\n'"$body")"; then
+        printf '%s: issue=#%s\n' "$verdict" "$n"
+        hit=1
+      fi
+    done < <("$GH_BIN" issue list --state open --limit 200 --json number,title,body \
+      --jq '.[] | [.number, .title, (.body // "" | gsub("\n";" "))] | @tsv' 2> /dev/null)
+    while IFS=$'\t' read -r n title body; do
+      [[ -n $n ]] || continue
+      if verdict="$(match_verdict "$title"$'\n'"$body")"; then
+        printf '%s: pr=#%s\n' "$verdict" "$n"
+        hit=1
+      fi
+    done < <("$GH_BIN" pr list --state open --limit 200 --json number,title,body \
+      --jq '.[] | [.number, .title, (.body // "" | gsub("\n";" "))] | @tsv' 2> /dev/null)
+  fi
+
+  if [[ $hit -eq 0 ]]; then
+    printf '残存ヒットはありません。\n'
+  fi
+  return $hit
+}
+
+selftest() {
+  local tmp
+  tmp="$(mktemp -d)"
+  TEST_TMP="$tmp"
+  trap 'rm -rf "$TEST_TMP"' EXIT
+
+  export PUBLISH_GUARD_CONFIG_DIR="$tmp/config"
+  export PUBLISH_GUARD_STATE_DIR="$tmp/state"
+  export PUBLISH_GUARD_ORGS_FILE="$tmp/config/orgs.txt"
+  export PUBLISH_GUARD_REPOS_FILE="$tmp/config/repos.txt"
+  export PUBLISH_GUARD_ALLOW_STOPWORDS_FILE="$tmp/config/allow-stopwords.txt"
+  export PUBLISH_GUARD_ALLOW_REGEXES_FILE="$tmp/config/allow-regexes.txt"
+  export PUBLISH_GUARD_ALLOW_PATHS_FILE="$tmp/config/allow-paths.txt"
+  export PUBLISH_GUARD_OWNER="test-owner"
+  init_vars # export しただけでは既に評価済みの変数に反映されないため明示的に再計算する
+  mkdir -p "$tmp/config" "$tmp/state"
+  printf 'acme\n' > "$PUBLISH_GUARD_ORGS_FILE"
+  printf 'acme/secret-project\n' > "$PUBLISH_GUARD_REPOS_FILE"
+
+  # gh をスタブし、private/internal リポ一覧の live 取得を固定内容にする。
+  # 実際の呼び出しは常に --jq を付ける(--json name --jq '.[].name' /
+  # --json visibility --jq .visibility)ので、スタブも jq 適用後の値を返す。
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+# repo list は private/internal どちらの呼び出しでも同じ名前を返す(重複は
+# refresh_private_repo_cache 側の sort -u が畳む)。テストが見たいのは
+# 「orgs.txt の org 名だけから private リポ名が導出される」という経路の
+# 有無であり、private/internal の呼び分け自体は本体側の実装(--visibility
+# を private/internal で2回呼ぶ)でカバーする。
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view") printf 'PUBLIC' ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod +x "$tmp/bin-gh"
+  export PUBLISH_GUARD_GH_BIN="$tmp/bin-gh"
+  init_vars
+
+  local fails=0
+  expect_verdict() { # $1=expected(deny/ask/pass) $2=text
+    local got
+    build_patterns
+    if got="$(match_verdict "$2")"; then :; else got="pass"; fi
+    if [[ $got != "$1" ]]; then
+      echo "FAIL(期待=$1, 実際=$got): $2" >&2
+      fails=$((fails + 1))
+    fi
+  }
+
+  # hard-deny: org/repo 形式(URL に埋め込まれていても)
+  expect_verdict deny "参照: acme/secret-project の話"
+  expect_verdict deny "https://github.com/acme/secret-project/issues/1"
+  # hard-deny: repos.txt の裸のリポ名単体
+  expect_verdict deny "secret-project の CI が壊れている"
+  # hard-deny: 自分の private リポ名(live 取得したキャッシュ)
+  expect_verdict deny "my-private-tool のドリフトを見つけた"
+  # ask: org 名の裸の単体出現(スラッシュ無し)
+  expect_verdict ask "会社は acme という名前です"
+  expect_verdict ask "user@acmecorp.example のような紛らわしいドメインではなく単語一致 acme のみ"
+  # pass: 無関係
+  expect_verdict pass "これは無関係な文章です"
+  expect_verdict pass "academia という単語だけの文章"
+
+  # 改行直後の単語境界(adapter が tool_input を丸ごと文字列化するときの
+  # 回帰 — 実改行であれば単語境界は正しく機能する。adapter 側のテスト
+  # (hooks/claude-adapter に付く selftest)で、JSON エスケープ由来の
+  # "\n"(バックスラッシュ+n)がここを壊さないことを別途確認する)。
+  expect_verdict deny "見つけた件
+secret-project は失敗した"
+  expect_verdict ask "検討メモ
+acme で議論した"
+
+  # allow-stopwords: 組み込みの .github は既定で denylist に入らない
+  printf 'acme/.github\n' > "$PUBLISH_GUARD_REPOS_FILE"
+  expect_verdict pass ".github の workflows を見た"
+  printf 'acme/secret-project\n' > "$PUBLISH_GUARD_REPOS_FILE"
+
+  # allow-stopwords: ユーザ定義の追加 stopword
+  printf 'widget\n' > "$PUBLISH_GUARD_ALLOW_STOPWORDS_FILE"
+  printf 'acme/widget\n' >> "$PUBLISH_GUARD_REPOS_FILE"
+  expect_verdict pass "widget の話"
+  : > "$PUBLISH_GUARD_ALLOW_STOPWORDS_FILE"
+  printf 'acme/secret-project\n' > "$PUBLISH_GUARD_REPOS_FILE"
+
+  # allow-regexes: ask だけを無効化する(deny は緩めない)
+  printf 'acme-forum\\.example' > "$PUBLISH_GUARD_ALLOW_REGEXES_FILE"
+  expect_verdict pass "問い合わせは acme-forum.example の acme 宛"
+  : > "$PUBLISH_GUARD_ALLOW_REGEXES_FILE"
+
+  # gather 相当: gh/git push の検出とフォールスルー(scan-bash-command 経由)
+  local out rc
+  set +e
+  (cd "$tmp" && "$SELF" scan-bash-command 'echo hello') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL: 無関係なコマンドを deny/ask 扱いした(rc=$rc)" >&2; fails=$((fails + 1)); }
+
+  # git push の diff スキャン(実リポで検証)
+  local repo="$tmp/repo"
+  mkdir -p "$repo"
+  git -C "$repo" init -qb main
+  git -C "$repo" config core.hooksPath /dev/null
+  git -C "$repo" config user.email test@example.invalid
+  git -C "$repo" config user.name test
+  git -C "$repo" config commit.gpgsign false
+  echo "clean content" > "$repo/a.txt"
+  git -C "$repo" add a.txt
+  git -C "$repo" commit -qm initial
+  git init -q --bare "$tmp/remote.git"
+  git -C "$repo" remote add origin "$tmp/remote.git"
+  git -C "$repo" push -q origin main
+  git -C "$repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  echo "acme/secret-project が話題" >> "$repo/a.txt"
+  git -C "$repo" add a.txt
+  git -C "$repo" commit -qm "mentions acme/secret-project"
+
+  local pushdir
+  pushdir="$(cd "$repo" && compute_push_diff_text)"
+  [[ $pushdir == *"acme/secret-project"* ]] || {
+    echo "FAIL: compute_push_diff_text が diff 内の denylist 文字列を拾わなかった" >&2
+    fails=$((fails + 1))
+  }
+
+  # scan-bash-command: 実際の Bash tool_input 相当の入力で deny/ask/フォールスルー
+  set +e
+  (cd "$repo" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(scan-bash-command git push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  (cd "$repo" && "$SELF" scan-bash-command 'gh pr create --title t --body "acme is our employer"') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(scan-bash-command gh pr create ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  (cd "$repo" && "$SELF" scan-bash-command 'git status') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(scan-bash-command git status): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # PUBLISH_GUARD_ALLOW=1 は scan* の early exit(hook 全体の bypass)。
+  set +e
+  (cd "$repo" && PUBLISH_GUARD_ALLOW=1 "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL: ALLOW=1 でも bypass されなかった(rc=$rc)" >&2; fails=$((fails + 1)); }
+
+  # PRIVATE な対象リポは検査自体をスキップする(--repo 明示指定)。
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view") printf 'PRIVATE' ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  rm -f "$PUBLISH_GUARD_STATE_DIR/visibility-cache.tsv"
+  set +e
+  (cd "$repo" && "$SELF" scan-bash-command 'gh pr create --repo acme/other --title t --body "acme/secret-project"') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL: PRIVATE な対象なのに検査された(rc=$rc)" >&2; fails=$((fails + 1)); }
+
+  # fail-loud: merge-base が解けない(origin/HEAD 未設定の新規リポ)場合は
+  # 無言 pass ではなく ask にエスカレートする。origin remote 自体を作らない
+  # ことで resolve_repo_nwo を意図的に失敗させ(可視性スキップ経路に入らせ
+  # ない)、compute_push_diff_text の merge-base 失敗経路まで確実に到達させる
+  # — gh はこの時点で PRIVATE を返すスタブに固定済みなので、visibility 経路
+  # に入るとテストの意図(diff 計算失敗の検出)を検証できなくなる。
+  local repo2="$tmp/repo2"
+  mkdir -p "$repo2"
+  git -C "$repo2" init -qb main
+  git -C "$repo2" config core.hooksPath /dev/null
+  git -C "$repo2" config user.email test@example.invalid
+  git -C "$repo2" config user.name test
+  git -C "$repo2" config commit.gpgsign false
+  echo x > "$repo2/a.txt"
+  git -C "$repo2" add a.txt
+  git -C "$repo2" commit -qm initial
+  set +e
+  (cd "$repo2" && "$SELF" scan-push) > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(fail-loud merge-base): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  if [[ $fails -gt 0 ]]; then
+    echo "selftest: ${fails} 件失敗" >&2
+    exit 1
+  fi
+  echo "selftest: OK"
+}
+
+# ---- dispatch ---------------------------------------------------------------
+
+if [[ "${PUBLISH_GUARD_ALLOW:-}" == "1" ]]; then
+  case "${1-}" in
+    scan | scan-push | scan-bash-command) exit 0 ;;
+  esac
+fi
+
+case "${1-}" in
+  scan)
+    shift
+    cmd_scan "$@"
+    ;;
+  scan-push)
+    shift
+    cmd_scan_push "$@"
+    ;;
+  scan-bash-command)
+    shift
+    cmd_scan_bash_command "$@"
+    ;;
+  audit)
+    shift
+    audit "$@"
+    ;;
+  refresh-cache)
+    refresh_private_repo_cache && printf 'private-repos-cache.txt を更新しました。\n' || printf 'キャッシュ更新に失敗しました(gh の認証状態を確認してください)。\n' >&2
+    ;;
+  selftest) selftest ;;
+  -h | --help) usage ;;
+  "")
+    usage >&2
+    exit 2
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
