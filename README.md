@@ -1,14 +1,36 @@
 # publish-guard
 
-会社/private リポジトリの実名が **PUBLIC な GitHub 面**(`git push`・
-`gh pr|issue` の create/edit/comment・MCP 経由の GitHub tool call)に漏れる
-のを防ぐ、AI コーディングエージェント向けの deny/ask gate。
+AI コーディングエージェントが public な GitHub 面(git push・PR/Issue 作成・MCP tool call)に会社/private リポジトリの実名を漏らす事故を防ぐ deny/ask gate。
 
 Claude Code の PreToolUse hook として生まれ(元は
 [tarotene/dotfiles](https://github.com/tarotene/dotfiles) の
 `config/claude/hooks/public-publish-guard.sh`)、判定エンジンを
 エージェント非依存の CLI に切り出し、Claude Code plugin / Codex CLI /
 Copilot CLI 用の薄い adapter を追加したものがこのリポジトリ。
+
+## Scope
+
+In:
+- 判定エンジン CLI(`scan` / `scan-push` / `scan-bash-command` / `audit`)
+- Claude Code plugin・Codex CLI・Copilot CLI 用 adapter
+- denylist/allowlist 設定ファイル仕様
+
+Out:
+- 悪意ある回避を防ぐ security boundary(設計上不可能。詳細は次節)
+- secret 検出(gitleaks 等の責務)
+- 各ホストでの hook 配線(dotfiles 側の責務)
+
+## Issue litmus
+
+判定問: その変更は、既に仲介できている PreToolUse 面での「誤操作による名前漏れ」検出・判定を改善するか?
+
+採用例:
+- fix(scan-push): refspec 解析が force-push 形式を取りこぼす
+- feat(adapter): Copilot CLI の MCP tool 命名に matcher を追従
+
+棄却例:
+- feat: ブラウザ経由の投稿も監視する
+- feat(audit): API トークン漏洩の検出を追加
 
 ## これは security boundary ではない
 
