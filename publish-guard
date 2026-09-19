@@ -46,8 +46,11 @@
 #                                           そのまま denylist と突き合わせる。
 #                                           MCP tool_input 等、任意のテキスト向け。
 #   publish-guard scan-push                cwd の git リポジトリで、これから
-#                                           push する差分(diff + commit log)
-#                                           を検査する。対象リポジトリが
+#                                           push する各コミットの追加行
+#                                           (+ 新規/rename 先ファイルパス)と
+#                                           commit log を検査する。削除行は
+#                                           対象外(#7 — 既公開内容の除去は
+#                                           新規公開ではない)。対象リポジトリが
 #                                           PRIVATE/INTERNAL と判明していれば
 #                                           検査自体をスキップする。
 #   publish-guard scan-bash-command CMD     シェルコマンド文字列を検査する。
@@ -351,10 +354,12 @@ resolve_default_branch() {
   printf ''
 }
 
-# compute_push_diff_text: これから push する範囲のファイル差分 + コミット
-# メッセージを連結して出力する。default branch / merge-base が解決できない
-# 場合は非 0 を返し、PUSH_DIFF_FAIL_REASON に理由をセットする(fail-loud —
-# 呼び出し側はこれを ask にエスカレートする。無言の pass にはしない)。
+# compute_push_diff_text: これから push する範囲の「追加行」+ 新規/rename 先
+# ファイルパス + コミットメッセージを連結して出力する(#7 — 削除行は既公開
+# 内容の除去であり新規公開ではないため検査対象外)。default branch /
+# merge-base が解決できない場合は非 0 を返し、PUSH_DIFF_FAIL_REASON に理由を
+# セットする(fail-loud — 呼び出し側はこれを ask にエスカレートする。無言の
+# pass にはしない)。
 PUSH_DIFF_FAIL_REASON=''
 compute_push_diff_text() {
   PUSH_DIFF_FAIL_REASON=''
@@ -369,7 +374,20 @@ compute_push_diff_text() {
     PUSH_DIFF_FAIL_REASON="origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性)。"
     return 1
   fi
-  git diff "$base"..HEAD 2>/dev/null
+
+  local patches
+  # per-commit patch(--format= でメッセージを混ぜない)。merge コミットは
+  # --diff-merges=first-parent で第1親との diff を出す — evil merge(どちらの
+  # 親にも無い行を解決結果に足す)の追加行もここに現れる。--no-renames で
+  # rename を add+delete に展開し、-U0 で無関係な文脈行を落とす。
+  patches="$(git log -p --diff-merges=first-parent --no-renames --unified=0 --format= "$base"..HEAD 2>/dev/null)"
+  grep '^+' <<< "$patches" || true # 追加行のみ抽出。無一致(grep の非 0)は空でよい
+
+  # 追加/rename 先のファイルパスは patch 本文に依存せず明示的に列挙する
+  # (空ファイル・バイナリには +++ ヘッダ自体が出ないため、grep '^+' だけでは
+  # パス名検出が漏れる)。
+  git log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "$base"..HEAD 2>/dev/null
+
   git log --format=%B "$base"..HEAD 2>/dev/null
   return 0
 }
@@ -683,6 +701,132 @@ acme で議論した"
     echo "FAIL: compute_push_diff_text が diff 内の denylist 文字列を拾わなかった" >&2
     fails=$((fails + 1))
   }
+
+  # 追加行のみスキャン(#7)の回帰テスト群。共通ヘルパで独立リポジトリを作る。
+  new_pushed_repo() { # $1=repo dir -> 初期コミット済み・push 済み・origin/HEAD 設定済みの repo を作る
+    local d="$1"
+    mkdir -p "$d"
+    git -C "$d" init -qb main
+    git -C "$d" config core.hooksPath /dev/null
+    git -C "$d" config user.email test@example.invalid
+    git -C "$d" config user.name test
+    git -C "$d" config commit.gpgsign false
+  }
+
+  # #7 本体: base に denylist 名を含む行が既にある状態から、それを削除する
+  # コミットだけを積んだら pass になること(削除行は検査対象外)。
+  local repo3="$tmp/repo3"
+  new_pushed_repo "$repo3"
+  printf 'line0\nacme/secret-project\n' > "$repo3/f.txt"
+  git -C "$repo3" add f.txt
+  git -C "$repo3" commit -qm initial
+  git init -q --bare "$tmp/remote3.git"
+  git -C "$repo3" remote add origin "$tmp/remote3.git"
+  git -C "$repo3" push -q origin main
+  git -C "$repo3" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  printf 'line0\n' > "$repo3/f.txt"
+  git -C "$repo3" add f.txt
+  git -C "$repo3" commit -qm "remove secret mention"
+  set +e
+  (cd "$repo3" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#7: 削除のみは pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # ブランチ内で追加してから削除しても、push は中間コミットも公開するため
+  # deny のまま(net diff では見えないが per-commit なら捕捉できる)。
+  local repo4="$tmp/repo4"
+  new_pushed_repo "$repo4"
+  printf 'line0\n' > "$repo4/f.txt"
+  git -C "$repo4" add f.txt
+  git -C "$repo4" commit -qm initial
+  git init -q --bare "$tmp/remote4.git"
+  git -C "$repo4" remote add origin "$tmp/remote4.git"
+  git -C "$repo4" push -q origin main
+  git -C "$repo4" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  printf 'line0\nacme/secret-project\n' > "$repo4/f.txt"
+  git -C "$repo4" add f.txt
+  git -C "$repo4" commit -qm "add secret mention"
+  printf 'line0\n' > "$repo4/f.txt"
+  git -C "$repo4" add f.txt
+  git -C "$repo4" commit -qm "remove it again"
+  set +e
+  (cd "$repo4" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(ブランチ内 add→remove は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # 秘密名をファイル名に持つ空ファイルの追加は deny(+++ ヘッダが出ない
+  # ケースなので --name-only --diff-filter=A 経由の検出を確認する)。
+  local repo5="$tmp/repo5"
+  new_pushed_repo "$repo5"
+  echo x > "$repo5/f.txt"
+  git -C "$repo5" add f.txt
+  git -C "$repo5" commit -qm initial
+  git init -q --bare "$tmp/remote5.git"
+  git -C "$repo5" remote add origin "$tmp/remote5.git"
+  git -C "$repo5" push -q origin main
+  git -C "$repo5" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  : > "$repo5/secret-project"
+  git -C "$repo5" add secret-project
+  git -C "$repo5" commit -qm "add empty file"
+  set +e
+  (cd "$repo5" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(秘密名の空ファイル追加は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # diff がクリーンでもコミットメッセージに denylist 名を含めば deny のまま。
+  local repo6="$tmp/repo6"
+  new_pushed_repo "$repo6"
+  echo x > "$repo6/f.txt"
+  git -C "$repo6" add f.txt
+  git -C "$repo6" commit -qm initial
+  git init -q --bare "$tmp/remote6.git"
+  git -C "$repo6" remote add origin "$tmp/remote6.git"
+  git -C "$repo6" push -q origin main
+  git -C "$repo6" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  git -C "$repo6" commit -q --allow-empty -m "acme/secret-project の件"
+  set +e
+  (cd "$repo6" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(メッセージ経由は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # evil merge: merge コミットの解決内容にだけ denylist 名を足し、次のコミット
+  # で消しても、merge コミット自身の(第1親との)patch で捕捉できること。
+  local repo7="$tmp/repo7"
+  new_pushed_repo "$repo7"
+  printf 'line0\n' > "$repo7/f.txt"
+  git -C "$repo7" add f.txt
+  git -C "$repo7" commit -qm initial
+  git init -q --bare "$tmp/remote7.git"
+  git -C "$repo7" remote add origin "$tmp/remote7.git"
+  git -C "$repo7" push -q origin main
+  git -C "$repo7" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  git -C "$repo7" checkout -qb topic
+  printf 'line0\nline-topic\n' > "$repo7/f.txt"
+  git -C "$repo7" add f.txt
+  git -C "$repo7" commit -qm "topic change"
+  git -C "$repo7" checkout -q main
+  printf 'line0\nline-main\n' > "$repo7/f.txt"
+  git -C "$repo7" add f.txt
+  git -C "$repo7" commit -qm "main change"
+  set +e
+  git -C "$repo7" merge -q --no-commit topic > /dev/null 2>&1
+  set -e
+  # 両方の親にも無い行を解決結果として手で足す(evil merge)。
+  printf 'line0\nline-main\nline-topic\nacme/secret-project\n' > "$repo7/f.txt"
+  git -C "$repo7" add f.txt > /dev/null 2>&1
+  git -C "$repo7" commit -q --no-edit > /dev/null 2>&1
+  printf 'line0\nline-main\nline-topic\n' > "$repo7/f.txt"
+  git -C "$repo7" add f.txt
+  git -C "$repo7" commit -qm "remove the evil-merge line"
+  set +e
+  (cd "$repo7" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(evil merge の追加は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # scan-bash-command: 実際の Bash tool_input 相当の入力で deny/ask/フォールスルー
   set +e
