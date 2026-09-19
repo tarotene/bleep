@@ -170,6 +170,18 @@ Copilot の `preToolUse` には **matcher が無い**(実機確認済み — 全
 call で無条件発火する)。絞り込みは adapter 内部(`toolName == "bash"` か
 どうか)で行っている。
 
+## `scan-push` が検査する範囲
+
+`publish-guard scan-push`(`scan-bash-command` 経由の `git push` 検出も同じ)
+は、push する範囲の各コミットの**追加行**(+ 新規/rename 先ファイルパス)と
+コミットメッセージ全文を検査する。**削除行は検査対象外**(#7 — denylist 名を
+含む行を削除する修正そのものが deny されてしまう問題への対応)。削除された
+内容は「base(既に公開済み)にある」か「同じ push 範囲内の先行コミットの
+追加行として既に検査済み」のいずれかであり、削除行自体をスキャンする漏洩
+防止上の価値はないため。net diff ではなくコミット単位(`git log -p`)で見る
+ので、ブランチ内で秘密を追加してから別コミットで削除しても、push する以上
+中間コミットの内容は公開されるため deny されたままになる。
+
 ## exit code の契約(自分でスクリプトを書く人向け)
 
 `publish-guard scan`/`scan-push`/`scan-bash-command` はすべて同じ契約:
