@@ -1,8 +1,30 @@
 # Contributing
 
-## サニタイズ規則(公開リポジトリの正本)
+See [README](README.md) for what this repository is and how to set up a
+development environment.
 
-この規則は [tarotene/dotfiles](https://github.com/tarotene/dotfiles) の
+## Issues
+
+Judging question: その変更は、既に仲介できている PreToolUse 面での「誤操作
+による名前漏れ」検出・判定を改善するか?
+
+Accepted:
+- fix(scan-push): refspec 解析が force-push 形式を取りこぼす
+- feat(adapter): Copilot CLI の MCP tool 命名に matcher を追従
+
+Rejected:
+- feat: ブラウザ経由の投稿も監視する
+- feat(audit): API トークン漏洩の検出を追加
+
+## Pull requests
+
+Fork this repository, create a topic branch, and open a pull request against
+`main`. Before submitting, run the checks listed in the README's
+[Development](README.md#development) section (`selftest` and `shellcheck -S
+error`) and make sure both pass.
+
+**サニタイズ規則(公開リポジトリの正本)**。この規則は
+[tarotene/dotfiles](https://github.com/tarotene/dotfiles) の
 `config/claude/skills/skill-gardening/SKILL.md` §3 と同一のものを、この
 リポジトリ用に複製している。この規則自体が「denylist は一切コミットしない」
 という本ツールの設計原則の適用例であり、他のどの寄稿にも適用される。
@@ -24,11 +46,9 @@ Issue/PR・commit message を書くときは次を満たす:
 - **コミット前の最終確認**: 差分を固有名詞と URL の観点で読み直す。迷ったら
   書かない側に倒す。
 
-## このツールに変更を加える前に
-
-`publish-guard` は README の「これは security boundary ではない」を前提に
-設計されている(Lampson 1973, Saltzer & Schroeder 1975, CWE-184)。新しい
-検査ロジックを追加するときは:
+**このツールに変更を加える前に**。`publish-guard` は README の「これは
+security boundary ではない」を前提に設計されている(Lampson 1973, Saltzer
+& Schroeder 1975, CWE-184)。新しい検査ロジックを追加するときは:
 
 - 判定不能を無言の pass にしない(fail-loud)。既存の `PUSH_DIFF_FAIL_REASON`
   や `cmd_scan`/`cmd_scan_push` の読み取り失敗処理を参考にする。
