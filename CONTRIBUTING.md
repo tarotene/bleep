@@ -5,16 +5,16 @@ development environment.
 
 ## Issues
 
-Judging question: その変更は、既に仲介できている PreToolUse 面での「誤操作
-による名前漏れ」検出・判定を改善するか?
+Judging question: Does this change improve detection/judging of "accidental
+name leaks" on the PreToolUse surfaces this tool already mediates?
 
 Accepted:
-- fix(scan-push): refspec 解析が force-push 形式を取りこぼす
-- feat(adapter): Copilot CLI の MCP tool 命名に matcher を追従
+- fix(scan-push): refspec parsing misses a force-push form
+- feat(adapter): follow Copilot CLI's MCP tool naming in the matcher
 
 Rejected:
-- feat: ブラウザ経由の投稿も監視する
-- feat(audit): API トークン漏洩の検出を追加
+- feat: also monitor browser-based posting
+- feat(audit): add API token leak detection
 
 ## Pull requests
 
@@ -23,35 +23,38 @@ Fork this repository, create a topic branch, and open a pull request against
 [Development](README.md#development) section (`selftest` and `shellcheck -S
 error`) and make sure both pass.
 
-**サニタイズ規則(公開リポジトリの正本)**。この規則は
-[tarotene/dotfiles](https://github.com/tarotene/dotfiles) の
-`config/claude/skills/skill-gardening/SKILL.md` §3 と同一のものを、この
-リポジトリ用に複製している。この規則自体が「denylist は一切コミットしない」
-という本ツールの設計原則の適用例であり、他のどの寄稿にも適用される。
+**Sanitization rules (canonical for this public repository)**. This rule
+duplicates, verbatim, §3 of `config/claude/skills/skill-gardening/SKILL.md`
+in [tarotene/dotfiles](https://github.com/tarotene/dotfiles) for this
+repository's use. The rule itself is an instance of this tool's own design
+principle — "never commit denylist data" — and applies to every
+contribution.
 
-このリポジトリは公開なので、社内固有の情報は一切載せない。コード・README・
-Issue/PR・commit message を書くときは次を満たす:
+This repository is public, so it must never carry any company-internal
+information. Code, README, Issues/PRs, and commit messages must all satisfy:
 
-- **固有名詞ゼロ**: 社名・製品名・機体名・プロジェクト名・実在するリポジトリ名・
-  人名・Issue/PR 番号を書かない。テスト・例に登場する組織名/リポジトリ名は
-  `acme` / `secret-project` のような明らかな架空名のみを使う。
-- **URL ゼロ**: 社内リソースへの URL は書かない(公式ドキュメントなど一般に
-  公開された参照先は例外)。
-- **実物の持ち込み禁止**: スクリーンショット・実ファイルのコピー・実データを
-  貼らない。
-- **denylist / allowlist の設定ファイルはコミットしない**: `orgs.txt` /
-  `repos.txt` / `allow-*.txt` はこのツールが読む対象であり、このリポジトリの
-  `.gitignore` にも入れる。テストフィクスチャは selftest 内の `mktemp -d` に
-  閉じる。
-- **コミット前の最終確認**: 差分を固有名詞と URL の観点で読み直す。迷ったら
-  書かない側に倒す。
+- **Zero proper nouns**: no company names, product names, machine/project
+  names, real repository names, personal names, or Issue/PR numbers. Tests
+  and examples may only use obviously fictional org/repo names like `acme`
+  or `secret-project`.
+- **Zero internal URLs**: no links to internal resources (publicly
+  documented references, like official docs, are the exception).
+- **No real artifacts**: no screenshots, copies of real files, or real data.
+- **Never commit denylist/allowlist config files**: `orgs.txt`, `repos.txt`,
+  and `allow-*.txt` are files this tool reads at runtime, and are also in
+  this repository's `.gitignore`. Test fixtures stay confined to a
+  `mktemp -d` inside selftest.
+- **Final check before committing**: re-read the diff specifically looking
+  for proper nouns and URLs. When in doubt, leave it out.
 
-**このツールに変更を加える前に**。`publish-guard` は README の「これは
-security boundary ではない」を前提に設計されている(Lampson 1973, Saltzer
-& Schroeder 1975, CWE-184)。新しい検査ロジックを追加するときは:
+**Before changing this tool**. `publish-guard` is designed around the
+README's "This is not a security boundary" premise (Lampson 1973, Saltzer &
+Schroeder 1975, CWE-184). When adding new detection logic:
 
-- 判定不能を無言の pass にしない(fail-loud)。既存の `PUSH_DIFF_FAIL_REASON`
-  や `cmd_scan`/`cmd_scan_push` の読み取り失敗処理を参考にする。
-- deny の理由文にバイパス手段(`PUBLISH_GUARD_ALLOW=1`)を書かない。
-- `./publish-guard selftest` と `shellcheck -S error publish-guard` の両方が
-  通ること。
+- Never let an indeterminate verdict silently pass (fail-loud). Look at the
+  existing `PUSH_DIFF_FAIL_REASON` and the read-failure handling in
+  `cmd_scan`/`cmd_scan_push` for the pattern.
+- Never name the bypass mechanism (`PUBLISH_GUARD_ALLOW=1`) in a deny
+  reason's text.
+- Both `./publish-guard selftest` and `shellcheck -S error publish-guard`
+  must pass.

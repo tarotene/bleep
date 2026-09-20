@@ -1,39 +1,40 @@
 # publish-guard
 
-AI コーディングエージェントが public な GitHub 面(git push・PR/Issue 作成・MCP tool call)に会社/private リポジトリの実名を漏らす事故を防ぐ deny/ask gate。
+A deny/ask gate that prevents AI coding agents from leaking company/private repository names onto public GitHub surfaces (git push, PR/Issue creation, MCP tool calls).
 
 ## Background
 
-Claude Code の PreToolUse hook として生まれ(元は
-[tarotene/dotfiles](https://github.com/tarotene/dotfiles) の
-`config/claude/hooks/public-publish-guard.sh`)、判定エンジンを
-エージェント非依存の CLI に切り出し、Claude Code plugin / Codex CLI /
-Copilot CLI 用の薄い adapter を追加したものがこのリポジトリ。
+Born as a Claude Code PreToolUse hook (originally
+`config/claude/hooks/public-publish-guard.sh` in
+[tarotene/dotfiles](https://github.com/tarotene/dotfiles)), this repository
+extracted the decision engine into an agent-agnostic CLI and added thin
+adapters for the Claude Code plugin, Codex CLI, and Copilot CLI.
 
 ## Install
 
-denylist データ(org 名・repo 名)は一切このリポジトリにコミットしない。
-`$XDG_CONFIG_HOME/publish-guard/`(既定 `~/.config/publish-guard/`)以下に
-自分で置く。**手書きが必要なのは実質 `orgs.txt` の org 名 1 行だけ**——
-自分の private/internal リポジトリ名は、そこに書いた org 名と(gh
-認証ユーザ自身の)owner から、各自の `gh` credential で live 導出する。
-リポジトリ名のリストそのものは誰も持ち運ばない。
+This repository never commits denylist data (org names, repo names). You
+place your own under `$XDG_CONFIG_HOME/publish-guard/` (defaults to
+`~/.config/publish-guard/`). **The only thing you realistically have to
+write by hand is one line in `orgs.txt` with your org name** — your own
+private/internal repository names are live-derived from the org name you
+wrote there plus the owner of your authenticated `gh` user, using your own
+`gh` credentials. Nobody carries around a literal list of repo names.
 
 ```
 $ mkdir -p ~/.config/publish-guard
-$ echo acme > ~/.config/publish-guard/orgs.txt   # 会社の org 名だけ書く
+$ echo acme > ~/.config/publish-guard/orgs.txt   # write only your company's org name
 ```
 
-任意で追加できる設定ファイル(すべて省略可、1行1件、`#` コメント・空行は
-無視):
+Optional config files you can add (all optional, one entry per line, `#`
+comments and blank lines ignored):
 
-| ファイル | 用途 |
+| File | Purpose |
 |---|---|
-| `orgs.txt` | 会社/他人の org 名(手書きが必要なのは実質ここだけ) |
-| `repos.txt` | `org/repo` 形の明示的な参照(任意) |
-| `allow-stopwords.txt` | denylist から除外する単語(組み込みで `.github` を既定値として持つ) |
-| `allow-regexes.txt` | この正規表現が scan 対象テキストにマッチしたら **ask だけ**を無効化する(deny は緩めない) |
-| `allow-paths.txt` | `audit` から除外するファイルパスの正規表現 |
+| `orgs.txt` | Company/other-party org names (this is realistically the only one you write by hand) |
+| `repos.txt` | Explicit `org/repo` references (optional) |
+| `allow-stopwords.txt` | Words excluded from the denylist (`.github` is a built-in default) |
+| `allow-regexes.txt` | If this regex matches the scanned text, it disables **only the ask** verdict (it does not loosen deny) |
+| `allow-paths.txt` | Regex of file paths excluded from `audit` |
 
 ### Claude Code
 
@@ -42,22 +43,24 @@ $ echo acme > ~/.config/publish-guard/orgs.txt   # 会社の org 名だけ書く
 /plugin install publish-guard@publish-guard
 ```
 
-`.claude-plugin/plugin.json` が `hooks/hooks.json` を読み、`PreToolUse` に
-`Bash|mcp__.*` の複合 matcher で `hooks/claude-adapter.sh` を登録する
-(`${CLAUDE_PLUGIN_ROOT}` で自己解決)。
+`.claude-plugin/plugin.json` reads `hooks/hooks.json`, which registers
+`hooks/claude-adapter.sh` on `PreToolUse` with a single compound matcher
+`Bash|mcp__.*` (self-resolved via `${CLAUDE_PLUGIN_ROOT}`).
 
-**matcher を分けない理由**: Bash 用と MCP 用に2つの hook エントリを
-書きたくなるかもしれないが、書かないこと。存在判定が command 文字列の
-完全一致でしか行えない登録系(home-manager の `registerHooks` 等)と
-組み合わせると、同一 command を2つの matcher で登録した場合に2回目が
-早期 return し、片方の経路が無検査のまま残る。複合1本に統一しておけば
-どの登録系でも同じ挙動になる。
+**Why the matchers aren't split**: you might be tempted to write two
+separate hook entries, one for Bash and one for MCP — don't. Combined with a
+registration mechanism that can only detect existing entries by exact
+command-string match (e.g. home-manager's `registerHooks`), registering the
+same command under two matchers means the second one short-circuits on
+"already registered," leaving one of the two paths unchecked. Keeping it to
+a single compound matcher gives the same behavior under any registration
+mechanism.
 
-**組織単位で一括配布したい場合**: Claude Code の managed settings は、
-組織が使えるマーケットプレイスを `strictKnownMarketplaces` で制限し、
-`enabledPlugins` で全ユーザに事前導入できる。
+**Rolling this out org-wide**: Claude Code's managed settings can restrict
+which marketplaces an organization may use via `strictKnownMarketplaces`,
+and pre-install for every user via `enabledPlugins`.
 — Anthropic, "Plugin marketplaces",
-<https://code.claude.com/docs/en/plugin-marketplaces.md>(2026-09-10 取得)。
+<https://code.claude.com/docs/en/plugin-marketplaces.md> (accessed 2026-09-10).
 
 ```json
 {
@@ -70,15 +73,15 @@ $ echo acme > ~/.config/publish-guard/orgs.txt   # 会社の org 名だけ書く
 }
 ```
 
-denylist データ(`orgs.txt` 等)はこの配布経路に乗らない——各ユーザが
-自分の `~/.config/publish-guard/orgs.txt` に org 名を書く必要がある点は
-変わらない(意図的な設計。詳細は [Scope](#scope) の「これは security
-boundary ではない」を参照)。
+Denylist data (`orgs.txt`, etc.) does not travel through this distribution
+path — each user still has to write their org name into their own
+`~/.config/publish-guard/orgs.txt` (this is intentional; see "This is not a
+security boundary" under [Scope](#scope) for details).
 
 ### Codex CLI
 
-`~/.codex/hooks.json` に手で追記する(dotfiles の `register-codex-hooks`
-のような idempotent merger を自分で書いてもよい):
+Add this to `~/.codex/hooks.json` by hand (or write your own idempotent
+merger, similar to dotfiles' `register-codex-hooks`):
 
 ```json
 {
@@ -95,14 +98,15 @@ boundary ではない」を参照)。
 }
 ```
 
-matcher `Bash` は実機(`codex exec --dangerously-bypass-hook-trust`)で
-確認済み。**MCP tool の命名規則(`mcp__server__tool` 形かどうか)は Codex
-側で未確認** — MCP server を使っている場合は実際の `tool_name` を確認して
-から matcher を調整すること。
+The `Bash` matcher has been verified against a real Codex CLI
+(`codex exec --dangerously-bypass-hook-trust`). **Codex's MCP tool naming
+convention (whether it follows the `mcp__server__tool` shape) has not been
+verified** — if you use an MCP server, check the actual `tool_name` and
+adjust the matcher accordingly.
 
 ### Copilot CLI
 
-`~/.copilot/settings.json` の `"hooks"` キーに追記する:
+Add this under the `"hooks"` key in `~/.copilot/settings.json`:
 
 ```json
 {
@@ -114,99 +118,106 @@ matcher `Bash` は実機(`codex exec --dangerously-bypass-hook-trust`)で
 }
 ```
 
-Copilot の `preToolUse` には **matcher が無い**(実機確認済み — 全 tool
-call で無条件発火する)。絞り込みは adapter 内部(`toolName == "bash"` か
-どうか)で行っている。
+Copilot's `preToolUse` **has no matcher** (verified against a real
+instance — it fires unconditionally on every tool call). Filtering happens
+inside the adapter itself (checking whether `toolName == "bash"`).
 
 ## Usage
 
-`publish-guard scan`/`scan-push`/`scan-bash-command` はすべて同じ exit code
-契約を持つ(自分でスクリプトを書く人向け):
+`publish-guard scan`/`scan-push`/`scan-bash-command` all share the same exit
+code contract (for anyone scripting against this themselves):
 
-| exit code | 意味 | stdout |
+| exit code | meaning | stdout |
 |---|---|---|
-| 0 | pass(denylist に一致しない) | 無出力 |
-| 1 | ask(org 名の裸単体一致 — 正当な用途と衝突しうる) | 理由1行 |
-| 2 | deny(org/repo 明示参照・具体リポ名一致 — ほぼ確実に意図しない漏洩) | 理由1行 |
+| 0 | pass (no denylist match) | none |
+| 1 | ask (a bare org-name match — could collide with a legitimate use) | one-line reason |
+| 2 | deny (an explicit org/repo reference or a specific repo-name match — almost certainly an unintended leak) | one-line reason |
 
-**`scan-push` が検査する範囲**: `publish-guard scan-push`
-(`scan-bash-command` 経由の `git push` 検出も同じ)は、push する範囲の各
-コミットの**追加行**(+ 新規/rename 先ファイルパス)とコミットメッセージ
-全文を検査する。**削除行は検査対象外**(#7 — denylist 名を含む行を削除
-する修正そのものが deny されてしまう問題への対応)。削除された内容は
-「base(既に公開済み)にある」か「同じ push 範囲内の先行コミットの追加行
-として既に検査済み」のいずれかであり、削除行自体をスキャンする漏洩防止上
-の価値はないため。net diff ではなくコミット単位(`git log -p`)で見るので、
-ブランチ内で秘密を追加してから別コミットで削除しても、push する以上中間
-コミットの内容は公開されるため deny されたままになる。
+**What `scan-push` checks**: `publish-guard scan-push` (and `git push`
+detection via `scan-bash-command`) inspects the **added lines** (plus
+new/renamed file paths) and the full commit message of each commit in the
+range being pushed. **Removed lines are not scanned** (#7 — this addresses
+the problem where a fix that removes a line containing a denylisted name
+would itself get denied). Deleted content is either already on the base
+(already public) or was already scanned as an added line in an earlier
+commit within the same push range, so scanning removed lines has no
+leak-prevention value. Because this looks at commits (`git log -p`), not the
+net diff, adding a secret in one commit and removing it in a later commit
+within the same branch still gets denied once you push, since the
+intermediate commit's content becomes public regardless.
 
-**`audit --remote` の注意**: `publish-guard audit --remote` は `gh issue
-list`/`gh pr list` で対象リポジトリの**open な Issue/PR の title/body を
-丸ごと取得**してローカルプロセスに載せる。会社の private/internal
-リポジトリに対して実行すると、社内の Issue/PR 本文がこのプロセスの
-メモリと(シェル履歴等)に一時的に残る。実行対象は選んで使うこと。
+**A caveat about `audit --remote`**: `publish-guard audit --remote` fetches
+the **full title/body of every open Issue/PR** in the target repository via
+`gh issue list`/`gh pr list` and loads it into the local process. Running it
+against a company private/internal repository temporarily leaves that
+internal Issue/PR content in this process's memory (and shell history,
+etc.). Choose your targets deliberately.
 
 ## Scope
 
-担当領域は判定エンジン CLI(`scan`/`scan-push`/`scan-bash-command`/
-`audit`)、Claude Code plugin・Codex CLI・Copilot CLI 向けの薄い adapter、
-denylist/allowlist 設定ファイルの仕様である。悪意ある回避を防ぐ security
-boundary の構築、secret 検出(gitleaks 等の責務)、各ホストでの hook 配線
-(dotfiles 側の責務)は、このリポジトリの外側の関心事として扱う。
+This repository owns the decision-engine CLI (`scan`/`scan-push`/
+`scan-bash-command`/`audit`), thin adapters for the Claude Code plugin,
+Codex CLI, and Copilot CLI, and the denylist/allowlist config-file format.
+Building a security boundary against malicious evasion, secret detection
+(gitleaks and similar tools' job), and per-host hook wiring (dotfiles' job)
+are treated as concerns outside this repository.
 
-**これは security boundary ではない**。このツールは**事故とエージェントの
-滑りに対するガードレール**であり、悪意ある回避を防ぐ仕組みではない。理由は
-3つある。
+**This is not a security boundary.** This tool is a **guardrail against
+accidents and agent slip-ups**, not a mechanism that prevents malicious
+evasion. There are three reasons for this.
 
-1. **制約される当事者(エージェント、または手打ちする人間)が
-   github.com に直接ブラウザで打ち込む経路はどう転んでも仲介できない**。
-   言い換え・分割・base64・手打ちのいずれでも迂回できる。これは
-   local な PreToolUse hook という設計そのものの限界であり、実装で
-   解決できるものではない。
+1. **There is no way to mediate the path where the constrained party (the
+   agent, or a human typing directly) types straight into github.com in a
+   browser.** Rewording, splitting, base64-encoding, or manual typing can
+   all route around it. This is a limitation of the local-PreToolUse-hook
+   design itself, not something an implementation can fix.
    — Lampson, B. W., "A Note on the Confinement Problem", *Communications
-   of the ACM* 16(10), 1973, pp.613–615,
-   <https://dl.acm.org/doi/10.1145/362375.362389>(2026-09-10 取得)。
-2. **complete mediation を満たしていない**。このツールが仲介するのは
-   `Bash` ツールと `mcp__*` ツールの PreToolUse イベントだけで、それ以外の
-   経路(エージェントが直接 API を叩く、ユーザが別のターミナルで作業する
-   等)は一切見ない。
+   of the ACM* 16(10), 1973, pp. 613–615,
+   <https://dl.acm.org/doi/10.1145/362375.362389> (accessed 2026-09-10).
+2. **It does not satisfy complete mediation.** This tool only mediates
+   `PreToolUse` events for the `Bash` tool and `mcp__*` tools; it sees
+   nothing on any other path (an agent hitting an API directly, a user
+   working in a separate terminal, etc.).
    — Saltzer, J. H. & Schroeder, M. D., "The Protection of Information in
    Computer Systems", 1975,
-   <https://www.cs.virginia.edu/~evans/cs551/saltzer/>(2026-09-10 取得)。
-3. **denylist ベースの検出は「疑わしい活動の検出」にしか使えない**。
-   `audit` サブコマンドはこの前提で設計している(既存ファイル/Issue/PR の
-   事後チェック用)。
+   <https://www.cs.virginia.edu/~evans/cs551/saltzer/> (accessed 2026-09-10).
+3. **Denylist-based detection is only useful for "detecting suspicious
+   activity."** The `audit` subcommand is designed around this premise (for
+   after-the-fact checks of existing files/Issues/PRs).
    — MITRE CWE-184, "Incomplete List of Disallowed Inputs",
-   <https://cwe.mitre.org/data/definitions/184.html>(2026-09-10 取得)。
+   <https://cwe.mitre.org/data/definitions/184.html> (accessed 2026-09-10).
 
-誤検知が多いと、エージェントも人間も bypass を日常化させ、結果として
-このツールは無いのと同じになる。誤検知を見つけたら denylist の粒度を
-上げるより先に allowlist を使うこと。
+A high false-positive rate normalizes bypassing for both agents and humans,
+which makes the tool functionally equivalent to not existing at all. If you
+find a false positive, reach for the allowlist before tightening the
+denylist's granularity.
 — Rahman, A., Imtiaz, F., Storey, M.-A., Williams, L., "Why secret
 detection tools are not enough: It's not just about false positives — An
 industrial case study", *Empirical Software Engineering*, 2022,
-<https://doi.org/10.1007/s10664-021-10109-y>(2026-09-10 取得)。
+<https://doi.org/10.1007/s10664-021-10109-y> (accessed 2026-09-10).
 
-**hook のタイムアウトは構造的に防げない**。Claude Code の公式ドキュメントは
-「タイムアウトで停止した hook は tool call を block しない」と明記している。
-つまり、hook プロセス自体が時間内に終了しなければ、判定結果に関わらず操作は
-素通りする。これは publish-guard 側で対処できない、ホスト CLI 側の仕様。
+**A hook timeout is not something this tool can structurally prevent.**
+Claude Code's official documentation states that "a hook that times out does
+not block the tool call." In other words, if the hook process itself doesn't
+finish in time, the operation goes through regardless of the verdict. This
+is a host-CLI-side specification that publish-guard cannot address.
 — Anthropic, "Hooks reference", <https://code.claude.com/docs/en/hooks>
-(2026-09-10 取得)。
+(accessed 2026-09-10).
 
-**bypass: `PUBLISH_GUARD_ALLOW=1`**。`scan`/`scan-push`/`scan-bash-command`
-は環境変数 `PUBLISH_GUARD_ALLOW=1` が立っていると即座に pass する。意識的
-に検査を外したいとき用のエスケープハッチ。**deny/ask の理由文にはこの
-env var 名を書いていない** — 制約される当事者(エージェント)が deny の
-理由を読んで自分で bypass を再実行できてしまうため。この bypass の存在
-自体は、このツールを設定する人間だけが知っていればよい。
+**Bypass: `PUBLISH_GUARD_ALLOW=1`**. `scan`/`scan-push`/`scan-bash-command`
+pass immediately if the `PUBLISH_GUARD_ALLOW=1` environment variable is set.
+This is an escape hatch for when you deliberately want to skip the check.
+**The deny/ask reason text never names this env var** — because the
+constrained party (the agent) could otherwise read the deny reason and
+re-run the bypass itself. The existence of this bypass is meant to be known
+only to the human who configures this tool.
 
 ## Development
 
 - `./publish-guard selftest` / `./hooks/claude-adapter.sh --selftest` /
   `./adapters/codex-adapter.sh --selftest` / `./adapters/copilot-adapter.sh --selftest`
 - `shellcheck -S error publish-guard hooks/*.sh adapters/*.sh`
-- コミット前のサニタイズ規則: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Pre-commit sanitization rules: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
 
