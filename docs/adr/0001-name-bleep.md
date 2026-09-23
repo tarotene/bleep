@@ -57,10 +57,11 @@ Search API(`search/repositories?q=<name>+in:name`)で名前空間を実測して
 | `airlock` `portcullis` `cerberus` `heimdall` `sluice` `bulkhead` ほか | 全て TAKEN | — | 外した(crates.io で取得済み) |
 
 決め手は比喩の質ではなく実測: 選択時点で評価できたのは名前空間の空き
-具合と、既存 org 先例(`naming-codename` 8件のうち実在語比喩の
-`hato`/`petrel`/`telepath`、ポートマンテーの `shadowgraph`/
-`selffiles`)への整合のみ。比喩の良し悪しと口コミ性は事後的にしか
-評価できない。
+具合と、既存 org 先例(`naming-codename` 8件のうち public な
+`telepath` を含む、実在語の比喩・ポートマンテーという2系統の造語脈)への
+整合のみ。比喩の良し悪しと口コミ性は事後的にしか評価できない(残りの
+private リポジトリの命名例はこの public リポジトリの成果物には書かない
+— CONTRIBUTING.md「Zero proper nouns」)。
 
 ### アイキャッチ
 
