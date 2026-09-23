@@ -4,3 +4,6 @@
 
 # selftest scratch (selftest uses mktemp -d, but guard stray local runs)
 /.tmp/
+
+# Rust build output(Cargo.lock はバイナリ crate なのでコミットする)
+/target/
