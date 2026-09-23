@@ -235,6 +235,31 @@ against a company private/internal repository temporarily leaves that
 internal Issue/PR content in this process's memory (and shell history,
 etc.). Choose your targets deliberately.
 
+**Before making a private repo public, run `audit --since`**: the default
+`audit` only looks at the **current working tree** (`git ls-files`), so it
+can't see a denylisted string that was added in one commit and removed in a
+later one — that content is still fully present in the repo's history, and
+the moment you flip the repo's visibility to public, GitHub exposes the
+whole history, not just the current tree (#11's motivating concern, closed
+as already-implemented for the *added-lines* case, but this is the
+already-known gap for the *history* case). `--since <rev>` additionally
+scans every added line (plus new/renamed file paths and commit messages)
+between `<rev>` and `HEAD`, reusing the same added-lines-only extraction
+`scan-push` uses (#7 — removed lines still carry no leak-prevention value
+here either):
+
+```
+$ publish-guard audit --since "$(git rev-list --max-parents=0 HEAD)"
+```
+
+**This intentionally isn't wired into CI.** Running `audit` in CI would mean
+putting `orgs.txt`/`repos.txt` into an Actions secret so the workflow can
+reconstruct the denylist — but that puts denylist data in a place this
+project has decided it categorically shouldn't be (`## Install`'s "this
+repository never commits denylist data," CONTRIBUTING's sanitization
+rules). Run `audit --since` locally, by hand, right before you flip
+visibility.
+
 ## Scope
 
 This repository owns the decision-engine CLI (`scan`/`scan-push`/

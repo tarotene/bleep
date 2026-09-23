@@ -78,11 +78,18 @@
 #                                           scan-push と同じ diff+log を検査
 #                                           する。どちらの形も無ければ
 #                                           無検査で pass。
-#   publish-guard audit [path...] [--remote]
+#   publish-guard audit [path...] [--remote] [--since REV]
 #                                           指定ファイル(省略時は git ls-files
 #                                           全体)を同じ denylist で検査する。
 #                                           --remote で open な Issue/PR の
 #                                           title/body も対象に含める。
+#                                           --since REV で "REV..HEAD" の
+#                                           追加行/新規ファイルパス/commit
+#                                           メッセージも追加で検査する
+#                                           (working tree の現物では見えない、
+#                                           過去に削除済みの denylist 文字列を
+#                                           含む — private → public 化の直前に
+#                                           使う)。
 #   publish-guard refresh-cache            private/internal リポジトリ一覧
 #                                           キャッシュを強制更新する。
 #   publish-guard selftest                 回帰テスト(スタブ gh/git)。
@@ -115,7 +122,8 @@ init_vars
 usage() {
   cat <<'EOF'
 usage: publish-guard [--cwd DIR] <scan [FILE]|scan-push|scan-bash-command CMD|
-                       audit [path...] [--remote]|refresh-cache|selftest>
+                       audit [path...] [--remote] [--since REV]|
+                       refresh-cache|selftest>
 
 エージェント非依存の denylist 判定エンジン。scan/scan-push/scan-bash-command
 は exit code で判定を返す: 0=pass, 1=ask(理由を stdout に1行), 2=deny(同)。
@@ -870,12 +878,34 @@ cmd_scan_bash_command() {
   exit 0
 }
 
+# compute_since_diff_text: $1=since_rev -> "$1..HEAD" 範囲の追加行 + 新規/
+# rename 先ファイルパス + commit メッセージを出力する。抽出ロジックは
+# compute_push_diff_text(publish-guard 内の単一正本、D7)と同じ3本の git
+# 呼び出しを流用するが、default branch/merge-base の自動解決はしない —
+# audit --since はユーザが明示的に起点を指定する手動操作であり、push の
+# fail-loud 経路(起点を自動解決できなければ ask)とは前提が異なる。
+compute_since_diff_text() {
+  local since="$1" dir="${TARGET_CWD:-.}"
+  local patches
+  patches="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= "$since"..HEAD 2>/dev/null)"
+  grep '^+' <<< "$patches" || true
+
+  git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "$since"..HEAD 2>/dev/null
+
+  git -C "$dir" log --format=%B "$since"..HEAD 2>/dev/null
+  return 0
+}
+
 audit() {
-  local remote=false
+  local remote=false since=''
   local -a paths=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --remote) remote=true ;;
+      --since)
+        since="${2-}"
+        shift
+        ;;
       *) paths+=("$1") ;;
     esac
     shift
@@ -883,6 +913,20 @@ audit() {
 
   build_patterns
   local hit=0 verdict content
+
+  # --since <rev>: working tree の現物(git ls-files)は「今 push したら
+  # 何が漏れるか」しか見ない。private → public 化の直前には、既に削除
+  # した内容(過去のコミットにだけ残る denylist 文字列)も含めて履歴全体を
+  # 確認したい(G3)。working tree のスキャンを置き換えるのではなく追加する
+  # — 両方確認できて初めて「これから公開して大丈夫か」の判断材料になる。
+  if [[ -n $since ]]; then
+    local since_text
+    since_text="$(compute_since_diff_text "$since")"
+    if verdict="$(match_verdict "$since_text")"; then
+      printf '%s: history-since=%s\n' "$verdict" "$since"
+      hit=1
+    fi
+  fi
 
   if ((${#paths[@]} == 0)); then
     mapfile -t paths < <(git ls-files 2>/dev/null)
@@ -1431,6 +1475,39 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(fail-loud merge-base): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # audit --since REV(G3): working tree の現物(git ls-files)では見えない、
+  # 既に削除済みだが過去のコミットに残る denylist 文字列を検出できること。
+  local repo8="$tmp/repo8"
+  mkdir -p "$repo8"
+  git -C "$repo8" init -qb main
+  git -C "$repo8" config core.hooksPath /dev/null
+  git -C "$repo8" config user.email test@example.invalid
+  git -C "$repo8" config user.name test
+  git -C "$repo8" config commit.gpgsign false
+  echo "line0" > "$repo8/f.txt"
+  git -C "$repo8" add f.txt
+  git -C "$repo8" commit -qm initial
+  local root8
+  root8="$(git -C "$repo8" rev-parse HEAD)"
+  printf 'line0\nacme/secret-project\n' > "$repo8/f.txt"
+  git -C "$repo8" add f.txt
+  git -C "$repo8" commit -qm "add secret mention"
+  printf 'line0\n' > "$repo8/f.txt"
+  git -C "$repo8" add f.txt
+  git -C "$repo8" commit -qm "remove it again"
+
+  # 現物(working tree)だけの audit は既に削除済みなので何も拾わない。
+  local out8
+  out8="$(cd "$repo8" && "$SELF" audit f.txt 2>&1)"
+  [[ $out8 == *'残存ヒットはありません。'* ]] || { echo "FAIL(audit 現物のみ: 削除済みは拾わない想定): out=$out8" >&2; fails=$((fails + 1)); }
+
+  # --since <root コミット> なら履歴内の追加行として拾う(deny を見つけると
+  # audit() は非0を返すため set -e を一時解除する)。
+  set +e
+  out8="$(cd "$repo8" && "$SELF" audit f.txt --since "$root8" 2>&1)"
+  set -e
+  [[ $out8 == *'deny: history-since='* ]] || { echo "FAIL(audit --since: 履歴内の denylist 文字列を検出できていない): out=$out8" >&2; fails=$((fails + 1)); }
 
   if [[ $fails -gt 0 ]]; then
     echo "selftest: ${fails} 件失敗" >&2
