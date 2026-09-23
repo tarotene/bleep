@@ -1003,6 +1003,19 @@ acme で議論した"
   expect_verdict pass ".github の workflows を見た"
   printf 'acme/secret-project\n' > "$PUBLISH_GUARD_REPOS_FILE"
 
+  # #15: allow-stopwords は live sweep 由来の private リポ名(WORD_HARD)も
+  # 外す。個人 owner の owner/repo 形は元々 PLAIN_PATTERNS に入らない
+  # (org/repo 形の PLAIN_PATTERNS は orgs.txt/repos.txt 由来のみ)ため、
+  # bare 名を stopword すれば owner/repo 形も通る(README「Marking a
+  # private repo as "prospectively public"」参照)。一方、orgs.txt 配下の
+  # org/repo は PLAIN_PATTERNS がフィルタされないため引き続き deny する
+  # 非対称を固定する。
+  printf '# prospectively public\nmy-private-tool\n' > "$PUBLISH_GUARD_ALLOW_STOPWORDS_FILE"
+  expect_verdict pass "my-private-tool のドリフトを見つけた"
+  expect_verdict pass "test-owner/my-private-tool のドリフトを見つけた"
+  expect_verdict deny "acme/secret-project の話" # org 配下は引き続き deny
+  : > "$PUBLISH_GUARD_ALLOW_STOPWORDS_FILE"
+
   # allow-stopwords: ユーザ定義の追加 stopword
   printf 'widget\n' > "$PUBLISH_GUARD_ALLOW_STOPWORDS_FILE"
   printf 'acme/widget\n' >> "$PUBLISH_GUARD_REPOS_FILE"

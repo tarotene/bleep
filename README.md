@@ -36,6 +36,46 @@ comments and blank lines ignored):
 | `allow-regexes.txt` | If this regex matches the scanned text, it disables **only the ask** verdict (it does not loosen deny) |
 | `allow-paths.txt` | Regex of file paths excluded from `audit` |
 
+**Marking a private repo as "prospectively public"** (#15): a personal side
+project that's private only because it isn't polished yet — not because its
+name or existence is sensitive — can be exempted from the hard-deny tier
+with nothing more than `allow-stopwords.txt`; there is no separate
+"prospective public" file or config tier, because this exemption is fully
+covered by the stopword mechanism that already exists for false positives
+in general:
+
+```
+$ cat >> ~/.config/publish-guard/allow-stopwords.txt <<'EOF'
+# prospectively public — revert to repos.txt if this changes
+my-side-project
+EOF
+```
+
+What this does and does not cover:
+
+- `allow-stopwords.txt` filters **both** `WORD_HARD` (hard-deny, bare repo
+  names) and `WORD_WARN` (ask, bare org names) — so a stopword removes a
+  live-swept private repo name from the hard-deny tier just as it would a
+  `repos.txt` entry.
+- Your **own personal repos** (the org derived from your authenticated `gh`
+  user, not an entry in `orgs.txt`) never appear in `PLAIN_PATTERNS`
+  (`org/repo`-shaped literal matches) in the first place — only
+  `orgs.txt`/`repos.txt`-derived entries do. So for a personal repo, a bare
+  stopword is enough; both the bare name and the `owner/repo` form pass.
+- This does **not** apply to repos under an org listed in `orgs.txt` — those
+  still hard-deny on the `org/repo` form via `PLAIN_PATTERNS`, which
+  stopwords don't filter (intentional: `orgs.txt` encodes "definitely keep
+  this secret," and a stopword shouldn't be able to fully undo that for a
+  company/org repo).
+- Precede the entry with a whole-line `#` comment recording *why* it's there
+  and what to do if the decision reverses — a bare word in this file
+  doesn't otherwise distinguish "known false-positive trigger" from "opted
+  out of hard-deny on purpose." Only whole-line comments are stripped
+  (`read_lines` skips lines that *start* with `#`); there's no inline
+  trailing-comment syntax, so a comment needs its own line, as in the
+  example above. If you commit to keeping the repo private, move the entry
+  back out of `allow-stopwords.txt` and into `repos.txt` instead.
+
 ### Claude Code
 
 ```
