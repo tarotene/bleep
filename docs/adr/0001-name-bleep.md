@@ -82,19 +82,27 @@ README ロゴを同一図形で賄え、外部素材のライセンス制約と�
 
 ## 執行点
 
-この PR で新規追加・変更した実ファイル:
+この PR で識別子置換(`publish-guard` → `bleep`、`publish-guard-hook` →
+`bleep-hook`、`PUBLISH_GUARD_*` → `BLEEP_*`)を適用した実ファイル:
 
-- リポジトリ全体の識別子置換(`publish-guard` → `bleep`、
-  `publish-guard-hook` → `bleep-hook`、`PUBLISH_GUARD_*` → `BLEEP_*`):
-  `bleep`(旧 `publish-guard`)、`hooks/bleep.sh`(旧 `hooks/pg-hook.sh`)、
-  `hooks/hooks.json`、`Cargo.toml`、`Cargo.lock`、`src/main.rs`、
-  `src/host.rs`、`src/lex.rs`、`tests/host_test.rs`、
-  `tests/fixtures/gh-stub.sh`、`.claude-plugin/plugin.json`、
-  `.claude-plugin/marketplace.json`、`release-plz.toml`、
-  `.github/workflows/ci.yml`、`.github/workflows/release-plz.yml`、
-  `README.md`、`CONTRIBUTING.md`
-- `docs/adr/0001-name-bleep.md`(本ファイル)
-- `docs/img/bleep.svg`
+- `bleep` — 旧 `publish-guard`(本体スクリプト、`git mv`)
+- `hooks/bleep.sh` — 旧 `hooks/pg-hook.sh`(`git mv`)
+- `hooks/hooks.json`
+- `Cargo.toml`
+- `Cargo.lock`
+- `src/main.rs`
+- `src/host.rs`
+- `src/lex.rs`
+- `tests/host_test.rs`
+- `tests/fixtures/gh-stub.sh`
+- `.claude-plugin/plugin.json`
+- `.claude-plugin/marketplace.json`
+- `release-plz.toml`
+- `.github/workflows/ci.yml`
+- `.github/workflows/release-plz.yml`
+- `README.md`
+- `CONTRIBUTING.md`
+- `docs/img/bleep.svg` — 新規追加(アイキャッチ)
 
 `gh repo rename`・topic 宣言(`naming-coined`)・description の書き直しは
 段2(GitHub 側メタデータ)、dotfiles 側の `home/modules/claude.nix` 等の
