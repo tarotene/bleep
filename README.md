@@ -144,8 +144,14 @@ tokenized and walked by **position**, skipping recognized global options
 whether the next token is the actual subcommand. This means `git -C <dir>
 push` and `gh --repo owner/repo pr create` are correctly recognized as
 push/publish actions — a plain adjacency regex (the previous implementation)
-missed both (#9, #14). If a `gh pr|issue create|edit|comment` segment is
-found, the denylist match runs against `CMD` with any segment that is
+missed both (#9, #14). The recognized `gh` publish surface is
+`pr|issue create|edit|comment`, `release create|edit`, `repo edit`,
+`gist create`, and `api` with a write method (`-X`/`--method` set to `POST`,
+`PUT`, or `PATCH` — a plain `gh api <endpoint>` read defaults to GET and is
+not scanned). `gh api` doesn't take `--repo`, so its target-repo resolution
+falls back to the same `cd`-tracking/`git remote` lookup as everything else.
+If any of these segments is found, the denylist match runs against `CMD`
+with any segment that is
 **exactly** `cd <single token>` removed — not against the whole command
 string — so a `cd`'s path argument merely containing a private repo name no
 longer triggers a false-positive hard-deny (#9); everything else (including
