@@ -42,8 +42,12 @@ information. Code, README, Issues/PRs, and commit messages must all satisfy:
 - **No real artifacts**: no screenshots, copies of real files, or real data.
 - **Never commit denylist/allowlist config files**: `orgs.txt`, `repos.txt`,
   and `allow-*.txt` are files this tool reads at runtime, and are also in
-  this repository's `.gitignore`. Test fixtures stay confined to a
-  `mktemp -d` inside selftest.
+  this repository's `.gitignore`. These, and anything derived from real
+  `gh`/`git` state, stay confined to a `mktemp -d` inside selftest.
+  Static mock payloads under `tests/fixtures/` (PreToolUse JSON, the stub
+  `gh` script) are fine to commit as long as they only use the fictional
+  names above — they aren't denylist/allowlist config, they're inputs the
+  selftest feeds to it.
 - **Final check before committing**: re-read the diff specifically looking
   for proper nouns and URLs. When in doubt, leave it out.
 

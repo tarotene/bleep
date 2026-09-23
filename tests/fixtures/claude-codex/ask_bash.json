@@ -1,0 +1,1 @@
+{"tool_name":"Bash","tool_input":{"command":"gh pr create --title t --body \"acme is our employer\""}}
