@@ -112,6 +112,7 @@ init_vars() {
   ALLOW_PATHS_FILE="${PUBLISH_GUARD_ALLOW_PATHS_FILE:-$CONFIG_DIR/allow-paths.txt}"
   OWNER="${PUBLISH_GUARD_OWNER:-}"
   GH_BIN="${PUBLISH_GUARD_GH_BIN:-gh}"
+  LEX_BIN="${PUBLISH_GUARD_LEX_BIN:-publish-guard-hook}" # cmd_scan_bash_command の字句解析(D1)
   CACHE_TTL="${PUBLISH_GUARD_CACHE_TTL:-86400}"
   PRIVATE_CACHE="$STATE_DIR/private-repos-cache.txt"
   VIS_CACHE="$STATE_DIR/visibility-cache.tsv"
@@ -532,7 +533,7 @@ cmd_scan_push() {
   exit 0
 }
 
-# ---- コマンド文字列のセグメント解析(#9/#14 対応) --------------------------
+# ---- コマンド文字列の字句解析(#9/#14 対応、D1) ----------------------------
 #
 # 以前の cmd_scan_bash_command は正規表現で CMD 全体を検索していた
 # (`gh[[:space:]]+(pr|issue)...` / `git[[:space:]]+push`)。これは2つの
@@ -545,392 +546,59 @@ cmd_scan_push() {
 #      対象リポジトリ自身の名前がパス経由で含まれるだけで hard-deny する
 #      (#9)。
 #
-# ここでは CMD を `;`/`&&`/`||`/`|`/改行 で区切ったセグメントに分け、
-# セグメントごとにトークン位置で分類する(D5: 隣接一致ではなく位置で見る)。
-# 一方、denylist との照合対象(scan subject)は「CMD 全文から、厳密に
-# `cd <単一トークン>` とだけ一致したセグメントだけを除いたもの」にする
-# (D3 の限定版)。gh/git アクションのセグメントだけに絞らないのは、素朴な
-# 分割が引用符の外の `$(...)` 等で意図せず割れた場合でも、cd セグメント
-# 以外の断片は常に scan subject に残る(= 検出漏れを作らない)ようにする
-# ため — 分割の正確さを検出精度の前提にしない。
-#
-# クォート(' と ")の対応は追うが、$(...) のネストは追わない(README の
-# 「security boundary ではない」範囲内の近似)。
+# CMD を `;`/`&&`/`||`/`|`/改行 で区切ったセグメントに分け、セグメントごとに
+# トークン位置で分類する(隣接一致ではなく位置で見る)必要があった。この
+# セグメント分割・トークン化・分類・cd 積み重ねによる実効ディレクトリ解決
+# (旧 split_command_segments/tokenize_segment/classify_segment/
+# resolve_effective_dir)は $LEX_BIN(publish-guard-hook、src/lex.rs)に
+# 移した — 純粋関数のみ(I/O・gh・キャッシュ非依存)で、判定を運ばない
+# 継ぎ目のため、この本体の判断ロジック(match_verdict/build_patterns/
+# resolve_repo_nwo)には影響しない。移植の経緯・字句解析だけを Rust に
+# 委ねた理由は publish-guard-wise-elephant の Plan(#22 で見つかった
+# fail-open の退行 — 自前実装がシェルの引用規則を不完全に近似していた)
+# を参照。
 
-CMD_SEGMENTS=()
-# split_command_segments: $1=cmd -> CMD_SEGMENTS にセグメントを積む(副作用。
-# build_patterns の PLAIN_PATTERNS 等と同じグローバル配列の idiom)。クォート
-# が閉じないまま終わった場合は分割せず CMD 全体を1セグメントにする
-# (D4 — パーサの失敗を緩和側の分割として使わない)。バックスラッシュ
-# エスケープも解釈する(#22)— 解釈しないと \" 等でクォート状態が誤って
-# 反転し、以降の && ; | がセグメント区切りとして認識されず fail-open する。
-split_command_segments() {
-  local cmd="$1"
-  CMD_SEGMENTS=()
-  local buf='' i=0 n=${#cmd} c two nc quote=''
-  while ((i < n)); do
-    c="${cmd:i:1}"
-    if [[ $quote == "'" ]]; then
-      # 単一引用符内は \ を含め一切のエスケープが働かない(POSIX)。
-      buf+="$c"
-      [[ $c == "'" ]] && quote=''
-      i=$((i + 1))
-      continue
-    fi
-    if [[ $quote == '"' ]]; then
-      # 二重引用符内は \ が $ ` " \ および改行の直前でだけエスケープとして
-      # 働く(#22)。特に \" はここで閉じ扱いしてはいけない —
-      # 閉じ扱いにすると quote 状態が早期に外れ、以降の && 等が区切りとして
-      # 誤認識され fail-open する(echo \" && gh pr create ... が無検査 pass
-      # した回帰)。
-      if [[ $c == '\' ]]; then
-        nc="${cmd:i + 1:1}"
-        case "$nc" in
-          '$' | '`' | '"' | '\' | $'\n')
-            buf+="$c$nc"
-            i=$((i + 2))
-            continue
-            ;;
-        esac
-      fi
-      buf+="$c"
-      [[ $c == '"' ]] && quote=''
-      i=$((i + 1))
-      continue
-    fi
-    case "$c" in
-      '\')
-        # クォート外の \ は直後の1文字をエスケープする(POSIX)。区切り文字
-        # (; & | 改行)やクォート開始文字がエスケープされた場合、区切り・
-        # 開始のいずれとしても扱わない — raw text は変更せず両文字とも buf
-        # に積む(このセグメント自体は unescape しない設計を維持)。
-        nc="${cmd:i + 1:1}"
-        if [[ -n $nc ]]; then
-          buf+="$c$nc"
-          i=$((i + 2))
-        else
-          buf+="$c" # 末尾の孤立した \ はリテラル扱い
-          i=$((i + 1))
-        fi
-        continue
-        ;;
-      "'" | '"')
-        quote="$c"
-        buf+="$c"
-        i=$((i + 1))
-        continue
-        ;;
-      ';')
-        CMD_SEGMENTS+=("$buf")
-        buf=''
-        i=$((i + 1))
-        continue
-        ;;
-      $'\n')
-        CMD_SEGMENTS+=("$buf")
-        buf=''
-        i=$((i + 1))
-        continue
-        ;;
-      '&' | '|')
-        two="${cmd:i:2}"
-        if [[ $two == "&&" || $two == "||" || $two == "|&" ]]; then
-          CMD_SEGMENTS+=("$buf")
-          buf=''
-          i=$((i + 2))
-          continue
-        fi
-        # 単独の & (background) / | (pipe) も区切りとして扱う — publish
-        # サブコマンドが後続に来るケースを見逃さない側に倒す。
-        CMD_SEGMENTS+=("$buf")
-        buf=''
-        i=$((i + 1))
-        continue
-        ;;
-    esac
-    buf+="$c"
-    i=$((i + 1))
-  done
-
-  if [[ -n $quote ]]; then
-    CMD_SEGMENTS=("$cmd") # クォート閉じ忘れ = パース不能。分割しない。
-    return 0
-  fi
-  CMD_SEGMENTS+=("$buf")
-  return 0
-}
-
-SEG_TOKENS=()
-# tokenize_segment: $1=segment -> SEG_TOKENS にクォートを外したトークンを
-# 積む(副作用)。classify_segment がサブコマンドの位置を判定するための
-# 簡易トークナイザ。POSIX のエスケープ規則(クォート外の \ は直後の1文字を
-# リテラル化、二重引用符内は $ ` " \ および改行の直前でのみエスケープとして
-# 働く、単一引用符内は \ もリテラル)を解釈する(#22 — 誤って解釈しないと
-# --repo/-R の値取り違えや区切りの誤認識につながる)。
-tokenize_segment() {
-  local seg="$1"
-  SEG_TOKENS=()
-  local buf='' i=0 n=${#seg} c nc quote='' started=0
-  while ((i < n)); do
-    c="${seg:i:1}"
-    if [[ $quote == "'" ]]; then
-      if [[ $c == "'" ]]; then
-        quote=''
-      else
-        buf+="$c"
-      fi
-      i=$((i + 1))
-      continue
-    fi
-    if [[ $quote == '"' ]]; then
-      if [[ $c == '"' ]]; then
-        quote=''
-        i=$((i + 1))
-        continue
-      fi
-      if [[ $c == '\' ]]; then
-        nc="${seg:i + 1:1}"
-        case "$nc" in
-          '$' | '`' | '"' | '\' | $'\n')
-            buf+="$nc"
-            i=$((i + 2))
-            continue
-            ;;
-        esac
-      fi
-      buf+="$c"
-      i=$((i + 1))
-      continue
-    fi
-    case "$c" in
-      '\')
-        nc="${seg:i + 1:1}"
-        if [[ -n $nc ]]; then
-          buf+="$nc"
-          started=1
-          i=$((i + 2))
-        else
-          buf+="$c" # 末尾の孤立した \ はリテラル扱い
-          started=1
-          i=$((i + 1))
-        fi
-        continue
-        ;;
-      "'" | '"')
-        quote="$c"
-        started=1
-        i=$((i + 1))
-        continue
-        ;;
-      [[:space:]])
-        if ((started)); then
-          SEG_TOKENS+=("$buf")
-          buf=''
-          started=0
-        fi
-        i=$((i + 1))
-        continue
-        ;;
-      *)
-        buf+="$c"
-        started=1
-        i=$((i + 1))
-        continue
-        ;;
-    esac
-  done
-  ((started)) && SEG_TOKENS+=("$buf")
-  return 0
-}
-
-SEG_KIND='' SEG_DIR_OVERRIDE='' SEG_REPO_OVERRIDE=''
-# classify_segment: $1=segment -> SEG_KIND(push|gh_publish|other) /
-# SEG_DIR_OVERRIDE(git -C の引数) / SEG_REPO_OVERRIDE(gh --repo/-R の引数)
-# を設定する。global option をトークン位置で読み飛ばしてからサブコマンド
-# 位置を確定するため、`git -C <dir> push` や `gh --repo x pr create` も
-# 正しく分類できる(D5)。未知の global option(`-` 始まり)は安全側
-# (読み飛ばし)に倒す — 誤って分類漏れにしない。
-classify_segment() {
-  SEG_KIND='other' SEG_DIR_OVERRIDE='' SEG_REPO_OVERRIDE=''
-  tokenize_segment "$1"
-  local -a t=("${SEG_TOKENS[@]}")
-  local n=${#t[@]}
-  ((n > 0)) || return 0
-
-  case "${t[0]}" in
-    git)
-      local idx=1
-      while ((idx < n)); do
-        case "${t[idx]}" in
-          -C)
-            SEG_DIR_OVERRIDE="${t[idx + 1]-}"
-            idx=$((idx + 2))
-            continue
-            ;;
-          -c | --git-dir | --work-tree | --namespace)
-            idx=$((idx + 2)) # 値を1個消費
-            continue
-            ;;
-          --git-dir=* | --work-tree=* | --namespace=* | -c=*)
-            idx=$((idx + 1))
-            continue
-            ;;
-          --no-pager | --paginate | -p | --bare | --literal-pathspecs | --no-optional-locks)
-            idx=$((idx + 1))
-            continue
-            ;;
-          -*)
-            idx=$((idx + 1)) # 未知の global option。読み飛ばす(安全側)。
-            continue
-            ;;
-          *)
-            break
-            ;;
-        esac
-      done
-      [[ $idx -lt $n && "${t[idx]}" == push ]] && SEG_KIND='push'
-      ;;
-    gh)
-      local idx=1
-      while ((idx < n)); do
-        case "${t[idx]}" in
-          --repo | -R)
-            SEG_REPO_OVERRIDE="${t[idx + 1]-}"
-            idx=$((idx + 2))
-            continue
-            ;;
-          --repo=*)
-            SEG_REPO_OVERRIDE="${t[idx]#--repo=}"
-            idx=$((idx + 1))
-            continue
-            ;;
-          --hostname)
-            idx=$((idx + 2))
-            continue
-            ;;
-          -*)
-            idx=$((idx + 1))
-            continue
-            ;;
-          *)
-            break
-            ;;
-        esac
-      done
-      if ((idx < n)); then
-        local sub="${t[idx]}" action="${t[idx + 1]-}"
-        if [[ ($sub == pr || $sub == issue) && ($action == create || $action == edit || $action == comment) ]]; then
-          SEG_KIND='gh_publish'
-        elif [[ $sub == release && ($action == create || $action == edit) ]]; then
-          SEG_KIND='gh_publish' # gh release create|edit(#8 由来の要調査項目 G2)
-        elif [[ $sub == repo && $action == edit ]]; then
-          SEG_KIND='gh_publish' # gh repo edit --description 等
-        elif [[ $sub == gist && $action == create ]]; then
-          SEG_KIND='gh_publish' # gh gist create
-        elif [[ $sub == api ]]; then
-          # gh api は --repo を取らない(REST エンドポイントを直接叩く)ため
-          # ここでは書き込みメソッドの有無だけを見る。-X/--method の値が
-          # POST/PUT/PATCH なら「ファイル内容の直接更新」等の公開面として
-          # 扱う。--repo が無い分、nwo 解決は resolve_effective_dir 経由の
-          # git remote フォールバックに委ねる(解決できなければ visibility
-          # スキップに入らず、scan_subject の全文照合が効く — fail-loud)。
-          local j method=''
-          for ((j = idx + 1; j < n; j++)); do
-            case "${t[j]}" in
-              -X | --method)
-                method="${t[j + 1]-}"
-                ;;
-              --method=*)
-                method="${t[j]#--method=}"
-                ;;
-            esac
-          done
-          case "${method^^}" in
-            POST | PUT | PATCH)
-              SEG_KIND='gh_publish'
-              ;;
-          esac
-        fi
-      fi
-      ;;
-  esac
-  return 0
-}
-
-# resolve_effective_dir: $1=start_dir $2=upto_index(このインデックスより
-# 前のセグメントだけを見る、0-origin) -> CMD_SEGMENTS を先頭から歩き、
-# 厳密に `cd <単一トークン>` と一致するセグメントだけを反映した実効
-# ディレクトリを出力する。1個の cd だけでなく、先行する全 cd を順に
-# 適用する(#14 の裁定 — 先頭の cd だけを見て誤解決しない)。絶対パスは
-# そのまま、相対パスは直前の実効ディレクトリに連結する。`~` 展開や
-# 変数展開はしない(静的解析の範囲外 — 解決できなければ後段の git -C が
-# 失敗し、既存の fail-loud 経路に委ねる)。
-resolve_effective_dir() {
-  local dir="$1" upto="$2" i seg tgt
-  for ((i = 0; i < upto; i++)); do
-    seg="${CMD_SEGMENTS[i]}"
-    if [[ $seg =~ ^[[:space:]]*cd[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
-      tgt="${BASH_REMATCH[1]}"
-      if [[ $tgt == /* ]]; then
-        dir="$tgt"
-      else
-        dir="$dir/$tgt"
-      fi
-    fi
-  done
-  printf '%s' "$dir"
-}
-
-# cmd_scan_bash_command: CMD をセグメントに分割し、"git push" 形(-C 込み)
-# または "gh pr|issue create/edit/comment" 形(--repo 込み)のセグメントを
-# トークン位置で見つける。見つかった場合、対象ディレクトリ/リポジトリは
-# そのセグメント自身の -C/--repo を優先し、無ければ先行する cd セグメントの
-# 積み重ねから解決する。照合対象(scan subject)は CMD 全文から `cd <単一
-# トークン>` セグメントだけを除いたもの(#9)。どちらの形も見つからなければ
-# 無検査で pass(フォールスルー)。Claude/Codex/Copilot の Bash 系 adapter が
-# 共通で呼ぶ、シェルコマンド用の唯一の判定入口。
+# cmd_scan_bash_command: CMD の字句解析(セグメント分割・"git push" 形/
+# "gh pr|issue create/edit/comment" 形の検出・cd 積み重ねによる実効
+# ディレクトリ解決)は $LEX_BIN(publish-guard-hook、D1)に委ねる。この
+# バイナリは純粋関数のみで I/O・gh を一切行わないため、判定不能を無言 pass
+# にしない fail-loud の格は落ちない — 起動自体に失敗したら ask にエスカレート
+# する(下記 lex_out の読み取り失敗を参照)。出力は5行の固定ヘッダ
+# (found_push/push_dir/found_gh/gh_repo_override/gh_effective_dir)+
+# scan_subject(jq 非依存を保つための独自の単純書式、publish-guard-hook
+# lex --help 参照)。照合対象(scan subject)は CMD 全文から `cd <単一
+# トークン>` セグメントだけを除いたもの(#9)。push/gh のどちらの形も
+# 見つからなければ無検査で pass(フォールスルー)。Claude/Codex/Copilot の
+# Bash 系 host が共通で呼ぶ、シェルコマンド用の唯一の判定入口。
 cmd_scan_bash_command() {
   local cmd="${1-}"
   [[ -n $cmd ]] || { usage >&2; exit 2; }
 
-  split_command_segments "$cmd"
-  local n=${#CMD_SEGMENTS[@]}
+  local lex_out
+  if ! lex_out="$("$LEX_BIN" lex --cwd "${TARGET_CWD:-.}" -- "$cmd" 2>/dev/null)"; then
+    emit_verdict ask "コマンドの字句解析に失敗しました(publish-guard-hook が見つからないか実行できません)。"
+  fi
 
-  local scan_subject='' seg
-  for seg in "${CMD_SEGMENTS[@]}"; do
-    [[ $seg =~ ^[[:space:]]*cd[[:space:]]+[^[:space:]]+[[:space:]]*$ ]] && continue
-    scan_subject+="$seg"$'\n'
-  done
+  local found_push found_gh push_dir gh_repo_override gh_effective_dir scan_subject
+  {
+    IFS= read -r found_push
+    IFS= read -r push_dir
+    IFS= read -r found_gh
+    IFS= read -r gh_repo_override
+    IFS= read -r gh_effective_dir
+    scan_subject="$(cat)"
+  } <<< "$lex_out"
 
-  local found_push=false push_dir='' found_gh=false gh_nwo='' i
-  for ((i = 0; i < n; i++)); do
-    classify_segment "${CMD_SEGMENTS[i]}"
-    if [[ $SEG_KIND == push && $found_push == false ]]; then
-      found_push=true
-      if [[ -n $SEG_DIR_OVERRIDE ]]; then
-        push_dir="$SEG_DIR_OVERRIDE"
-      else
-        push_dir="$(resolve_effective_dir "${TARGET_CWD:-.}" "$i")"
-      fi
+  if [[ $found_gh == "1" ]]; then
+    local gh_nwo="$gh_repo_override"
+    if [[ -z $gh_nwo ]]; then
+      local saved_target="$TARGET_CWD"
+      TARGET_CWD="$gh_effective_dir"
+      gh_nwo="$(resolve_repo_nwo)" || gh_nwo=""
+      TARGET_CWD="$saved_target"
     fi
-    if [[ $SEG_KIND == gh_publish && $found_gh == false ]]; then
-      found_gh=true
-      if [[ -n $SEG_REPO_OVERRIDE ]]; then
-        gh_nwo="$SEG_REPO_OVERRIDE"
-      else
-        local gdir saved_target="$TARGET_CWD"
-        gdir="$(resolve_effective_dir "${TARGET_CWD:-.}" "$i")"
-        TARGET_CWD="$gdir"
-        gh_nwo="$(resolve_repo_nwo)" || gh_nwo=""
-        TARGET_CWD="$saved_target"
-      fi
-    fi
-  done
-
-  # 優先順位は従来どおり gh > git push(1個のコマンドに両方が含まれる
-  # 稀なケースでは gh 側だけを検査する — 既存実装からの引き継ぎで、今回の
-  # 変更で新たに縮小した範囲ではない)。
-  if [[ $found_gh == true ]]; then
+    # 優先順位は従来どおり gh > git push(1個のコマンドに両方が含まれる
+    # 稀なケースでは gh 側だけを検査する — 既存実装からの引き継ぎ)。
     if [[ -n $gh_nwo ]]; then
       local vis
       vis="$(repo_visibility "$gh_nwo")"
@@ -944,7 +612,7 @@ cmd_scan_bash_command() {
     exit 0
   fi
 
-  if [[ $found_push == true ]]; then
+  if [[ $found_push == "1" ]]; then
     TARGET_CWD="$push_dir"
     cmd_scan_push
     return

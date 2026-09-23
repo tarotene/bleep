@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/claude-adapter.sh",
+          "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/pg-hook.sh --host=claude",
           "timeout": 20
         }
       ]

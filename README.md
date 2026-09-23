@@ -7,8 +7,12 @@ A deny/ask gate that prevents AI coding agents from leaking company/private repo
 Born as a Claude Code PreToolUse hook (originally
 `config/claude/hooks/public-publish-guard.sh` in
 [tarotene/dotfiles](https://github.com/tarotene/dotfiles)), this repository
-extracted the decision engine into an agent-agnostic CLI and added thin
-adapters for the Claude Code plugin, Codex CLI, and Copilot CLI.
+extracted the decision engine into an agent-agnostic CLI (`publish-guard`,
+Bash) and a small Rust binary (`publish-guard-hook`) that translates each
+host's PreToolUse payload into calls against that CLI. A thin Bash shim
+(`hooks/pg-hook.sh`) is what each host actually registers — it locates
+`publish-guard-hook` and execs into it, falling back to an `ask` verdict if
+the binary isn't installed (see [Install](#install)).
 
 ## Install
 
@@ -76,6 +80,24 @@ What this does and does not cover:
   example above. If you commit to keeping the repo private, move the entry
   back out of `allow-stopwords.txt` and into `repos.txt` instead.
 
+### `publish-guard-hook` binary (required for every host)
+
+Every host's hook registration points at `hooks/pg-hook.sh`, a shim that
+execs into the `publish-guard-hook` binary. Install it once per machine:
+
+```
+$ cargo install publish-guard-hook
+```
+
+The shim looks for it via `$PUBLISH_GUARD_HOOK_BIN`, then `PATH`, then
+`~/.cargo/bin/publish-guard-hook` (in that order). **If none of those
+resolve, the shim does not silently let the tool call through** — it prints
+an `ask` verdict and exits 0, so an agent is stopped for confirmation rather
+than the guard quietly doing nothing. This is a different failure mode from
+the hook-timeout caveat below: a missing binary is something this repository
+*can* detect and fail loud on, unlike a timeout, which is out of its hands
+entirely.
+
 ### Claude Code
 
 ```
@@ -84,8 +106,8 @@ What this does and does not cover:
 ```
 
 `.claude-plugin/plugin.json` reads `hooks/hooks.json`, which registers
-`hooks/claude-adapter.sh` on `PreToolUse` with a single compound matcher
-`Bash|mcp__.*` (self-resolved via `${CLAUDE_PLUGIN_ROOT}`).
+`hooks/pg-hook.sh --host=claude` on `PreToolUse` with a single compound
+matcher `Bash|mcp__.*` (self-resolved via `${CLAUDE_PLUGIN_ROOT}`).
 
 **Why the matchers aren't split**: you might be tempted to write two
 separate hook entries, one for Bash and one for MCP — don't. Combined with a
@@ -130,7 +152,7 @@ merger, similar to dotfiles' `register-codex-hooks`):
       {
         "matcher": "Bash|mcp__.*",
         "hooks": [
-          {"type": "command", "command": "/path/to/publish-guard/adapters/codex-adapter.sh", "timeout": 20}
+          {"type": "command", "command": "/path/to/publish-guard/hooks/pg-hook.sh --host=codex", "timeout": 20}
         ]
       }
     ]
@@ -152,7 +174,7 @@ Add this under the `"hooks"` key in `~/.copilot/settings.json`:
 {
   "hooks": {
     "preToolUse": [
-      {"type": "command", "bash": "/path/to/publish-guard/adapters/copilot-adapter.sh", "timeoutSec": 20}
+      {"type": "command", "bash": "/path/to/publish-guard/hooks/pg-hook.sh --host=copilot", "timeoutSec": 20}
     ]
   }
 }
@@ -160,17 +182,17 @@ Add this under the `"hooks"` key in `~/.copilot/settings.json`:
 
 Copilot's `preToolUse` **has no matcher** (verified against a real
 instance — it fires unconditionally on every tool call). Filtering happens
-inside the adapter itself (checking whether `toolName == "bash"`).
+inside `publish-guard-hook` itself (checking whether `toolName == "bash"`).
 
 ## Usage
 
 **`--cwd DIR`**: a global option, placed before the subcommand name, that
 tells `resolve_repo_nwo`/`compute_push_diff_text`/`resolve_default_branch` to
 treat `DIR` as the target repository's location instead of the hook
-process's own cwd. All three official adapters pass this automatically from
-the PreToolUse payload's `cwd` field (Claude, Codex, and Copilot all expose
-one — Copilot's has been verified against a real instance; see `hooks/claude-
-adapter.sh` / `adapters/*.sh` for the field paths). This exists because a
+process's own cwd. `publish-guard-hook` passes this automatically for all
+three hosts from the PreToolUse payload's `cwd` field (Claude, Codex, and
+Copilot all expose one — Copilot's has been verified against a real
+instance; see `src/host.rs` for the field paths). This exists because a
 PreToolUse hook runs as a separate process **before** the actual shell
 command executes, so a command like `cd /other/repo && gh pr create ...`
 can't be resolved by looking at the hook process's own cwd — it's still
@@ -263,8 +285,10 @@ visibility.
 ## Scope
 
 This repository owns the decision-engine CLI (`scan`/`scan-push`/
-`scan-bash-command`/`audit`), thin adapters for the Claude Code plugin,
-Codex CLI, and Copilot CLI, and the denylist/allowlist config-file format.
+`scan-bash-command`/`audit`), the `publish-guard-hook` binary that translates
+each host's PreToolUse payload into calls against that CLI, the `pg-hook.sh`
+shim each host actually registers, and the denylist/allowlist config-file
+format.
 Building a security boundary against malicious evasion, secret detection
 (gitleaks and similar tools' job), and per-host hook wiring (dotfiles' job)
 are treated as concerns outside this repository.
@@ -321,9 +345,13 @@ only to the human who configures this tool.
 
 ## Development
 
-- `./publish-guard selftest` / `./hooks/claude-adapter.sh --selftest` /
-  `./adapters/codex-adapter.sh --selftest` / `./adapters/copilot-adapter.sh --selftest`
-- `shellcheck -S error publish-guard hooks/*.sh adapters/*.sh`
+- `cargo build` (builds `target/debug/publish-guard-hook`, which the Bash
+  selftests below shell out to for command lexing — set
+  `PUBLISH_GUARD_LEX_BIN=target/debug/publish-guard-hook` before running
+  them if the binary isn't on `PATH`)
+- `./publish-guard selftest` / `./hooks/pg-hook.sh --selftest`
+- `cargo test` / `cargo clippy --all-targets -- -D warnings` / `cargo fmt --check`
+- `shellcheck -S error publish-guard hooks/*.sh`
 - Pre-commit sanitization rules: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
