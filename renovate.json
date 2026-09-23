@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommitTypeAll(chore)",
+    ":timezone(Asia/Tokyo)"
+  ],
+  "schedule": ["before 6am on monday"],
+  "commitMessagePrefix": "chore(deps):",
+  "rangeStrategy": "auto",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on the first day of the month"]
+  },
+  "rebaseWhen": "behind-base-branch",
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "labels": ["dependencies"],
+  "cargo": {
+    "enabled": true,
+    "managerFilePatterns": ["/Cargo\\.toml$/"]
+  },
+  "github-actions": {
+    "enabled": true,
+    "pinDigests": true,
+    "managerFilePatterns": ["/\\.github/workflows/[^/]+\\.ya?ml$/"]
+  },
+  "packageRules": [
+    {
+      "description": "GitHub Actions: group all action upgrades into one PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "labels": ["dependencies", "ci"]
+    }
+  ]
+}

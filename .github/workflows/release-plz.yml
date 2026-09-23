@@ -1,0 +1,88 @@
+name: Release-plz
+
+# rust-repo-governance skill(tarotene/dotfiles)の release-plz.yml テンプレート
+# を単一クレート向けに簡略化したもの(workspace/excluded-crate 分割・
+# embedded HAL 向けの bump-excluded ロジックは publish-guard-hook には
+# 存在しないため省略)。GitHub App token を使う理由: release-plz が開く
+# リリース PR は既定の GITHUB_TOKEN で作ると他の workflow(pull_request
+# トリガーの CI)を再帰的に起動しない制約があるため。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # main への push ごとにリリース PR を開閉する。
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Release-plz PR
+        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+
+  # リリース PR がマージされたら GitHub Release + git tag を作り、
+  # crates.io へ publish する(OIDC Trusted Publishing、id-token: write)。
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write # crates.io への OIDC Trusted Publishing に必要
+    steps:
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Release-plz release
+        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
