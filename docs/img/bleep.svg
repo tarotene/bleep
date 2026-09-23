@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 120" role="img" aria-labelledby="bleep-title">
+  <title id="bleep-title">A black censor bar covering the word BLEEP</title>
+  <!--
+    D8 の執行点: いらすとや / OpenMoji / unDraw のいずれの既成素材にも
+    「ピー音」を直撃する図案が無かった(2026-09-24 実測、docs/adr/0001-
+    name-bleep.md 参照)ため、検閲バーを自作した。favicon・OG 画像・
+    README ロゴをこの1つの SVG で兼用する — 外部素材の点数制限・再配布
+    条項という同期点を一切持ち込まないための選択(D8、軸: 還元)。
+  -->
+  <rect width="360" height="120" fill="none"/>
+  <!-- 背後の単語(隠されている、という文脈を伝える最小限の書字) -->
+  <text x="180" y="76" font-family="Menlo, Consolas, monospace" font-size="44"
+        font-weight="700" fill="#9aa0a6" text-anchor="middle"
+        letter-spacing="6">BLEEP</text>
+  <!-- 検閲バー本体 -->
+  <rect x="30" y="46" width="300" height="34" rx="4" fill="#111318"/>
+  <!-- バー上のハイライト(単なる黒塗りでなく、テープ質感を軽く示す) -->
+  <rect x="30" y="46" width="300" height="6" rx="3" fill="#2b2f38"/>
+</svg>

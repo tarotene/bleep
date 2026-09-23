@@ -1,11 +1,11 @@
 {
-  "name": "publish-guard",
+  "name": "bleep",
   "owner": {
     "name": "Kentaro Sugimoto"
   },
   "plugins": [
     {
-      "name": "publish-guard",
+      "name": "bleep",
       "source": "./"
     }
   ]

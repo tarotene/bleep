@@ -1,6 +1,6 @@
 //! 3つの Bash adapter(claude-adapter.sh / codex-adapter.sh /
 //! copilot-adapter.sh)の統合移植(D1)。判定ロジックは一切持たない —
-//! tool_name/tool_input(または toolName/toolArgs)を publish-guard の入口
+//! tool_name/tool_input(または toolName/toolArgs)を bleep の入口
 //! (scan-bash-command / scan)に渡し、その exit code(0=pass/1=ask/2=deny)を
 //! ホストごとの出力 JSON に翻訳するだけ。
 
@@ -29,7 +29,7 @@ impl Host {
 /// tool_input/toolArgs の文字列リーフだけを出現順に再帰収集する
 /// (`[.. | strings] | join("\n")` の移植)。tostring は使わない — JSON
 /// エスケープが残ると改行が "\n"(バックスラッシュ+n)になり、
-/// publish-guard 側の grep -Fw が改行直後の裸の単語一致を見逃す
+/// bleep 側の grep -Fw が改行直後の裸の単語一致を見逃す
 /// (claude-adapter.sh の既存回帰と同じ理由、tests/fixtures/claude-codex/
 /// deny_mcp_newline.json で固定している)。
 fn collect_string_leaves(v: &Value, out: &mut Vec<String>) {
@@ -119,11 +119,7 @@ fn run_pg(pg_bin: &str, cwd: Option<&str>, args: &[&str], stdin_text: Option<&st
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => {
-            return Verdict::Ask(
-                "publish-guard を起動できませんでした(publish-guard-hook)。".to_string(),
-            )
-        }
+        Err(_) => return Verdict::Ask("bleep を起動できませんでした(bleep-hook)。".to_string()),
     };
     if let Some(text) = stdin_text {
         if let Some(mut stdin) = child.stdin.take() {
@@ -132,11 +128,7 @@ fn run_pg(pg_bin: &str, cwd: Option<&str>, args: &[&str], stdin_text: Option<&st
     }
     let output = match child.wait_with_output() {
         Ok(o) => o,
-        Err(_) => {
-            return Verdict::Ask(
-                "publish-guard の終了を待てませんでした(publish-guard-hook)。".to_string(),
-            )
-        }
+        Err(_) => return Verdict::Ask("bleep の終了を待てませんでした(bleep-hook)。".to_string()),
     };
     let reason = String::from_utf8_lossy(&output.stdout)
         .trim_end()
@@ -170,14 +162,14 @@ fn emit(host: Host, verdict: Verdict) {
     println!("{body}");
 }
 
-/// run_hook の移植。pg_bin は `$PUBLISH_GUARD_BIN`(既定 "publish-guard"、
+/// run_hook の移植。pg_bin は `$BLEEP_BIN`(既定 "bleep"、
 /// PATH 解決)。
 pub fn run(host: Host, pg_bin: &str) {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         emit(
             host,
-            Verdict::Ask("stdin を読み取れませんでした(publish-guard-hook)。".to_string()),
+            Verdict::Ask("stdin を読み取れませんでした(bleep-hook)。".to_string()),
         );
         return;
     }

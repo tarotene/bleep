@@ -1,32 +1,50 @@
-# publish-guard
+# bleep
+
+<img src="docs/img/bleep.svg" alt="A black censor bar over the word BLEEP" width="360">
 
 A deny/ask gate that prevents AI coding agents from leaking company/private repository names onto public GitHub surfaces (git push, PR/Issue creation, MCP tool calls).
+
+Formerly `publish-guard` — see [docs/adr/0001-name-bleep.md](docs/adr/0001-name-bleep.md) for why it was renamed.
 
 ## Background
 
 Born as a Claude Code PreToolUse hook (originally
 `config/claude/hooks/public-publish-guard.sh` in
-[tarotene/dotfiles](https://github.com/tarotene/dotfiles)), this repository
-extracted the decision engine into an agent-agnostic CLI (`publish-guard`,
-Bash) and a small Rust binary (`publish-guard-hook`) that translates each
+[tarotene/dotfiles](https://github.com/tarotene/dotfiles), from this
+repository's time as `publish-guard`), this repository
+extracted the decision engine into an agent-agnostic CLI (`bleep`,
+Bash) and a small Rust binary (`bleep-hook`) that translates each
 host's PreToolUse payload into calls against that CLI. A thin Bash shim
-(`hooks/pg-hook.sh`) is what each host actually registers — it locates
-`publish-guard-hook` and execs into it, falling back to an `ask` verdict if
+(`hooks/bleep.sh`) is what each host actually registers — it locates
+`bleep-hook` and execs into it, falling back to an `ask` verdict if
 the binary isn't installed (see [Install](#install)).
 
 ## Install
 
+**Upgrading from `publish-guard`**: this tool was renamed from
+`publish-guard`/`publish-guard-hook` to `bleep`/`bleep-hook` (see
+[docs/adr/0001-name-bleep.md](docs/adr/0001-name-bleep.md)). There is no
+compatibility shim — move your config and state directories by hand, once:
+
+```
+$ mv ~/.config/publish-guard ~/.config/bleep
+$ mv ~/.local/state/publish-guard ~/.local/state/bleep   # if it exists
+```
+
+Then reinstall the plugin/hooks under the new name (see below) and remove the
+old `publish-guard@publish-guard` plugin install.
+
 This repository never commits denylist data (org names, repo names). You
-place your own under `$XDG_CONFIG_HOME/publish-guard/` (defaults to
-`~/.config/publish-guard/`). **The only thing you realistically have to
+place your own under `$XDG_CONFIG_HOME/bleep/` (defaults to
+`~/.config/bleep/`). **The only thing you realistically have to
 write by hand is one line in `orgs.txt` with your org name** — your own
 private/internal repository names are live-derived from the org name you
 wrote there plus the owner of your authenticated `gh` user, using your own
 `gh` credentials. Nobody carries around a literal list of repo names.
 
 ```
-$ mkdir -p ~/.config/publish-guard
-$ echo acme > ~/.config/publish-guard/orgs.txt   # write only your company's org name
+$ mkdir -p ~/.config/bleep
+$ echo acme > ~/.config/bleep/orgs.txt   # write only your company's org name
 ```
 
 Optional config files you can add (all optional, one entry per line, `#`
@@ -49,7 +67,7 @@ covered by the stopword mechanism that already exists for false positives
 in general:
 
 ```
-$ cat >> ~/.config/publish-guard/allow-stopwords.txt <<'EOF'
+$ cat >> ~/.config/bleep/allow-stopwords.txt <<'EOF'
 # prospectively public — revert to repos.txt if this changes
 my-side-project
 EOF
@@ -80,17 +98,17 @@ What this does and does not cover:
   example above. If you commit to keeping the repo private, move the entry
   back out of `allow-stopwords.txt` and into `repos.txt` instead.
 
-### `publish-guard-hook` binary (required for every host)
+### `bleep-hook` binary (required for every host)
 
-Every host's hook registration points at `hooks/pg-hook.sh`, a shim that
-execs into the `publish-guard-hook` binary. Install it once per machine:
+Every host's hook registration points at `hooks/bleep.sh`, a shim that
+execs into the `bleep-hook` binary. Install it once per machine:
 
 ```
-$ cargo install publish-guard-hook
+$ cargo install bleep-hook
 ```
 
-The shim looks for it via `$PUBLISH_GUARD_HOOK_BIN`, then `PATH`, then
-`~/.cargo/bin/publish-guard-hook` (in that order). **If none of those
+The shim looks for it via `$BLEEP_HOOK_BIN`, then `PATH`, then
+`~/.cargo/bin/bleep-hook` (in that order). **If none of those
 resolve, the shim does not silently let the tool call through** — it prints
 an `ask` verdict and exits 0, so an agent is stopped for confirmation rather
 than the guard quietly doing nothing. This is a different failure mode from
@@ -101,12 +119,12 @@ entirely.
 ### Claude Code
 
 ```
-/plugin marketplace add tarotene/publish-guard
-/plugin install publish-guard@publish-guard
+/plugin marketplace add tarotene/bleep
+/plugin install bleep@bleep
 ```
 
 `.claude-plugin/plugin.json` reads `hooks/hooks.json`, which registers
-`hooks/pg-hook.sh --host=claude` on `PreToolUse` with a single compound
+`hooks/bleep.sh --host=claude` on `PreToolUse` with a single compound
 matcher `Bash|mcp__.*` (self-resolved via `${CLAUDE_PLUGIN_ROOT}`).
 
 **Why the matchers aren't split**: you might be tempted to write two
@@ -127,17 +145,17 @@ and pre-install for every user via `enabledPlugins`.
 ```json
 {
   "strictKnownMarketplaces": [
-    {"source": "github", "repo": "tarotene/publish-guard"}
+    {"source": "github", "repo": "tarotene/bleep"}
   ],
   "enabledPlugins": {
-    "publish-guard@publish-guard": true
+    "bleep@bleep": true
   }
 }
 ```
 
 Denylist data (`orgs.txt`, etc.) does not travel through this distribution
 path — each user still has to write their org name into their own
-`~/.config/publish-guard/orgs.txt` (this is intentional; see "This is not a
+`~/.config/bleep/orgs.txt` (this is intentional; see "This is not a
 security boundary" under [Scope](#scope) for details).
 
 ### Codex CLI
@@ -152,7 +170,7 @@ merger, similar to dotfiles' `register-codex-hooks`):
       {
         "matcher": "Bash|mcp__.*",
         "hooks": [
-          {"type": "command", "command": "/path/to/publish-guard/hooks/pg-hook.sh --host=codex", "timeout": 20}
+          {"type": "command", "command": "/path/to/bleep/hooks/bleep.sh --host=codex", "timeout": 20}
         ]
       }
     ]
@@ -174,7 +192,7 @@ Add this under the `"hooks"` key in `~/.copilot/settings.json`:
 {
   "hooks": {
     "preToolUse": [
-      {"type": "command", "bash": "/path/to/publish-guard/hooks/pg-hook.sh --host=copilot", "timeoutSec": 20}
+      {"type": "command", "bash": "/path/to/bleep/hooks/bleep.sh --host=copilot", "timeoutSec": 20}
     ]
   }
 }
@@ -182,14 +200,14 @@ Add this under the `"hooks"` key in `~/.copilot/settings.json`:
 
 Copilot's `preToolUse` **has no matcher** (verified against a real
 instance — it fires unconditionally on every tool call). Filtering happens
-inside `publish-guard-hook` itself (checking whether `toolName == "bash"`).
+inside `bleep-hook` itself (checking whether `toolName == "bash"`).
 
 ## Usage
 
 **`--cwd DIR`**: a global option, placed before the subcommand name, that
 tells `resolve_repo_nwo`/`compute_push_diff_text`/`resolve_default_branch` to
 treat `DIR` as the target repository's location instead of the hook
-process's own cwd. `publish-guard-hook` passes this automatically for all
+process's own cwd. `bleep-hook` passes this automatically for all
 three hosts from the PreToolUse payload's `cwd` field (Claude, Codex, and
 Copilot all expose one — Copilot's has been verified against a real
 instance; see `src/host.rs` for the field paths). This exists because a
@@ -228,7 +246,7 @@ of the hook process's own cwd (#10, #14). Nested `$(...)` command
 substitutions are not tracked — this is an approximation within the "not a
 security boundary" scope already stated below.
 
-`publish-guard scan`/`scan-push`/`scan-bash-command` all share the same exit
+`bleep scan`/`scan-push`/`scan-bash-command` all share the same exit
 code contract (for anyone scripting against this themselves):
 
 | exit code | meaning | stdout |
@@ -237,7 +255,7 @@ code contract (for anyone scripting against this themselves):
 | 1 | ask (a bare org-name match — could collide with a legitimate use) | one-line reason |
 | 2 | deny (an explicit org/repo reference or a specific repo-name match — almost certainly an unintended leak) | one-line reason |
 
-**What `scan-push` checks**: `publish-guard scan-push` (and `git push`
+**What `scan-push` checks**: `bleep scan-push` (and `git push`
 detection via `scan-bash-command`) inspects the **added lines** (plus
 new/renamed file paths) and the full commit message of each commit in the
 range being pushed. **Removed lines are not scanned** (#7 — this addresses
@@ -250,7 +268,7 @@ net diff, adding a secret in one commit and removing it in a later commit
 within the same branch still gets denied once you push, since the
 intermediate commit's content becomes public regardless.
 
-**A caveat about `audit --remote`**: `publish-guard audit --remote` fetches
+**A caveat about `audit --remote`**: `bleep audit --remote` fetches
 the **full title/body of every open Issue/PR** in the target repository via
 `gh issue list`/`gh pr list` and loads it into the local process. Running it
 against a company private/internal repository temporarily leaves that
@@ -271,7 +289,7 @@ between `<rev>` and `HEAD`, reusing the same added-lines-only extraction
 here either):
 
 ```
-$ publish-guard audit --since "$(git rev-list --max-parents=0 HEAD)"
+$ bleep audit --since "$(git rev-list --max-parents=0 HEAD)"
 ```
 
 **This intentionally isn't wired into CI.** Running `audit` in CI would mean
@@ -285,8 +303,8 @@ visibility.
 ## Scope
 
 This repository owns the decision-engine CLI (`scan`/`scan-push`/
-`scan-bash-command`/`audit`), the `publish-guard-hook` binary that translates
-each host's PreToolUse payload into calls against that CLI, the `pg-hook.sh`
+`scan-bash-command`/`audit`), the `bleep-hook` binary that translates
+each host's PreToolUse payload into calls against that CLI, the `bleep.sh`
 shim each host actually registers, and the denylist/allowlist config-file
 format.
 Building a security boundary against malicious evasion, secret detection
@@ -331,12 +349,12 @@ industrial case study", *Empirical Software Engineering*, 2022,
 Claude Code's official documentation states that "a hook that times out does
 not block the tool call." In other words, if the hook process itself doesn't
 finish in time, the operation goes through regardless of the verdict. This
-is a host-CLI-side specification that publish-guard cannot address.
+is a host-CLI-side specification that bleep cannot address.
 — Anthropic, "Hooks reference", <https://code.claude.com/docs/en/hooks>
 (accessed 2026-09-10).
 
-**Bypass: `PUBLISH_GUARD_ALLOW=1`**. `scan`/`scan-push`/`scan-bash-command`
-pass immediately if the `PUBLISH_GUARD_ALLOW=1` environment variable is set.
+**Bypass: `BLEEP_ALLOW=1`**. `scan`/`scan-push`/`scan-bash-command`
+pass immediately if the `BLEEP_ALLOW=1` environment variable is set.
 This is an escape hatch for when you deliberately want to skip the check.
 **The deny/ask reason text never names this env var** — because the
 constrained party (the agent) could otherwise read the deny reason and
@@ -345,13 +363,13 @@ only to the human who configures this tool.
 
 ## Development
 
-- `cargo build` (builds `target/debug/publish-guard-hook`, which the Bash
+- `cargo build` (builds `target/debug/bleep-hook`, which the Bash
   selftests below shell out to for command lexing — set
-  `PUBLISH_GUARD_LEX_BIN=target/debug/publish-guard-hook` before running
+  `BLEEP_LEX_BIN=target/debug/bleep-hook` before running
   them if the binary isn't on `PATH`)
-- `./publish-guard selftest` / `./hooks/pg-hook.sh --selftest`
+- `./bleep selftest` / `./hooks/bleep.sh --selftest`
 - `cargo test` / `cargo clippy --all-targets -- -D warnings` / `cargo fmt --check`
-- `shellcheck -S error publish-guard hooks/*.sh`
+- `shellcheck -S error bleep hooks/*.sh`
 - Pre-commit sanitization rules: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
