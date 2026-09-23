@@ -73,11 +73,19 @@ run_hook() {
   tool_name="$(jq -r '.tool_name // empty' <<< "$input" 2> /dev/null)" || tool_name=""
   [[ -n $tool_name ]] || exit 0
 
+  # PreToolUse payload の cwd を publish-guard に明示的に渡す(#10/#14 —
+  # フックプロセス自身の cwd ではなく、セッションが実際にいるディレクトリを
+  # 対象にする。OpenAI "Hooks" が cwd フィールドの存在を明記)。
+  local hook_cwd
+  hook_cwd="$(jq -r '.cwd // empty' <<< "$input" 2> /dev/null)" || hook_cwd=""
+  local -a cwd_args=()
+  [[ -n $hook_cwd ]] && cwd_args=(--cwd "$hook_cwd")
+
   local reason="" rc=0 cmd text
   if [[ $tool_name == "Bash" ]]; then
     cmd="$(jq -r '.tool_input.command // empty' <<< "$input" 2> /dev/null)" || cmd=""
     if [[ -n $cmd ]]; then
-      if reason="$("$PG" scan-bash-command "$cmd")"; then
+      if reason="$("$PG" "${cwd_args[@]}" scan-bash-command "$cmd")"; then
         rc=0
       else
         rc=$?
@@ -85,7 +93,7 @@ run_hook() {
     fi
   else
     text="$(jq -r '[.tool_input | .. | strings] | join("\n")' <<< "$input" 2> /dev/null)" || text=""
-    if reason="$(printf '%s' "$text" | "$PG" scan -)"; then
+    if reason="$(printf '%s' "$text" | "$PG" "${cwd_args[@]}" scan -)"; then
       rc=0
     else
       rc=$?
@@ -134,6 +142,31 @@ STUB
   printf '%s' '{"tool_name":"mcp__github__create_issue","tool_input":{"title":"t","body":"acme/secret-project"}}' > "$tmp/deny_mcp.json"
   printf '%s' '{}' > "$tmp/no_tool_name.json"
 
+  # --cwd: payload の cwd を経由して、adapter 自身の cwd ではなく対象リポジトリの
+  # push 差分を検査できること(#10/#14)。cwd が無効でも無関係コマンドは pass。
+  local repo="$tmp/repo"
+  mkdir -p "$repo"
+  git -C "$repo" init -qb main
+  git -C "$repo" config core.hooksPath /dev/null
+  git -C "$repo" config user.email test@example.invalid
+  git -C "$repo" config user.name test
+  git -C "$repo" config commit.gpgsign false
+  echo "clean content" > "$repo/a.txt"
+  git -C "$repo" add a.txt
+  git -C "$repo" commit -qm initial
+  git init -q --bare "$tmp/remote.git"
+  git -C "$repo" remote add origin "$tmp/remote.git"
+  git -C "$repo" push -q origin main
+  git -C "$repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  echo "acme/secret-project が話題" >> "$repo/a.txt"
+  git -C "$repo" add a.txt
+  git -C "$repo" commit -qm "mentions acme/secret-project"
+  jq -n --arg cwd "$repo" \
+    '{tool_name:"Bash", tool_input:{command:"git push origin main"}, cwd:$cwd}' \
+    > "$tmp/deny_cwd_push.json"
+  jq -n '{tool_name:"Bash", tool_input:{command:"echo hello"}, cwd:"/does-not-exist"}' \
+    > "$tmp/pass_bad_cwd.json"
+
   local fails=0 out decision
   assert_decision() {
     out="$("$SELF" < "$tmp/$1")"
@@ -156,6 +189,8 @@ STUB
   assert_empty pass_bash.json
   assert_decision deny_mcp.json deny
   assert_empty no_tool_name.json
+  assert_decision deny_cwd_push.json deny # --cwd 経由で対象リポジトリの push を検査
+  assert_empty pass_bad_cwd.json # --cwd 解決失敗でも無関係コマンドは無言 pass
 
   out="$(PUBLISH_GUARD_ALLOW=1 "$SELF" < "$tmp/deny_bash.json")"
   [[ -z $out ]] || { echo "FAIL(ALLOW=1): 出力があった: $out" >&2; fails=$((fails + 1)); }

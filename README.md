@@ -124,6 +124,18 @@ inside the adapter itself (checking whether `toolName == "bash"`).
 
 ## Usage
 
+**`--cwd DIR`**: a global option, placed before the subcommand name, that
+tells `resolve_repo_nwo`/`compute_push_diff_text`/`resolve_default_branch` to
+treat `DIR` as the target repository's location instead of the hook
+process's own cwd. All three official adapters pass this automatically from
+the PreToolUse payload's `cwd` field (Claude, Codex, and Copilot all expose
+one — Copilot's has been verified against a real instance; see `hooks/claude-
+adapter.sh` / `adapters/*.sh` for the field paths). This exists because a
+PreToolUse hook runs as a separate process **before** the actual shell
+command executes, so a command like `cd /other/repo && gh pr create ...`
+can't be resolved by looking at the hook process's own cwd — it's still
+sitting wherever the agent's session started (#10, #14).
+
 `publish-guard scan`/`scan-push`/`scan-bash-command` all share the same exit
 code contract (for anyone scripting against this themselves):
 

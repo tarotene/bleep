@@ -64,11 +64,18 @@ run_hook() {
   tool_name="$(jq -r '.toolName // empty' <<< "$input" 2> /dev/null)" || tool_name=""
   [[ -n $tool_name ]] || exit 0
 
+  # preToolUse payload のトップレベル cwd を publish-guard に明示的に渡す
+  # (#10/#14 — 実機実測済み: adapters/copilot-adapter.sh:8 参照)。
+  local hook_cwd
+  hook_cwd="$(jq -r '.cwd // empty' <<< "$input" 2> /dev/null)" || hook_cwd=""
+  local -a cwd_args=()
+  [[ -n $hook_cwd ]] && cwd_args=(--cwd "$hook_cwd")
+
   local reason="" rc=0 cmd text
   if [[ $tool_name == "bash" ]]; then
     cmd="$(jq -r '.toolArgs.command // empty' <<< "$input" 2> /dev/null)" || cmd=""
     if [[ -n $cmd ]]; then
-      if reason="$("$PG" scan-bash-command "$cmd")"; then
+      if reason="$("$PG" "${cwd_args[@]}" scan-bash-command "$cmd")"; then
         rc=0
       else
         rc=$?
@@ -79,7 +86,7 @@ run_hook() {
     # toolArgs の文字列リーフを再帰収集して実改行で連結する(tostring は
     # 使わない — claude-adapter.sh と同じ理由、改行直後の単語境界一致が壊れる)。
     text="$(jq -r '[.toolArgs | .. | strings] | join("\n")' <<< "$input" 2> /dev/null)" || text=""
-    if reason="$(printf '%s' "$text" | "$PG" scan -)"; then
+    if reason="$(printf '%s' "$text" | "$PG" "${cwd_args[@]}" scan -)"; then
       rc=0
     else
       rc=$?
@@ -131,6 +138,32 @@ STUB
   printf '%s' '{"sessionId":"s","timestamp":1,"cwd":"/x","toolName":"view","toolArgs":{"path":"/x/y"}}' > "$tmp/pass_other.json"
   printf '%s' '{"sessionId":"s","timestamp":1,"cwd":"/x"}' > "$tmp/no_tool_name.json"
 
+  # --cwd: payload の cwd を経由して、adapter 自身の cwd ではなく対象リポジトリの
+  # push 差分を検査できること(#10/#14)。cwd が無効でも無関係コマンドは pass。
+  local repo="$tmp/repo"
+  mkdir -p "$repo"
+  git -C "$repo" init -qb main
+  git -C "$repo" config core.hooksPath /dev/null
+  git -C "$repo" config user.email test@example.invalid
+  git -C "$repo" config user.name test
+  git -C "$repo" config commit.gpgsign false
+  echo "clean content" > "$repo/a.txt"
+  git -C "$repo" add a.txt
+  git -C "$repo" commit -qm initial
+  git init -q --bare "$tmp/remote.git"
+  git -C "$repo" remote add origin "$tmp/remote.git"
+  git -C "$repo" push -q origin main
+  git -C "$repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  echo "acme/secret-project が話題" >> "$repo/a.txt"
+  git -C "$repo" add a.txt
+  git -C "$repo" commit -qm "mentions acme/secret-project"
+  jq -n --arg cwd "$repo" \
+    '{sessionId:"s", timestamp:1, cwd:$cwd, toolName:"bash", toolArgs:{command:"git push origin main"}}' \
+    > "$tmp/deny_cwd_push.json"
+  jq -n \
+    '{sessionId:"s", timestamp:1, cwd:"/does-not-exist", toolName:"bash", toolArgs:{command:"echo hello"}}' \
+    > "$tmp/pass_bad_cwd.json"
+
   local fails=0 out decision
   assert_decision() {
     out="$("$SELF" < "$tmp/$1")"
@@ -154,6 +187,8 @@ STUB
   assert_decision deny_other.json deny
   assert_empty pass_other.json
   assert_empty no_tool_name.json
+  assert_decision deny_cwd_push.json deny # --cwd 経由で対象リポジトリの push を検査
+  assert_empty pass_bad_cwd.json # --cwd 解決失敗でも無関係コマンドは無言 pass
 
   out="$(PUBLISH_GUARD_ALLOW=1 "$SELF" < "$tmp/deny_bash.json")"
   [[ -z $out ]] || { echo "FAIL(ALLOW=1): 出力があった: $out" >&2; fails=$((fails + 1)); }
