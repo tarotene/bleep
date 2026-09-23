@@ -561,20 +561,59 @@ CMD_SEGMENTS=()
 # split_command_segments: $1=cmd -> CMD_SEGMENTS にセグメントを積む(副作用。
 # build_patterns の PLAIN_PATTERNS 等と同じグローバル配列の idiom)。クォート
 # が閉じないまま終わった場合は分割せず CMD 全体を1セグメントにする
-# (D4 — パーサの失敗を緩和側の分割として使わない)。
+# (D4 — パーサの失敗を緩和側の分割として使わない)。バックスラッシュ
+# エスケープも解釈する(#22)— 解釈しないと \" 等でクォート状態が誤って
+# 反転し、以降の && ; | がセグメント区切りとして認識されず fail-open する。
 split_command_segments() {
   local cmd="$1"
   CMD_SEGMENTS=()
-  local buf='' i=0 n=${#cmd} c two quote=''
+  local buf='' i=0 n=${#cmd} c two nc quote=''
   while ((i < n)); do
     c="${cmd:i:1}"
-    if [[ -n $quote ]]; then
+    if [[ $quote == "'" ]]; then
+      # 単一引用符内は \ を含め一切のエスケープが働かない(POSIX)。
       buf+="$c"
-      [[ $c == "$quote" ]] && quote=''
+      [[ $c == "'" ]] && quote=''
+      i=$((i + 1))
+      continue
+    fi
+    if [[ $quote == '"' ]]; then
+      # 二重引用符内は \ が $ ` " \ および改行の直前でだけエスケープとして
+      # 働く(#22)。特に \" はここで閉じ扱いしてはいけない —
+      # 閉じ扱いにすると quote 状態が早期に外れ、以降の && 等が区切りとして
+      # 誤認識され fail-open する(echo \" && gh pr create ... が無検査 pass
+      # した回帰)。
+      if [[ $c == '\' ]]; then
+        nc="${cmd:i + 1:1}"
+        case "$nc" in
+          '$' | '`' | '"' | '\' | $'\n')
+            buf+="$c$nc"
+            i=$((i + 2))
+            continue
+            ;;
+        esac
+      fi
+      buf+="$c"
+      [[ $c == '"' ]] && quote=''
       i=$((i + 1))
       continue
     fi
     case "$c" in
+      '\')
+        # クォート外の \ は直後の1文字をエスケープする(POSIX)。区切り文字
+        # (; & | 改行)やクォート開始文字がエスケープされた場合、区切り・
+        # 開始のいずれとしても扱わない — raw text は変更せず両文字とも buf
+        # に積む(このセグメント自体は unescape しない設計を維持)。
+        nc="${cmd:i + 1:1}"
+        if [[ -n $nc ]]; then
+          buf+="$c$nc"
+          i=$((i + 2))
+        else
+          buf+="$c" # 末尾の孤立した \ はリテラル扱い
+          i=$((i + 1))
+        fi
+        continue
+        ;;
       "'" | '"')
         quote="$c"
         buf+="$c"
@@ -624,15 +663,18 @@ split_command_segments() {
 SEG_TOKENS=()
 # tokenize_segment: $1=segment -> SEG_TOKENS にクォートを外したトークンを
 # 積む(副作用)。classify_segment がサブコマンドの位置を判定するための
-# 簡易トークナイザ。バックスラッシュエスケープは解釈しない。
+# 簡易トークナイザ。POSIX のエスケープ規則(クォート外の \ は直後の1文字を
+# リテラル化、二重引用符内は $ ` " \ および改行の直前でのみエスケープとして
+# 働く、単一引用符内は \ もリテラル)を解釈する(#22 — 誤って解釈しないと
+# --repo/-R の値取り違えや区切りの誤認識につながる)。
 tokenize_segment() {
   local seg="$1"
   SEG_TOKENS=()
-  local buf='' i=0 n=${#seg} c quote='' started=0
+  local buf='' i=0 n=${#seg} c nc quote='' started=0
   while ((i < n)); do
     c="${seg:i:1}"
-    if [[ -n $quote ]]; then
-      if [[ $c == "$quote" ]]; then
+    if [[ $quote == "'" ]]; then
+      if [[ $c == "'" ]]; then
         quote=''
       else
         buf+="$c"
@@ -640,7 +682,40 @@ tokenize_segment() {
       i=$((i + 1))
       continue
     fi
+    if [[ $quote == '"' ]]; then
+      if [[ $c == '"' ]]; then
+        quote=''
+        i=$((i + 1))
+        continue
+      fi
+      if [[ $c == '\' ]]; then
+        nc="${seg:i + 1:1}"
+        case "$nc" in
+          '$' | '`' | '"' | '\' | $'\n')
+            buf+="$nc"
+            i=$((i + 2))
+            continue
+            ;;
+        esac
+      fi
+      buf+="$c"
+      i=$((i + 1))
+      continue
+    fi
     case "$c" in
+      '\')
+        nc="${seg:i + 1:1}"
+        if [[ -n $nc ]]; then
+          buf+="$nc"
+          started=1
+          i=$((i + 2))
+        else
+          buf+="$c" # 末尾の孤立した \ はリテラル扱い
+          started=1
+          i=$((i + 1))
+        fi
+        continue
+        ;;
       "'" | '"')
         quote="$c"
         started=1
@@ -1343,6 +1418,24 @@ acme で議論した"
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(引用符内の && で分割しない): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #22 の回帰1: 二重引用符内の \" が quote 状態を誤って閉じ、後続の && が
+  # 区切りとして認識されず gh pr create セグメントごと無検査 pass していた
+  # (split_command_segments のバックスラッシュエスケープ未対応)。
+  set +e
+  "$SELF" scan-bash-command 'echo \" && gh pr create --title t --body "acme/secret-project"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(#22: \\\" で && の区切りが壊れない): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #22 の回帰2: --repo の値に \" を含むと tokenize_segment が quote を早期に
+  # 閉じ、gh_publish への分類自体に失敗して無検査 pass していた
+  # (tokenize_segment のバックスラッシュエスケープ未対応)。
+  set +e
+  "$SELF" scan-bash-command 'gh --repo "x\"y" pr create --title t --body "acme/secret-project leak"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(#22: --repo 値の \\\" で分類が壊れない): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # 複数 cd(#14 の裁定): 先頭の cd だけでなく、直前までの全 cd を反映する
   # こと。先頭だけ見ると PRIVATE な repo_priv に誤解決して検査全体を
