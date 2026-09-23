@@ -70,6 +70,7 @@ set -euo pipefail
 
 SELF="$(realpath "$0")"
 TEST_TMP=''
+TARGET_CWD='' # --cwd で明示された対象ディレクトリ(#10/#14 対応)。空なら "." 扱い。
 
 # init_vars: env から派生変数を(再)計算する。selftest が env を export した
 # 「後」に呼び直せるよう関数化してある — トップレベルで一度だけ計算すると、
@@ -93,13 +94,21 @@ init_vars
 
 usage() {
   cat <<'EOF'
-usage: publish-guard <scan [FILE]|scan-push|scan-bash-command CMD|
+usage: publish-guard [--cwd DIR] <scan [FILE]|scan-push|scan-bash-command CMD|
                        audit [path...] [--remote]|refresh-cache|selftest>
 
 エージェント非依存の denylist 判定エンジン。scan/scan-push/scan-bash-command
 は exit code で判定を返す: 0=pass, 1=ask(理由を stdout に1行), 2=deny(同)。
 PUBLISH_GUARD_ALLOW=1 で3つの scan* サブコマンドを意識的に bypass できる
 (README にのみ記載 — 判定結果の理由文には出さない)。
+
+--cwd DIR: PreToolUse hook プロセス自身の cwd ではなく DIR を対象リポジトリの
+  位置として扱う(resolve_repo_nwo/compute_push_diff_text/resolve_default_branch
+  が `git -C DIR` で参照する)。サブコマンド名より前に置くこと。DIR が無効な
+  場合の挙動は既存の fail-loud 経路をそのまま使う — push 差分計算(merge-base
+  解決)が失敗すれば ask にエスカレートし、nwo 解決だけが失敗する場合は
+  private/internal 早期スキップに入れないまま denylist 照合を続ける(#10/#14
+  — フックプロセスの cwd への暗黙依存を解消する)。
 
 設定は $XDG_CONFIG_HOME/publish-guard/ 以下、一切コミットしない:
   orgs.txt / repos.txt / allow-stopwords.txt / allow-regexes.txt / allow-paths.txt
@@ -340,16 +349,17 @@ emit_verdict() { # $1=deny|ask $2=reason -> 理由を印字し、対応する ex
 # ---- push 差分 / リポジトリ可視性 ------------------------------------------
 
 # resolve_default_branch: scripts/git-audit-worktrees(dotfiles)の同名関数と
-# 同じ idiom。cwd のリポジトリに対して行う。
+# 同じ idiom。TARGET_CWD(--cwd)が空なら "." = 呼び出しプロセスの cwd。
 resolve_default_branch() {
+  local dir="${TARGET_CWD:-.}"
   local ref b
-  ref="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || ref=""
+  ref="$(git -C "$dir" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || ref=""
   if [[ -n $ref ]]; then
     printf '%s' "${ref#origin/}"
     return 0
   fi
   for b in main master; do
-    git show-ref --verify --quiet "refs/heads/$b" && { printf '%s' "$b"; return 0; }
+    git -C "$dir" show-ref --verify --quiet "refs/heads/$b" && { printf '%s' "$b"; return 0; }
   done
   printf ''
 }
@@ -363,15 +373,16 @@ resolve_default_branch() {
 PUSH_DIFF_FAIL_REASON=''
 compute_push_diff_text() {
   PUSH_DIFF_FAIL_REASON=''
+  local dir="${TARGET_CWD:-.}"
   local default_branch base
   default_branch="$(resolve_default_branch)"
   if [[ -z $default_branch ]]; then
     PUSH_DIFF_FAIL_REASON='default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。'
     return 1
   fi
-  base="$(git merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
+  base="$(git -C "$dir" merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
   if [[ -z $base ]]; then
-    PUSH_DIFF_FAIL_REASON="origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性)。"
+    PUSH_DIFF_FAIL_REASON="origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性、または --cwd の解決失敗)。"
     return 1
   fi
 
@@ -380,21 +391,23 @@ compute_push_diff_text() {
   # --diff-merges=first-parent で第1親との diff を出す — evil merge(どちらの
   # 親にも無い行を解決結果に足す)の追加行もここに現れる。--no-renames で
   # rename を add+delete に展開し、-U0 で無関係な文脈行を落とす。
-  patches="$(git log -p --diff-merges=first-parent --no-renames --unified=0 --format= "$base"..HEAD 2>/dev/null)"
+  patches="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= "$base"..HEAD 2>/dev/null)"
   grep '^+' <<< "$patches" || true # 追加行のみ抽出。無一致(grep の非 0)は空でよい
 
   # 追加/rename 先のファイルパスは patch 本文に依存せず明示的に列挙する
   # (空ファイル・バイナリには +++ ヘッダ自体が出ないため、grep '^+' だけでは
   # パス名検出が漏れる)。
-  git log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "$base"..HEAD 2>/dev/null
+  git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "$base"..HEAD 2>/dev/null
 
-  git log --format=%B "$base"..HEAD 2>/dev/null
+  git -C "$dir" log --format=%B "$base"..HEAD 2>/dev/null
   return 0
 }
 
 # resolve_repo_nwo: $1(省略可)がシェルコマンド文字列なら --repo/-R 明示
-# 指定を優先し、無ければ(または $1 が空なら)cwd の origin リモートから
-# owner/repo を導出する。どちらも取れなければ非 0。
+# 指定を優先し、無ければ(または $1 が空なら)TARGET_CWD(--cwd。無指定なら
+# 呼び出しプロセスの cwd)の origin リモートから owner/repo を導出する。
+# どちらも取れなければ非 0(#10/#14 — 以前はここが常にプロセス自身の cwd
+# 固定だった)。
 resolve_repo_nwo() {
   local cmd="${1-}"
   if [[ -n $cmd ]] && [[ $cmd =~ (--repo|-R)[=\ ]+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) ]]; then
@@ -402,7 +415,7 @@ resolve_repo_nwo() {
     return 0
   fi
   local url
-  url="$(git remote get-url origin 2>/dev/null)" || return 1
+  url="$(git -C "${TARGET_CWD:-.}" remote get-url origin 2>/dev/null)" || return 1
   url="${url%.git}"
   url="${url#git@github.com:}"
   url="${url#https://github.com/}"
@@ -854,6 +867,36 @@ acme で議論した"
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL: ALLOW=1 でも bypass されなかった(rc=$rc)" >&2; fails=$((fails + 1)); }
 
+  # --cwd: プロセス自身の cwd を $repo に変えずとも同じ結果になること
+  # (#10/#14 の第一段。実効ディレクトリの cd 追跡は段2で検証する)。
+  set +e
+  "$SELF" --cwd "$repo" scan-bash-command 'git push origin main' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(--cwd git push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  "$SELF" --cwd "$repo" scan-bash-command 'gh pr create --title t --body "acme is our employer"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(--cwd gh pr create ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # --cwd の解決失敗は push 差分の fail-loud 経路(merge-base 解決失敗)を通って
+  # ask にエスカレートする — 無言 pass にはしない。
+  set +e
+  "$SELF" --cwd "$tmp/does-not-exist" scan-bash-command 'git push origin main' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(--cwd 解決不能): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # PUBLISH_GUARD_ALLOW=1 は --cwd を剥がした後の "$1"(サブコマンド名)を見る
+  # ため、--cwd 付きでも bypass が効くこと(dispatch 前段の並び順の回帰)。
+  set +e
+  PUBLISH_GUARD_ALLOW=1 "$SELF" --cwd "$repo" scan-bash-command 'git push origin main' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(--cwd + ALLOW=1): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
   # PRIVATE な対象リポは検査自体をスキップする(--repo 明示指定)。
   cat > "$tmp/bin-gh" <<'STUB'
 #!/usr/bin/env bash
@@ -899,6 +942,19 @@ STUB
   fi
   echo "selftest: OK"
 }
+
+# ---- --cwd グローバルオプション --------------------------------------------
+# ALLOW チェックとサブコマンド dispatch はどちらも "${1-}" でサブコマンド名を
+# 見るため、--cwd はその判定より前に剥がす。TARGET_CWD は resolve_repo_nwo/
+# compute_push_diff_text/resolve_default_branch が `git -C` で参照する
+# (#10/#14 の第一段 — 実効ディレクトリを cd 追跡で解決するのは段2)。
+if [[ "${1-}" == "--cwd" && -n "${2-}" ]]; then
+  TARGET_CWD="$2"
+  shift 2
+elif [[ "${1-}" == "--cwd" ]]; then
+  usage >&2
+  exit 2
+fi
 
 # ---- dispatch ---------------------------------------------------------------
 
