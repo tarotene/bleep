@@ -54,10 +54,26 @@
 #                                           PRIVATE/INTERNAL と判明していれば
 #                                           検査自体をスキップする。
 #   publish-guard scan-bash-command CMD     シェルコマンド文字列を検査する。
+#                                           CMD を ; && || | 改行で区切った
+#                                           セグメントごとに、global option
+#                                           (git の -C 等、gh の --repo 等)を
+#                                           読み飛ばしてサブコマンド位置を見る
+#                                           (#9/#14 — 正規表現の隣接一致では
+#                                           "git -C dir push"/"gh --repo x pr
+#                                           create" を取りこぼしていた)。
 #                                           "gh pr|issue create/edit/comment"
-#                                           形は CMD 全体を、"git push" 形は
+#                                           セグメントが見つかれば、CMD 全文
+#                                           から "cd <単一トークン>" セグメント
+#                                           だけを除いたテキストを検査する
+#                                           (#9 — cd のパス引数に private
+#                                           リポ名が含まれるだけでは deny
+#                                           しない)。"git push" セグメントが
+#                                           見つかれば、先行する cd の積み
+#                                           重ね(または同セグメントの -C)
+#                                           から解決した実効ディレクトリで
 #                                           scan-push と同じ diff+log を検査
-#                                           する。他の形は無検査で pass。
+#                                           する。どちらの形も無ければ
+#                                           無検査で pass。
 #   publish-guard audit [path...] [--remote]
 #                                           指定ファイル(省略時は git ls-files
 #                                           全体)を同じ denylist で検査する。
@@ -504,31 +520,316 @@ cmd_scan_push() {
   exit 0
 }
 
-# cmd_scan_bash_command: シェルコマンド文字列の形を見て、"gh pr|issue
-# create/edit/comment" なら CMD 全体を、"git push" なら scan-push と同じ
-# diff+log を検査する。どちらの形でもなければ無検査で pass(フォールスルー
-# — jq や gh を一切叩かない高速経路)。Claude/Codex/Copilot の Bash 系
-# adapter が共通で呼ぶ、シェルコマンド用の唯一の判定入口。
+# ---- コマンド文字列のセグメント解析(#9/#14 対応) --------------------------
+#
+# 以前の cmd_scan_bash_command は正規表現で CMD 全体を検索していた
+# (`gh[[:space:]]+(pr|issue)...` / `git[[:space:]]+push`)。これは2つの
+# 問題を生んでいた:
+#   1. `git -C <dir> push` / `gh --repo x pr create` のように、サブコマンド
+#      の前に global option を1個挟むだけで正規表現の隣接一致が崩れ、
+#      どちらの分岐にも入らず無検査 pass になる(#14 で発見)。
+#   2. gh 分岐の match_verdict の照合対象が CMD 全文だったため、
+#      `cd <private リポ名を含むパス> && gh pr create ...` のように
+#      対象リポジトリ自身の名前がパス経由で含まれるだけで hard-deny する
+#      (#9)。
+#
+# ここでは CMD を `;`/`&&`/`||`/`|`/改行 で区切ったセグメントに分け、
+# セグメントごとにトークン位置で分類する(D5: 隣接一致ではなく位置で見る)。
+# 一方、denylist との照合対象(scan subject)は「CMD 全文から、厳密に
+# `cd <単一トークン>` とだけ一致したセグメントだけを除いたもの」にする
+# (D3 の限定版)。gh/git アクションのセグメントだけに絞らないのは、素朴な
+# 分割が引用符の外の `$(...)` 等で意図せず割れた場合でも、cd セグメント
+# 以外の断片は常に scan subject に残る(= 検出漏れを作らない)ようにする
+# ため — 分割の正確さを検出精度の前提にしない。
+#
+# クォート(' と ")の対応は追うが、$(...) のネストは追わない(README の
+# 「security boundary ではない」範囲内の近似)。
+
+CMD_SEGMENTS=()
+# split_command_segments: $1=cmd -> CMD_SEGMENTS にセグメントを積む(副作用。
+# build_patterns の PLAIN_PATTERNS 等と同じグローバル配列の idiom)。クォート
+# が閉じないまま終わった場合は分割せず CMD 全体を1セグメントにする
+# (D4 — パーサの失敗を緩和側の分割として使わない)。
+split_command_segments() {
+  local cmd="$1"
+  CMD_SEGMENTS=()
+  local buf='' i=0 n=${#cmd} c two quote=''
+  while ((i < n)); do
+    c="${cmd:i:1}"
+    if [[ -n $quote ]]; then
+      buf+="$c"
+      [[ $c == "$quote" ]] && quote=''
+      i=$((i + 1))
+      continue
+    fi
+    case "$c" in
+      "'" | '"')
+        quote="$c"
+        buf+="$c"
+        i=$((i + 1))
+        continue
+        ;;
+      ';')
+        CMD_SEGMENTS+=("$buf")
+        buf=''
+        i=$((i + 1))
+        continue
+        ;;
+      $'\n')
+        CMD_SEGMENTS+=("$buf")
+        buf=''
+        i=$((i + 1))
+        continue
+        ;;
+      '&' | '|')
+        two="${cmd:i:2}"
+        if [[ $two == "&&" || $two == "||" || $two == "|&" ]]; then
+          CMD_SEGMENTS+=("$buf")
+          buf=''
+          i=$((i + 2))
+          continue
+        fi
+        # 単独の & (background) / | (pipe) も区切りとして扱う — publish
+        # サブコマンドが後続に来るケースを見逃さない側に倒す。
+        CMD_SEGMENTS+=("$buf")
+        buf=''
+        i=$((i + 1))
+        continue
+        ;;
+    esac
+    buf+="$c"
+    i=$((i + 1))
+  done
+
+  if [[ -n $quote ]]; then
+    CMD_SEGMENTS=("$cmd") # クォート閉じ忘れ = パース不能。分割しない。
+    return 0
+  fi
+  CMD_SEGMENTS+=("$buf")
+  return 0
+}
+
+SEG_TOKENS=()
+# tokenize_segment: $1=segment -> SEG_TOKENS にクォートを外したトークンを
+# 積む(副作用)。classify_segment がサブコマンドの位置を判定するための
+# 簡易トークナイザ。バックスラッシュエスケープは解釈しない。
+tokenize_segment() {
+  local seg="$1"
+  SEG_TOKENS=()
+  local buf='' i=0 n=${#seg} c quote='' started=0
+  while ((i < n)); do
+    c="${seg:i:1}"
+    if [[ -n $quote ]]; then
+      if [[ $c == "$quote" ]]; then
+        quote=''
+      else
+        buf+="$c"
+      fi
+      i=$((i + 1))
+      continue
+    fi
+    case "$c" in
+      "'" | '"')
+        quote="$c"
+        started=1
+        i=$((i + 1))
+        continue
+        ;;
+      [[:space:]])
+        if ((started)); then
+          SEG_TOKENS+=("$buf")
+          buf=''
+          started=0
+        fi
+        i=$((i + 1))
+        continue
+        ;;
+      *)
+        buf+="$c"
+        started=1
+        i=$((i + 1))
+        continue
+        ;;
+    esac
+  done
+  ((started)) && SEG_TOKENS+=("$buf")
+  return 0
+}
+
+SEG_KIND='' SEG_DIR_OVERRIDE='' SEG_REPO_OVERRIDE=''
+# classify_segment: $1=segment -> SEG_KIND(push|gh_publish|other) /
+# SEG_DIR_OVERRIDE(git -C の引数) / SEG_REPO_OVERRIDE(gh --repo/-R の引数)
+# を設定する。global option をトークン位置で読み飛ばしてからサブコマンド
+# 位置を確定するため、`git -C <dir> push` や `gh --repo x pr create` も
+# 正しく分類できる(D5)。未知の global option(`-` 始まり)は安全側
+# (読み飛ばし)に倒す — 誤って分類漏れにしない。
+classify_segment() {
+  SEG_KIND='other' SEG_DIR_OVERRIDE='' SEG_REPO_OVERRIDE=''
+  tokenize_segment "$1"
+  local -a t=("${SEG_TOKENS[@]}")
+  local n=${#t[@]}
+  ((n > 0)) || return 0
+
+  case "${t[0]}" in
+    git)
+      local idx=1
+      while ((idx < n)); do
+        case "${t[idx]}" in
+          -C)
+            SEG_DIR_OVERRIDE="${t[idx + 1]-}"
+            idx=$((idx + 2))
+            continue
+            ;;
+          -c | --git-dir | --work-tree | --namespace)
+            idx=$((idx + 2)) # 値を1個消費
+            continue
+            ;;
+          --git-dir=* | --work-tree=* | --namespace=* | -c=*)
+            idx=$((idx + 1))
+            continue
+            ;;
+          --no-pager | --paginate | -p | --bare | --literal-pathspecs | --no-optional-locks)
+            idx=$((idx + 1))
+            continue
+            ;;
+          -*)
+            idx=$((idx + 1)) # 未知の global option。読み飛ばす(安全側)。
+            continue
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+      [[ $idx -lt $n && "${t[idx]}" == push ]] && SEG_KIND='push'
+      ;;
+    gh)
+      local idx=1
+      while ((idx < n)); do
+        case "${t[idx]}" in
+          --repo | -R)
+            SEG_REPO_OVERRIDE="${t[idx + 1]-}"
+            idx=$((idx + 2))
+            continue
+            ;;
+          --repo=*)
+            SEG_REPO_OVERRIDE="${t[idx]#--repo=}"
+            idx=$((idx + 1))
+            continue
+            ;;
+          --hostname)
+            idx=$((idx + 2))
+            continue
+            ;;
+          -*)
+            idx=$((idx + 1))
+            continue
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+      if ((idx + 1 < n)); then
+        local sub="${t[idx]}" action="${t[idx + 1]}"
+        if [[ ($sub == pr || $sub == issue) && ($action == create || $action == edit || $action == comment) ]]; then
+          SEG_KIND='gh_publish'
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# resolve_effective_dir: $1=start_dir $2=upto_index(このインデックスより
+# 前のセグメントだけを見る、0-origin) -> CMD_SEGMENTS を先頭から歩き、
+# 厳密に `cd <単一トークン>` と一致するセグメントだけを反映した実効
+# ディレクトリを出力する。1個の cd だけでなく、先行する全 cd を順に
+# 適用する(#14 の裁定 — 先頭の cd だけを見て誤解決しない)。絶対パスは
+# そのまま、相対パスは直前の実効ディレクトリに連結する。`~` 展開や
+# 変数展開はしない(静的解析の範囲外 — 解決できなければ後段の git -C が
+# 失敗し、既存の fail-loud 経路に委ねる)。
+resolve_effective_dir() {
+  local dir="$1" upto="$2" i seg tgt
+  for ((i = 0; i < upto; i++)); do
+    seg="${CMD_SEGMENTS[i]}"
+    if [[ $seg =~ ^[[:space:]]*cd[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+      tgt="${BASH_REMATCH[1]}"
+      if [[ $tgt == /* ]]; then
+        dir="$tgt"
+      else
+        dir="$dir/$tgt"
+      fi
+    fi
+  done
+  printf '%s' "$dir"
+}
+
+# cmd_scan_bash_command: CMD をセグメントに分割し、"git push" 形(-C 込み)
+# または "gh pr|issue create/edit/comment" 形(--repo 込み)のセグメントを
+# トークン位置で見つける。見つかった場合、対象ディレクトリ/リポジトリは
+# そのセグメント自身の -C/--repo を優先し、無ければ先行する cd セグメントの
+# 積み重ねから解決する。照合対象(scan subject)は CMD 全文から `cd <単一
+# トークン>` セグメントだけを除いたもの(#9)。どちらの形も見つからなければ
+# 無検査で pass(フォールスルー)。Claude/Codex/Copilot の Bash 系 adapter が
+# 共通で呼ぶ、シェルコマンド用の唯一の判定入口。
 cmd_scan_bash_command() {
   local cmd="${1-}"
   [[ -n $cmd ]] || { usage >&2; exit 2; }
 
-  if [[ $cmd =~ (^|[^[:alnum:]_])gh[[:space:]]+(pr|issue)[[:space:]]+(create|edit|comment)([^[:alnum:]_]|$) ]]; then
-    local nwo vis
-    nwo="$(resolve_repo_nwo "$cmd")" || nwo=""
-    if [[ -n $nwo ]]; then
-      vis="$(repo_visibility "$nwo")"
+  split_command_segments "$cmd"
+  local n=${#CMD_SEGMENTS[@]}
+
+  local scan_subject='' seg
+  for seg in "${CMD_SEGMENTS[@]}"; do
+    [[ $seg =~ ^[[:space:]]*cd[[:space:]]+[^[:space:]]+[[:space:]]*$ ]] && continue
+    scan_subject+="$seg"$'\n'
+  done
+
+  local found_push=false push_dir='' found_gh=false gh_nwo='' i
+  for ((i = 0; i < n; i++)); do
+    classify_segment "${CMD_SEGMENTS[i]}"
+    if [[ $SEG_KIND == push && $found_push == false ]]; then
+      found_push=true
+      if [[ -n $SEG_DIR_OVERRIDE ]]; then
+        push_dir="$SEG_DIR_OVERRIDE"
+      else
+        push_dir="$(resolve_effective_dir "${TARGET_CWD:-.}" "$i")"
+      fi
+    fi
+    if [[ $SEG_KIND == gh_publish && $found_gh == false ]]; then
+      found_gh=true
+      if [[ -n $SEG_REPO_OVERRIDE ]]; then
+        gh_nwo="$SEG_REPO_OVERRIDE"
+      else
+        local gdir saved_target="$TARGET_CWD"
+        gdir="$(resolve_effective_dir "${TARGET_CWD:-.}" "$i")"
+        TARGET_CWD="$gdir"
+        gh_nwo="$(resolve_repo_nwo)" || gh_nwo=""
+        TARGET_CWD="$saved_target"
+      fi
+    fi
+  done
+
+  # 優先順位は従来どおり gh > git push(1個のコマンドに両方が含まれる
+  # 稀なケースでは gh 側だけを検査する — 既存実装からの引き継ぎで、今回の
+  # 変更で新たに縮小した範囲ではない)。
+  if [[ $found_gh == true ]]; then
+    if [[ -n $gh_nwo ]]; then
+      local vis
+      vis="$(repo_visibility "$gh_nwo")"
       [[ $vis == PRIVATE || $vis == INTERNAL ]] && exit 0
     fi
     build_patterns
     local verdict
-    if verdict="$(match_verdict "$cmd")"; then
+    if verdict="$(match_verdict "$scan_subject")"; then
       emit_verdict "$verdict" "$(verdict_reason "$verdict")"
     fi
     exit 0
   fi
 
-  if [[ $cmd =~ (^|[^[:alnum:]_])git[[:space:]]+push([^[:alnum:]_]|$) ]]; then
+  if [[ $found_push == true ]]; then
+    TARGET_CWD="$push_dir"
     cmd_scan_push
     return
   fi
@@ -896,6 +1197,120 @@ acme で議論した"
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(--cwd + ALLOW=1): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #14 で発見: git -C <dir> push / cd <dir> && git push は以前どちらの
+  # 分岐にも当たらず無検査 pass だった(fast-exit の正規表現がサブコマンド
+  # の隣接一致しか見ていなかったため)。位置ベースの分類でどちらも検査
+  # 対象になること。
+  local repo_b="$tmp/repo_b"
+  mkdir -p "$repo_b"
+  git -C "$repo_b" init -qb main
+  git -C "$repo_b" config core.hooksPath /dev/null
+  git -C "$repo_b" config user.email test@example.invalid
+  git -C "$repo_b" config user.name test
+  git -C "$repo_b" config commit.gpgsign false
+  echo "clean" > "$repo_b/f.txt"
+  git -C "$repo_b" add f.txt
+  git -C "$repo_b" commit -qm initial
+  git init -q --bare "$tmp/remote_b.git"
+  git -C "$repo_b" remote add origin "$tmp/remote_b.git"
+  git -C "$repo_b" push -q origin main
+  git -C "$repo_b" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  echo "acme/secret-project が話題" >> "$repo_b/f.txt"
+  git -C "$repo_b" add f.txt
+  git -C "$repo_b" commit -qm "mentions acme/secret-project"
+
+  set +e
+  "$SELF" scan-bash-command "git -C $repo_b push origin main" > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(git -C <dir> push): 期待=2(deny) 実際=$rc(以前は無検査 pass だった #14 の回帰)" >&2; fails=$((fails + 1)); }
+
+  set +e
+  "$SELF" scan-bash-command "cd $repo_b && git push origin main" > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(cd <dir> && git push): 期待=2(deny) 実際=$rc(以前は無言 pass だった #10 の回帰)" >&2; fails=$((fails + 1)); }
+
+  set +e
+  "$SELF" scan-bash-command 'gh --repo acme/other pr create --title t --body "acme/secret-project"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(gh --repo x pr create): 期待=2(deny) 実際=$rc(以前は無検査 pass だった #14 の回帰)" >&2; fails=$((fails + 1)); }
+
+  # #9 の直接回帰: cd のパスに private リポ名が含まれるだけでは hard-deny
+  # しない(gh セグメント自体に denylist 文字列が無ければ pass)。
+  set +e
+  "$SELF" scan-bash-command 'cd /x/my-private-tool-work && gh pr create --title t --body "unrelated body"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#9: cd パスの private リポ名だけでは deny しない): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # 引用符の中の && は分割対象にならないこと(素朴な分割が引用文字列を
+  # 切って deny を取りこぼす回帰の固定)。
+  set +e
+  "$SELF" scan-bash-command 'gh pr create --title t --body "before && my-private-tool after"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(引用符内の && で分割しない): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # 複数 cd(#14 の裁定): 先頭の cd だけでなく、直前までの全 cd を反映する
+  # こと。先頭だけ見ると PRIVATE な repo_priv に誤解決して検査全体を
+  # スキップしてしまう(rc=0)。正しくは最後の cd(PUBLIC な repo_pub)を
+  # 反映し、body の denylist 文字列を検査して deny する。
+  local repo_priv="$tmp/repo_priv" repo_pub="$tmp/repo_pub" d
+  for d in "$repo_priv" "$repo_pub"; do
+    mkdir -p "$d"
+    git -C "$d" init -qb main
+    git -C "$d" config core.hooksPath /dev/null
+    git -C "$d" config user.email test@example.invalid
+    git -C "$d" config user.name test
+    git -C "$d" config commit.gpgsign false
+    echo x > "$d/f.txt"
+    git -C "$d" add f.txt
+    git -C "$d" commit -qm initial
+  done
+  git -C "$repo_priv" remote add origin "$tmp/remote-priv.git"
+  git -C "$repo_pub" remote add origin "$tmp/remote-pub.git"
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view")
+    case "$3" in
+      *remote-priv.git) printf 'PRIVATE' ;;
+      *) printf 'PUBLIC' ;;
+    esac
+    ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  rm -f "$PUBLISH_GUARD_STATE_DIR/visibility-cache.tsv"
+  set +e
+  "$SELF" scan-bash-command "cd $repo_priv && cd $repo_pub && gh pr create --title t --body \"acme/secret-project\"" > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(複数 cd: 最後の cd を反映すること): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #9/#14 の組み合わせ: cd のパスに private リポ名を含み、かつ gh 側に
+  # --repo で別の PUBLIC リポを明示している場合、visibility は --repo 側で
+  # 解決され(cd パスの private リポ名は無関係)、scan subject からも cd
+  # セグメントが除かれるので pass する。
+  set +e
+  "$SELF" scan-bash-command 'cd /x/my-private-tool-work && gh pr create --repo public/other --title t --body b' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#9+#14: cd の private 名 + --repo public/other): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # 変数展開を含む cd は静的には解決できない。無言 pass にはせず、既存の
+  # fail-loud 経路(push 差分計算の失敗 = default branch/merge-base が
+  # ガラクタなパスでは解けない)を通って ask にエスカレートする。
+  set +e
+  "$SELF" scan-bash-command 'cd "$D" && git push origin main' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(変数展開を含む cd は ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # PRIVATE な対象リポは検査自体をスキップする(--repo 明示指定)。
   cat > "$tmp/bin-gh" <<'STUB'

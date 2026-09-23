@@ -136,6 +136,30 @@ command executes, so a command like `cd /other/repo && gh pr create ...`
 can't be resolved by looking at the hook process's own cwd — it's still
 sitting wherever the agent's session started (#10, #14).
 
+**How `scan-bash-command` classifies a compound command**: `CMD` is split
+into segments on `;`, `&&`, `||`, `|`, and newlines (quote-aware — `&&`
+inside a quoted string is not treated as a separator). Each segment is
+tokenized and walked by **position**, skipping recognized global options
+(`git`'s `-C`/`-c`/`--git-dir`/etc., `gh`'s `--repo`/`-R`), before checking
+whether the next token is the actual subcommand. This means `git -C <dir>
+push` and `gh --repo owner/repo pr create` are correctly recognized as
+push/publish actions — a plain adjacency regex (the previous implementation)
+missed both (#9, #14). If a `gh pr|issue create|edit|comment` segment is
+found, the denylist match runs against `CMD` with any segment that is
+**exactly** `cd <single token>` removed — not against the whole command
+string — so a `cd`'s path argument merely containing a private repo name no
+longer triggers a false-positive hard-deny (#9); everything else (including
+any oddly-split fragment) stays in the scanned text, so this narrowing never
+creates a new blind spot. If a `git push` segment is found, its effective
+target directory is resolved from that segment's own `-C` override, or
+failing that, from the cumulative effect of every preceding bare `cd <dir>`
+segment (not just the first one) starting at `--cwd`/the hook's own cwd —
+this is what makes `cd /other/repo && git push` and `cd /other/repo && gh pr
+create ...` correctly resolve visibility/diffs against `/other/repo` instead
+of the hook process's own cwd (#10, #14). Nested `$(...)` command
+substitutions are not tracked — this is an approximation within the "not a
+security boundary" scope already stated below.
+
 `publish-guard scan`/`scan-push`/`scan-bash-command` all share the same exit
 code contract (for anyone scripting against this themselves):
 
