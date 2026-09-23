@@ -1,0 +1,29 @@
+[package]
+name = "publish-guard-hook"
+version = "0.1.0"
+edition = "2021"
+description = "Host adapter + command lexer for publish-guard's PreToolUse hooks"
+license = "MIT"
+repository = "https://github.com/tarotene/publish-guard"
+
+[[bin]]
+name = "publish-guard-hook"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 単語分割(クォート/エスケープの解釈)のみを担う。演算子(&& ; |)による
+# セグメント分割は POSIX シェル文法そのものであり shell-words の担当範囲
+# 外なので、その部分は自前(src/lex.rs)で持つ(#22 の Bash 修正を直接移植)。
+# 149M+ ダウンロード・2018年から継続的にメンテナンスされている事実で選定
+# — 詳細は先行例との対比(D6)を参照。
+shell-words = "1.1"
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+
+[profile.release]
+# hook のホットパスで毎 tool call ごとに起動するため、起動コストを抑える。
+opt-level = 2
