@@ -2,7 +2,7 @@ name: Release-plz
 
 # rust-repo-governance skill(tarotene/dotfiles)の release-plz.yml テンプレート
 # を単一クレート向けに簡略化したもの(workspace/excluded-crate 分割・
-# embedded HAL 向けの bump-excluded ロジックは publish-guard-hook には
+# embedded HAL 向けの bump-excluded ロジックは bleep-hook には
 # 存在しないため省略)。GitHub App token を使う理由: release-plz が開く
 # リリース PR は既定の GITHUB_TOKEN で作ると他の workflow(pull_request
 # トリガーの CI)を再帰的に起動しない制約があるため。

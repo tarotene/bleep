@@ -1,5 +1,5 @@
 [workspace]
-# publish-guard-hook は単一クレート(Cargo workspace ではない)なので、
+# bleep-hook は単一クレート(Cargo workspace ではない)なので、
 # rust-repo-governance テンプレートが行う「canonical crate だけがタグを
 # 持つ」分割は不要 — [workspace] レベルで直接有効化する。
 git_release_enable = true
@@ -18,7 +18,7 @@ body = """
 ## [{{ version | trim_start_matches(pat="v") }}] \
 {%- if previous %}\
 {%- if previous.version %}\
-([`{{ version | trim_start_matches(pat="v") }}`](https://github.com/tarotene/publish-guard/compare/{{ previous.version }}..{{ version }}))\
+([`{{ version | trim_start_matches(pat="v") }}`](https://github.com/tarotene/bleep/compare/{{ previous.version }}..{{ version }}))\
 {% endif %}\
 {% endif %} — {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
@@ -31,7 +31,7 @@ body = """
 {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
 {{ commit.message | upper_first }}\
 {% if commit.remote.pr_number %} \
-([#{{ commit.remote.pr_number }}](https://github.com/tarotene/publish-guard/pull/{{ commit.remote.pr_number }}))\
+([#{{ commit.remote.pr_number }}](https://github.com/tarotene/bleep/pull/{{ commit.remote.pr_number }}))\
 {% endif %}
 {% endfor %}
 {% endfor %}

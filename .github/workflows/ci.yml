@@ -17,21 +17,21 @@ jobs:
           scandir: '.'
           severity: error
 
-      # cmd_scan_bash_command(publish-guard 本体)が字句解析を
-      # publish-guard-hook に委ねているため(D1)、Bash の selftest 自体が
+      # cmd_scan_bash_command(bleep 本体)が字句解析を
+      # bleep-hook に委ねているため(D1)、Bash の selftest 自体が
       # このバイナリを必要とする。
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo build (publish-guard-hook)
+      - name: cargo build (bleep-hook)
         run: cargo build
-      - name: export PUBLISH_GUARD_LEX_BIN
-        run: echo "PUBLISH_GUARD_LEX_BIN=$PWD/target/debug/publish-guard-hook" >> "$GITHUB_ENV"
+      - name: export BLEEP_LEX_BIN
+        run: echo "BLEEP_LEX_BIN=$PWD/target/debug/bleep-hook" >> "$GITHUB_ENV"
 
       - name: selftest (core CLI)
-        run: ./publish-guard selftest
+        run: ./bleep selftest
 
       - name: selftest (hook shim)
-        run: ./hooks/pg-hook.sh --selftest
+        run: ./hooks/bleep.sh --selftest
 
   rust:
     name: Rust (fmt + clippy + test)

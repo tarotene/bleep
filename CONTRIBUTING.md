@@ -51,14 +51,14 @@ information. Code, README, Issues/PRs, and commit messages must all satisfy:
 - **Final check before committing**: re-read the diff specifically looking
   for proper nouns and URLs. When in doubt, leave it out.
 
-**Before changing this tool**. `publish-guard` is designed around the
+**Before changing this tool**. `bleep` is designed around the
 README's "This is not a security boundary" premise (Lampson 1973, Saltzer &
 Schroeder 1975, CWE-184). When adding new detection logic:
 
 - Never let an indeterminate verdict silently pass (fail-loud). Look at the
   existing `PUSH_DIFF_FAIL_REASON` and the read-failure handling in
   `cmd_scan`/`cmd_scan_push` for the pattern.
-- Never name the bypass mechanism (`PUBLISH_GUARD_ALLOW=1`) in a deny
+- Never name the bypass mechanism (`BLEEP_ALLOW=1`) in a deny
   reason's text.
-- Both `./publish-guard selftest` and `shellcheck -S error publish-guard`
+- Both `./bleep selftest` and `shellcheck -S error bleep`
   must pass.

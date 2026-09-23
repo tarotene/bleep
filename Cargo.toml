@@ -1,13 +1,13 @@
 [package]
-name = "publish-guard-hook"
+name = "bleep-hook"
 version = "0.1.0"
 edition = "2021"
-description = "Host adapter + command lexer for publish-guard's PreToolUse hooks"
+description = "Host adapter + command lexer for bleep's PreToolUse hooks"
 license = "MIT"
-repository = "https://github.com/tarotene/publish-guard"
+repository = "https://github.com/tarotene/bleep"
 
 [[bin]]
-name = "publish-guard-hook"
+name = "bleep-hook"
 path = "src/main.rs"
 
 [dependencies]

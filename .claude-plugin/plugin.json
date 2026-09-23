@@ -1,10 +1,10 @@
 {
-  "name": "publish-guard",
+  "name": "bleep",
   "version": "0.1.0",
   "description": "Deny/ask gate that stops org- and repo-name leaks into public GitHub surfaces (PR/Issue bodies, pushes, and MCP-driven GitHub tool calls).",
   "author": "Kentaro Sugimoto",
-  "homepage": "https://github.com/tarotene/publish-guard",
-  "repository": "https://github.com/tarotene/publish-guard",
+  "homepage": "https://github.com/tarotene/bleep",
+  "repository": "https://github.com/tarotene/bleep",
   "license": "MIT",
   "keywords": [
     "security",

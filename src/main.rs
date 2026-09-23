@@ -6,17 +6,17 @@ use std::process::ExitCode;
 
 fn usage() -> String {
     "\
-usage: publish-guard-hook --host=<claude|codex|copilot>
-       publish-guard-hook lex [--cwd DIR] -- CMD
+usage: bleep-hook --host=<claude|codex|copilot>
+       bleep-hook lex [--cwd DIR] -- CMD
 
 --host=<name>   PreToolUse hook adapter モード。stdin から host 固有の JSON
-                を読み、PUBLISH_GUARD_BIN(既定 \"publish-guard\")を呼び出して
+                を読み、BLEEP_BIN(既定 \"bleep\")を呼び出して
                 判定結果を host 固有の出力 JSON に翻訳する。
-lex             publish-guard(Bash)本体の cmd_scan_bash_command から呼ばれる
+lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
                 純粋な字句解析モード。I/O・gh は一切行わない。出力は5行の
                 ヘッダ(found_push/push_dir/found_gh/gh_repo_override/
                 gh_effective_dir)に続けて scan_subject を書く固定書式(jq 非
-                依存 — 呼び出し側の publish-guard 本体を jq フリーに保つ)。
+                依存 — 呼び出し側の bleep 本体を jq フリーに保つ)。
 "
     .to_string()
 }
@@ -44,8 +44,7 @@ fn main() -> ExitCode {
         if let Some(name) = first.strip_prefix("--host=") {
             return match host::Host::parse(name) {
                 Some(h) => {
-                    let pg_bin = env::var("PUBLISH_GUARD_BIN")
-                        .unwrap_or_else(|_| "publish-guard".to_string());
+                    let pg_bin = env::var("BLEEP_BIN").unwrap_or_else(|_| "bleep".to_string());
                     host::run(h, &pg_bin);
                     ExitCode::SUCCESS
                 }
@@ -62,8 +61,7 @@ fn main() -> ExitCode {
             };
             return match host::Host::parse(name) {
                 Some(h) => {
-                    let pg_bin = env::var("PUBLISH_GUARD_BIN")
-                        .unwrap_or_else(|_| "publish-guard".to_string());
+                    let pg_bin = env::var("BLEEP_BIN").unwrap_or_else(|_| "bleep".to_string());
                     host::run(h, &pg_bin);
                     ExitCode::SUCCESS
                 }

@@ -1,4 +1,4 @@
-//! publish-guard 本体(Bash)の `split_command_segments` / `tokenize_segment` /
+//! bleep 本体(Bash)の `split_command_segments` / `tokenize_segment` /
 //! `classify_segment` / `resolve_effective_dir` の移植(D1)。純粋関数のみ —
 //! I/O・gh・キャッシュは一切触らない。`match_verdict` / `build_patterns` /
 //! `resolve_repo_nwo` は正本が Bash 実装のまま(判断を運ばない継ぎ目)。

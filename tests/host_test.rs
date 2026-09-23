@@ -35,28 +35,19 @@ impl Env {
     }
 
     fn pg_command(&self) -> Command {
-        let mut cmd = Command::cargo_bin("publish-guard-hook").unwrap();
-        cmd.env("PUBLISH_GUARD_BIN", repo_root().join("publish-guard"))
-            // publish-guard(bash)の cmd_scan_bash_command 自身も字句解析の
-            // ために publish-guard-hook を呼ぶ(D1 — 継ぎ目は2箇所ある)。
+        let mut cmd = Command::cargo_bin("bleep-hook").unwrap();
+        cmd.env("BLEEP_BIN", repo_root().join("bleep"))
+            // bleep(bash)の cmd_scan_bash_command 自身も字句解析の
+            // ために bleep-hook を呼ぶ(D1 — 継ぎ目は2箇所ある)。
             // CARGO_BIN_EXE_<name> はテスト対象と同じビルド済みバイナリを
             // 指す cargo 提供の compile-time env var。
-            .env(
-                "PUBLISH_GUARD_LEX_BIN",
-                env!("CARGO_BIN_EXE_publish-guard-hook"),
-            )
-            .env("PUBLISH_GUARD_CONFIG_DIR", self.tmp.path().join("config"))
-            .env("PUBLISH_GUARD_STATE_DIR", self.tmp.path().join("state"))
-            .env(
-                "PUBLISH_GUARD_ORGS_FILE",
-                self.tmp.path().join("config/orgs.txt"),
-            )
-            .env(
-                "PUBLISH_GUARD_REPOS_FILE",
-                self.tmp.path().join("config/repos.txt"),
-            )
-            .env("PUBLISH_GUARD_OWNER", "test-owner")
-            .env("PUBLISH_GUARD_GH_BIN", self.tmp.path().join("bin-gh"));
+            .env("BLEEP_LEX_BIN", env!("CARGO_BIN_EXE_bleep-hook"))
+            .env("BLEEP_CONFIG_DIR", self.tmp.path().join("config"))
+            .env("BLEEP_STATE_DIR", self.tmp.path().join("state"))
+            .env("BLEEP_ORGS_FILE", self.tmp.path().join("config/orgs.txt"))
+            .env("BLEEP_REPOS_FILE", self.tmp.path().join("config/repos.txt"))
+            .env("BLEEP_OWNER", "test-owner")
+            .env("BLEEP_GH_BIN", self.tmp.path().join("bin-gh"));
         cmd
     }
 
@@ -204,7 +195,7 @@ fn allow_bypass_still_works() {
     let input = read_fixture("claude-codex/deny_bash.json");
     let assert = env
         .pg_command()
-        .env("PUBLISH_GUARD_ALLOW", "1")
+        .env("BLEEP_ALLOW", "1")
         .arg("--host=claude")
         .write_stdin(input)
         .assert()
