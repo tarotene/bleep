@@ -62,7 +62,11 @@
 #                                           "git -C dir push"/"gh --repo x pr
 #                                           create" を取りこぼしていた)。
 #                                           "gh pr|issue create/edit/comment"
-#                                           セグメントが見つかれば、CMD 全文
+#                                           "gh release create/edit"
+#                                           "gh repo edit" "gh gist create"
+#                                           "gh api -X POST/PUT/PATCH" の
+#                                           いずれかのセグメントが見つかれば、
+#                                           CMD 全文
 #                                           から "cd <単一トークン>" セグメント
 #                                           だけを除いたテキストを検査する
 #                                           (#9 — cd のパス引数に private
@@ -730,10 +734,39 @@ classify_segment() {
             ;;
         esac
       done
-      if ((idx + 1 < n)); then
-        local sub="${t[idx]}" action="${t[idx + 1]}"
+      if ((idx < n)); then
+        local sub="${t[idx]}" action="${t[idx + 1]-}"
         if [[ ($sub == pr || $sub == issue) && ($action == create || $action == edit || $action == comment) ]]; then
           SEG_KIND='gh_publish'
+        elif [[ $sub == release && ($action == create || $action == edit) ]]; then
+          SEG_KIND='gh_publish' # gh release create|edit(#8 由来の要調査項目 G2)
+        elif [[ $sub == repo && $action == edit ]]; then
+          SEG_KIND='gh_publish' # gh repo edit --description 等
+        elif [[ $sub == gist && $action == create ]]; then
+          SEG_KIND='gh_publish' # gh gist create
+        elif [[ $sub == api ]]; then
+          # gh api は --repo を取らない(REST エンドポイントを直接叩く)ため
+          # ここでは書き込みメソッドの有無だけを見る。-X/--method の値が
+          # POST/PUT/PATCH なら「ファイル内容の直接更新」等の公開面として
+          # 扱う。--repo が無い分、nwo 解決は resolve_effective_dir 経由の
+          # git remote フォールバックに委ねる(解決できなければ visibility
+          # スキップに入らず、scan_subject の全文照合が効く — fail-loud)。
+          local j method=''
+          for ((j = idx + 1; j < n; j++)); do
+            case "${t[j]}" in
+              -X | --method)
+                method="${t[j + 1]-}"
+                ;;
+              --method=*)
+                method="${t[j]#--method=}"
+                ;;
+            esac
+          done
+          case "${method^^}" in
+            POST | PUT | PATCH)
+              SEG_KIND='gh_publish'
+              ;;
+          esac
         fi
       fi
       ;;
@@ -1311,6 +1344,41 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(変数展開を含む cd は ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # gh の公開面網羅(段3): pr|issue create/edit/comment 以外にも
+  # release create/edit・repo edit・gist create・api の書き込みメソッドが
+  # 以前はすべてフォールスルーしていた(triage で発見)。
+  set +e
+  "$SELF" scan-bash-command 'gh release create v1 --notes "acme/secret-project"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(gh release create): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  "$SELF" scan-bash-command 'gh repo edit --description "acme/secret-project"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(gh repo edit): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  "$SELF" scan-bash-command 'gh gist create --desc "acme/secret-project" file.txt' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(gh gist create): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  "$SELF" scan-bash-command 'gh api -X POST repos/acme/other/contents/f.txt --raw-field content="acme/secret-project"' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(gh api -X POST): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # gh api の読み取り専用メソッド(-X GET 相当、既定)は公開面として扱わない
+  # — 検出のみの範囲を無闇に広げない(D9)。
+  set +e
+  "$SELF" scan-bash-command 'gh api repos/acme/other --jq .name' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(gh api 読み取りは対象外): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # PRIVATE な対象リポは検査自体をスキップする(--repo 明示指定)。
   cat > "$tmp/bin-gh" <<'STUB'
