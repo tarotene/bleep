@@ -37,6 +37,14 @@ impl Env {
     fn pg_command(&self) -> Command {
         let mut cmd = Command::cargo_bin("publish-guard-hook").unwrap();
         cmd.env("PUBLISH_GUARD_BIN", repo_root().join("publish-guard"))
+            // publish-guard(bash)の cmd_scan_bash_command 自身も字句解析の
+            // ために publish-guard-hook を呼ぶ(D1 — 継ぎ目は2箇所ある)。
+            // CARGO_BIN_EXE_<name> はテスト対象と同じビルド済みバイナリを
+            // 指す cargo 提供の compile-time env var。
+            .env(
+                "PUBLISH_GUARD_LEX_BIN",
+                env!("CARGO_BIN_EXE_publish-guard-hook"),
+            )
             .env("PUBLISH_GUARD_CONFIG_DIR", self.tmp.path().join("config"))
             .env("PUBLISH_GUARD_STATE_DIR", self.tmp.path().join("state"))
             .env(
