@@ -34,6 +34,11 @@ $ mv ~/.local/state/publish-guard ~/.local/state/bleep   # if it exists
 Then reinstall the plugin/hooks under the new name (see below) and remove the
 old `publish-guard@publish-guard` plugin install.
 
+If you skip the move, `bleep` does not silently run without your org list.
+While `orgs.txt` is missing and the old `~/.config/publish-guard/` directory
+still exists, every publish check returns **ask** and says the migration is
+incomplete.
+
 This repository never commits denylist data (org names, repo names). You
 place your own under `$XDG_CONFIG_HOME/bleep/` (defaults to
 `~/.config/bleep/`). **The only thing you realistically have to
@@ -47,12 +52,23 @@ $ mkdir -p ~/.config/bleep
 $ echo acme > ~/.config/bleep/orgs.txt   # write only your company's org name
 ```
 
-Optional config files you can add (all optional, one entry per line, `#`
+`orgs.txt` itself is **required**. When it does not exist, `scan`,
+`scan-push`, and the publish paths of `scan-bash-command` return **ask**
+instead of passing. The rest of the denylist is never empty on its own (your
+own private repos are always derived), so "no org list" would otherwise go
+unnoticed. If you have no org to protect, create an empty `orgs.txt` to say
+so explicitly:
+
+```
+$ touch ~/.config/bleep/orgs.txt   # explicit opt-out: no company org
+```
+
+Other config files you can add (all optional, one entry per line, `#`
 comments and blank lines ignored):
 
 | File | Purpose |
 |---|---|
-| `orgs.txt` | Company/other-party org names (this is realistically the only one you write by hand) |
+| `orgs.txt` | Company/other-party org names (this is realistically the only one you write by hand). The file must exist; an empty file is an explicit opt-out |
 | `repos.txt` | Explicit `org/repo` references (optional) |
 | `allow-stopwords.txt` | Words excluded from the denylist (`.github` is a built-in default) |
 | `allow-regexes.txt` | If this regex matches the scanned text, it disables **only the ask** verdict (it does not loosen deny) |
