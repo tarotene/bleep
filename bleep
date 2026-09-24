@@ -18,7 +18,10 @@
 #
 # denylist は一切コミットしない(「ツールは公開・データはローカル」原則):
 #   $XDG_CONFIG_HOME/bleep/orgs.txt   — 1行1 org 名(手書きが必要なのは
-#                                               実質これだけ)
+#                                               実質これだけ)。ファイル自体の
+#                                               存在が必須 — 無ければ scan* は
+#                                               ask(require_orgs_file)。空
+#                                               ファイルは明示的な opt-out。
 #   $XDG_CONFIG_HOME/bleep/repos.txt  — 1行1 "org/repo"(任意)
 #   自分の private/internal リポジトリ名は、orgs.txt に書いた org 名 +
 #   (BLEEP_OWNER が空なら `gh api user` で自動導出する)現在の
@@ -104,6 +107,10 @@ TARGET_CWD='' # --cwd で明示された対象ディレクトリ(#10/#14 対応)
 # selftest 内で export した値が既に評価済みの変数に反映されない。
 init_vars() {
   CONFIG_DIR="${BLEEP_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/bleep}"
+  # 改名前(publish-guard)の設定ディレクトリ。読みはしない(互換 shim は
+  # 持たない、README 参照)— require_orgs_file の理由文を「移行未了」に
+  # 切り替えるためだけに存在を見る。
+  LEGACY_CONFIG_DIR="${BLEEP_LEGACY_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/publish-guard}"
   STATE_DIR="${BLEEP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bleep}"
   ORGS_FILE="${BLEEP_ORGS_FILE:-$CONFIG_DIR/orgs.txt}"
   REPOS_FILE="${BLEEP_REPOS_FILE:-$CONFIG_DIR/repos.txt}"
@@ -141,6 +148,7 @@ BLEEP_ALLOW=1 で3つの scan* サブコマンドを意識的に bypass でき�
 
 設定は $XDG_CONFIG_HOME/bleep/ 以下、一切コミットしない:
   orgs.txt / repos.txt / allow-stopwords.txt / allow-regexes.txt / allow-paths.txt
+orgs.txt が存在しなければ scan* は ask を返す(空ファイルは明示的な opt-out)。
 EOF
 }
 
@@ -375,6 +383,23 @@ emit_verdict() { # $1=deny|ask $2=reason -> 理由を印字し、対応する ex
   esac
 }
 
+# require_orgs_file: orgs.txt が存在しなければ ask で終了する(fail-loud)。
+# read_lines は「ファイル無し = 無出力」なので、orgs.txt が無いホストでは
+# org 由来の denylist が黙って空になる。しかも denylist 全体は空にならない
+# (private キャッシュは gh 認証ユーザ自身の private リポからも導出される)
+# ため、「denylist が空なら ask」では検出できない — 設定ファイルの存在
+# そのものを前提条件にする。空ファイルは「org を登録しない」という明示的な
+# 選択として従来どおり通す。publish 系の検査経路(cmd_scan / cmd_scan_push /
+# cmd_scan_bash_command の gh 分岐)でだけ呼ぶ — git status 等の無関係な
+# コマンドは従来どおり pass させる。
+require_orgs_file() {
+  [[ -f $ORGS_FILE ]] && return 0
+  if [[ -d $LEGACY_CONFIG_DIR ]]; then
+    emit_verdict ask "bleep の設定が改名前の場所に残っています(${LEGACY_CONFIG_DIR} → ${CONFIG_DIR} への移行が未了)。org denylist が読まれていません。README の Upgrading 手順で移行してください。"
+  fi
+  emit_verdict ask "bleep が未設定です(${ORGS_FILE} がありません)。org denylist が空のまま公開面を検査しています。org 名を 1 行書くか、登録しないなら空ファイルを置いて明示してください。"
+}
+
 # ---- push 差分 / リポジトリ可視性 ------------------------------------------
 
 # resolve_default_branch: scripts/git-audit-worktrees(dotfiles)の同名関数と
@@ -500,6 +525,7 @@ cmd_scan() {
       exit 1
     fi
   fi
+  require_orgs_file
   build_patterns
   local verdict
   if verdict="$(match_verdict "$text")"; then
@@ -525,6 +551,7 @@ cmd_scan_push() {
     printf 'push 差分を検査できませんでした: %s\n' "$PUSH_DIFF_FAIL_REASON"
     exit 1
   fi
+  require_orgs_file
   build_patterns
   local verdict
   if verdict="$(match_verdict "$text")"; then
@@ -604,6 +631,7 @@ cmd_scan_bash_command() {
       vis="$(repo_visibility "$gh_nwo")"
       [[ $vis == PRIVATE || $vis == INTERNAL ]] && exit 0
     fi
+    require_orgs_file
     build_patterns
     local verdict
     if verdict="$(match_verdict "$scan_subject")"; then
@@ -724,6 +752,9 @@ selftest() {
   export BLEEP_ALLOW_STOPWORDS_FILE="$tmp/config/allow-stopwords.txt"
   export BLEEP_ALLOW_REGEXES_FILE="$tmp/config/allow-regexes.txt"
   export BLEEP_ALLOW_PATHS_FILE="$tmp/config/allow-paths.txt"
+  # 実ホストの ~/.config/publish-guard の有無で理由文が変わらないよう固定する
+  # (このパスは作らない — 「移行未了」を見るケースだけ別パスを渡す)。
+  export BLEEP_LEGACY_CONFIG_DIR="$tmp/legacy-config-absent"
   export BLEEP_OWNER="test-owner"
   init_vars # export しただけでは既に評価済みの変数に反映されないため明示的に再計算する
   mkdir -p "$tmp/config" "$tmp/state"
@@ -1269,6 +1300,51 @@ STUB
   out8="$(cd "$repo8" && "$SELF" audit f.txt --since "$root8" 2>&1)"
   set -e
   [[ $out8 == *'deny: history-since='* ]] || { echo "FAIL(audit --since: 履歴内の denylist 文字列を検出できていない): out=$out8" >&2; fails=$((fails + 1)); }
+
+  # orgs.txt 不在は fail-loud(require_orgs_file)。denylist 全体は private
+  # キャッシュ(スタブ gh の my-private-tool)で空にならないので、「空なら
+  # ask」ではなくファイルの存在そのものを見ていることをここで確かめる。
+  local missing_orgs="$tmp/config/orgs-missing.txt" out9
+  set +e
+  out9="$(BLEEP_ORGS_FILE="$missing_orgs" "$SELF" scan <<< 'hello' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 1 && $out9 == *'未設定'* ]] || { echo "FAIL(orgs.txt 不在の scan は ask(未設定)): rc=$rc out=$out9" >&2; fails=$((fails + 1)); }
+
+  mkdir -p "$tmp/legacy-config"
+  set +e
+  out9="$(BLEEP_ORGS_FILE="$missing_orgs" BLEEP_LEGACY_CONFIG_DIR="$tmp/legacy-config" "$SELF" scan <<< 'hello' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 1 && $out9 == *'移行が未了'* ]] || { echo "FAIL(旧設定 dir 残存は ask(移行未了)): rc=$rc out=$out9" >&2; fails=$((fails + 1)); }
+
+  : > "$tmp/config/orgs-empty.txt"
+  set +e
+  BLEEP_ORGS_FILE="$tmp/config/orgs-empty.txt" "$SELF" scan <<< 'hello' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(空の orgs.txt は明示 opt-out で pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  BLEEP_ORGS_FILE="$missing_orgs" BLEEP_ALLOW=1 "$SELF" scan <<< 'hello' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(orgs.txt 不在でも BLEEP_ALLOW=1 は bypass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  (cd "$repo" && BLEEP_ORGS_FILE="$missing_orgs" "$SELF" scan-bash-command 'git status') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(orgs.txt 不在でも無関係なコマンドは pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # $repo は上の PRIVATE ケースで可視性が差し替わっている可能性があるため、
+  # nwo が解決できない(= 可視性スキップに入らない)非 git ディレクトリで見る。
+  mkdir -p "$tmp/not-a-repo"
+  set +e
+  (cd "$tmp/not-a-repo" && BLEEP_ORGS_FILE="$missing_orgs" "$SELF" scan-bash-command 'gh issue create --title t --body hello') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(orgs.txt 不在の gh issue create は ask): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
 
   if [[ $fails -gt 0 ]]; then
     echo "selftest: ${fails} 件失敗" >&2
