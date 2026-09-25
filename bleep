@@ -98,6 +98,11 @@
 #   bleep selftest                 回帰テスト(スタブ gh/git)。
 set -euo pipefail
 
+# bash 本体と Cargo.toml の [package].version を揃える。判定レッジャーの
+# tool_version フィールドにだけ使う — bump を忘れても実害は小さい(dotfiles
+# 側の集約は tool_version を fingerprint に使わない)。
+BLEEP_VERSION='0.2.0'
+
 SELF="$(realpath "$0")"
 TEST_TMP=''
 TARGET_CWD='' # --cwd で明示された対象ディレクトリ(#10/#14 対応)。空なら "." 扱い。
@@ -124,6 +129,14 @@ init_vars() {
   PRIVATE_CACHE="$STATE_DIR/private-repos-cache.txt"
   VIS_CACHE="$STATE_DIR/visibility-cache.tsv"
   OWNER_CACHE="$STATE_DIR/owner-login-cache.txt"
+  # 判定レッジャー(ローカルのみ、送信しない)。契約(場所・レコード形)の
+  # 正本は tarotene/dotfiles の ADR + docs/schemas/agent-verdict.schema.json
+  # (README「判定レッジャー」参照)。ツール名(agent-verdicts/<tool>.jsonl の
+  # <tool>)は bleep 固定 — 複数ツールが同じ鍵で書けるよう、ディレクトリと
+  # 鍵ファイルはツール横断で共有する。
+  LEDGER_DIR="${BLEEP_LEDGER_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-verdicts}"
+  LEDGER_FILE="$LEDGER_DIR/bleep.jsonl"
+  LEDGER_KEY_FILE="$LEDGER_DIR/hmac-key"
 }
 init_vars
 
@@ -155,6 +168,66 @@ EOF
 read_lines() { # $1=file; コメント行・空行を除いて出力。ファイル無しは無出力。
   [[ -f "$1" ]] || return 0
   grep -Ev '^[[:space:]]*(#|$)' "$1"
+}
+
+# ---- 判定レッジャー(ローカルのみ、送信しない)------------------------------
+#
+# 「弾かれ続けている」ことを開発元(tarotene/bleep)にフィードバックする
+# 仕組みの捕捉点(tarotene/dotfiles の grill-me セッションで裁定)。判定を
+# 下したこの場所以外に単一正本を作れない(PreToolUse hook の deny を他の
+# hook に通知するイベントを Claude Code/Codex/Copilot のいずれも持たない
+# — Anthropic, Hooks reference, https://code.claude.com/docs/en/hooks)。
+#
+# 書くもの: verdict/reason_id/match_class と、マッチ語をこのマシン固有の
+# ランダム鍵で HMAC-SHA256 したハッシュのみ。書かないもの: コマンド本文・
+# tool_input・cwd パス・マッチ語の平文・理由文そのもの — bleep の目的が
+# 「これらの値を漏らさないこと」なので、判定レッジャー自身がそれを破っては
+# 本末転倒になる。
+#
+# 既定で有効、マシン外へは一切送信しない。DO_NOT_TRACK(空でない値)または
+# BLEEP_NO_LEDGER=1 で無効化できる。書き込みに失敗しても判定結果には影響
+# させない(fail-open — 判定エンジンの可用性の方を優先する)。
+
+ledger_enabled() {
+  [[ -n "${DO_NOT_TRACK:-}" ]] && return 1
+  [[ "${BLEEP_NO_LEDGER:-}" == "1" ]] && return 1
+  return 0
+}
+
+# term_hash: $1=平文のマッチ語 -> hex64(bleep-hook hash に委ねる。鍵の
+# 生成・読み書きも bleep-hook 側の責務 — bash 本体はハッシュアルゴリズムを
+# 持たない)。失敗したら空文字列(呼び出し側は term_hash を null として書く)。
+term_hash() {
+  local term="$1"
+  [[ -n "$term" ]] || return 0
+  mkdir -p "$LEDGER_DIR" 2>/dev/null || return 0
+  "$LEX_BIN" hash --key-file "$LEDGER_KEY_FILE" -- "$term" 2>/dev/null || true
+}
+
+# ledger_write: $1=deny|ask $2=reason_id $3=match_class(既定 none)
+#               $4=平文のマッチ語(既定空、無ければ term_hash は null)
+ledger_write() {
+  ledger_enabled || return 0
+  local verdict="$1" reason_id="$2" match_class="${3:-none}" term="${4-}"
+  local hash="" hash_json="null"
+  if [[ -n "$term" ]]; then
+    hash="$(term_hash "$term")"
+    [[ -n "$hash" ]] && hash_json="\"$hash\""
+  fi
+  local sid_json="null"
+  [[ -n "${BLEEP_SESSION_ID:-}" ]] && sid_json="\"${BLEEP_SESSION_ID}\""
+  local ts host_field tool_name_field line
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  host_field="${BLEEP_HOST:-cli}"
+  tool_name_field="${BLEEP_TOOL_NAME:-}"
+  line="$(printf '{"v":1,"ts":"%s","tool":"bleep","tool_version":"%s","repo":"tarotene/bleep","host":"%s","session_id":%s,"verdict":"%s","reason_id":"%s","match_class":"%s","term_hash":%s,"tool_name":"%s"}' \
+    "$ts" "$BLEEP_VERSION" "$host_field" "$sid_json" "$verdict" "$reason_id" "$match_class" "$hash_json" "$tool_name_field")"
+  mkdir -p "$LEDGER_DIR" 2>/dev/null || return 0
+  chmod 700 "$LEDGER_DIR" 2>/dev/null || true
+  (
+    flock 9
+    printf '%s\n' "$line" >> "$LEDGER_FILE"
+  ) 9>>"$LEDGER_FILE.lock" 2>/dev/null || true
 }
 
 # ---- allowlist(gitleaks の [[allowlists]] と同型の3軸)----------------------
@@ -348,21 +421,40 @@ build_patterns() {
   filter_stopwords WORD_WARN
 }
 
-# match_verdict: $1 の中身を denylist と突き合わせ、"deny"/"ask" を印字して
-# 0 を返す。どちらにも一致しなければ何も印字せず非 0 を返す。
+# match_verdict: $1 の中身を denylist と突き合わせ、一致すれば 0 を返す。
+# 一致しなければ非 0 を返す(何も印字しない)。判定結果はグローバル変数
+# VERDICT(deny/ask)に、判定レッジャー用の付随情報は MATCH_CLASS/
+# MATCH_TERM(マッチしたパターンの種別と実際のマッチ語、平文)にセットする。
+# 呼び出し側は `$(match_verdict ...)` のようにコマンド置換で囲んではならない
+# — サブシェルで実行されるとこれらのグローバル変数への代入が親シェルに
+# 反映されない。必ず `if match_verdict "$text"; then ...` の形で直接呼ぶ。
+# MATCH_CLASS/MATCH_TERM の抽出は既存の -q 判定条件が真になった後に追加の
+# grep -o で行うため、判定結果(VERDICT)への影響はない。呼び出し側は
+# MATCH_TERM をレッジャーに書く前に必ずハッシュ化すること(平文のまま
+# 書いてはいけない)。
+VERDICT=''
+MATCH_CLASS=''
+MATCH_TERM=''
 match_verdict() {
   local text="$1"
+  VERDICT='' MATCH_CLASS='' MATCH_TERM=''
   if ((${#PLAIN_PATTERNS[@]} > 0)) && grep -Fqf <(printf '%s\n' "${PLAIN_PATTERNS[@]}") <<< "$text"; then
-    printf 'deny'
+    MATCH_CLASS='plain'
+    MATCH_TERM="$(grep -Fof <(printf '%s\n' "${PLAIN_PATTERNS[@]}") <<< "$text" | head -n1 || true)"
+    VERDICT='deny'
     return 0
   fi
   if ((${#WORD_HARD[@]} > 0)) && grep -Fwqf <(printf '%s\n' "${WORD_HARD[@]}") <<< "$text"; then
-    printf 'deny'
+    MATCH_CLASS='word-hard'
+    MATCH_TERM="$(grep -Fwof <(printf '%s\n' "${WORD_HARD[@]}") <<< "$text" | head -n1 || true)"
+    VERDICT='deny'
     return 0
   fi
   if ((${#WORD_WARN[@]} > 0)) && grep -Fwqf <(printf '%s\n' "${WORD_WARN[@]}") <<< "$text"; then
     text_allow_suppressed "$text" && return 1
-    printf 'ask'
+    MATCH_CLASS='word-warn'
+    MATCH_TERM="$(grep -Fwof <(printf '%s\n' "${WORD_WARN[@]}") <<< "$text" | head -n1 || true)"
+    VERDICT='ask'
     return 0
   fi
   return 1
@@ -375,9 +467,22 @@ verdict_reason() { # $1=deny|ask -> 理由文(bypass 手段はここに書かな
   esac
 }
 
-emit_verdict() { # $1=deny|ask $2=reason -> 理由を印字し、対応する exit code で終了
-  printf '%s\n' "$2"
+# match_verdict の結果から reason_id(判定レッジャーの閉語彙)を決める。
+reason_id_for_verdict() { # $1=deny|ask
   case "$1" in
+    deny) printf 'repo-ref' ;;
+    ask) printf 'org-bare' ;;
+  esac
+}
+
+# emit_verdict: $1=deny|ask $2=reason(理由文) $3=reason_id
+#               $4=match_class(既定 none) $5=平文のマッチ語(既定空)
+# レッジャーに書いてから理由を印字し、対応する exit code で終了する。
+emit_verdict() {
+  local verdict="$1" reason="$2" reason_id="$3" match_class="${4:-none}" term="${5-}"
+  ledger_write "$verdict" "$reason_id" "$match_class" "$term"
+  printf '%s\n' "$reason"
+  case "$verdict" in
     deny) exit 2 ;;
     ask) exit 1 ;;
   esac
@@ -395,9 +500,9 @@ emit_verdict() { # $1=deny|ask $2=reason -> 理由を印字し、対応する ex
 require_orgs_file() {
   [[ -f $ORGS_FILE ]] && return 0
   if [[ -d $LEGACY_CONFIG_DIR ]]; then
-    emit_verdict ask "bleep の設定が改名前の場所に残っています(${LEGACY_CONFIG_DIR} → ${CONFIG_DIR} への移行が未了)。org denylist が読まれていません。README の Upgrading 手順で移行してください。"
+    emit_verdict ask "bleep の設定が改名前の場所に残っています(${LEGACY_CONFIG_DIR} → ${CONFIG_DIR} への移行が未了)。org denylist が読まれていません。README の Upgrading 手順で移行してください。" legacy-config
   fi
-  emit_verdict ask "bleep が未設定です(${ORGS_FILE} がありません)。org denylist が空のまま公開面を検査しています。org 名を 1 行書くか、登録しないなら空ファイルを置いて明示してください。"
+  emit_verdict ask "bleep が未設定です(${ORGS_FILE} がありません)。org denylist が空のまま公開面を検査しています。org 名を 1 行書くか、登録しないなら空ファイルを置いて明示してください。" unconfigured
 }
 
 # ---- push 差分 / リポジトリ可視性 ------------------------------------------
@@ -516,20 +621,17 @@ cmd_scan() {
   local src="${1--}" text
   if [[ $src == "-" || -z $src ]]; then
     if ! text="$(cat)"; then
-      printf 'stdin を読み取れませんでした。\n'
-      exit 1
+      emit_verdict ask "stdin を読み取れませんでした。" engine-unavailable
     fi
   else
     if ! text="$(cat "$src" 2>/dev/null)"; then
-      printf '%s を読み取れませんでした。\n' "$src"
-      exit 1
+      emit_verdict ask "${src} を読み取れませんでした。" engine-unavailable
     fi
   fi
   require_orgs_file
   build_patterns
-  local verdict
-  if verdict="$(match_verdict "$text")"; then
-    emit_verdict "$verdict" "$(verdict_reason "$verdict")"
+  if match_verdict "$text"; then
+    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT")" "$(reason_id_for_verdict "$VERDICT")" "$MATCH_CLASS" "$MATCH_TERM"
   fi
   exit 0
 }
@@ -548,14 +650,12 @@ cmd_scan_push() {
 
   local text
   if ! text="$(compute_push_diff_text)"; then
-    printf 'push 差分を検査できませんでした: %s\n' "$PUSH_DIFF_FAIL_REASON"
-    exit 1
+    emit_verdict ask "push 差分を検査できませんでした: ${PUSH_DIFF_FAIL_REASON}" push-diff-failed
   fi
   require_orgs_file
   build_patterns
-  local verdict
-  if verdict="$(match_verdict "$text")"; then
-    emit_verdict "$verdict" "$(verdict_reason "$verdict")"
+  if match_verdict "$text"; then
+    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT")" "$(reason_id_for_verdict "$VERDICT")" "$MATCH_CLASS" "$MATCH_TERM"
   fi
   exit 0
 }
@@ -603,7 +703,7 @@ cmd_scan_bash_command() {
 
   local lex_out
   if ! lex_out="$("$LEX_BIN" lex --cwd "${TARGET_CWD:-.}" -- "$cmd" 2>/dev/null)"; then
-    emit_verdict ask "コマンドの字句解析に失敗しました(bleep-hook が見つからないか実行できません)。"
+    emit_verdict ask "コマンドの字句解析に失敗しました(bleep-hook が見つからないか実行できません)。" lex-failed
   fi
 
   local found_push found_gh push_dir gh_repo_override gh_effective_dir scan_subject
@@ -633,9 +733,8 @@ cmd_scan_bash_command() {
     fi
     require_orgs_file
     build_patterns
-    local verdict
-    if verdict="$(match_verdict "$scan_subject")"; then
-      emit_verdict "$verdict" "$(verdict_reason "$verdict")"
+    if match_verdict "$scan_subject"; then
+      emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT")" "$(reason_id_for_verdict "$VERDICT")" "$MATCH_CLASS" "$MATCH_TERM"
     fi
     exit 0
   fi
@@ -683,18 +782,20 @@ audit() {
   done
 
   build_patterns
-  local hit=0 verdict content
+  local hit=0 content
 
   # --since <rev>: working tree の現物(git ls-files)は「今 push したら
   # 何が漏れるか」しか見ない。private → public 化の直前には、既に削除
   # した内容(過去のコミットにだけ残る denylist 文字列)も含めて履歴全体を
   # 確認したい(G3)。working tree のスキャンを置き換えるのではなく追加する
   # — 両方確認できて初めて「これから公開して大丈夫か」の判断材料になる。
+  # match_verdict はグローバル変数 VERDICT で結果を返す(コマンド置換で
+  # 囲むと判定レッジャー用の付随変数がサブシェルに閉じてしまうため)。
   if [[ -n $since ]]; then
     local since_text
     since_text="$(compute_since_diff_text "$since")"
-    if verdict="$(match_verdict "$since_text")"; then
-      printf '%s: history-since=%s\n' "$verdict" "$since"
+    if match_verdict "$since_text"; then
+      printf '%s: history-since=%s\n' "$VERDICT" "$since"
       hit=1
     fi
   fi
@@ -707,8 +808,8 @@ audit() {
     [[ -f $f ]] || continue
     path_allow_suppressed "$f" && continue
     content="$(cat "$f" 2>/dev/null)"
-    if verdict="$(match_verdict "$content")"; then
-      printf '%s: file=%s\n' "$verdict" "$f"
+    if match_verdict "$content"; then
+      printf '%s: file=%s\n' "$VERDICT" "$f"
       hit=1
     fi
   done
@@ -717,16 +818,16 @@ audit() {
     local n title body
     while IFS=$'\t' read -r n title body; do
       [[ -n $n ]] || continue
-      if verdict="$(match_verdict "$title"$'\n'"$body")"; then
-        printf '%s: issue=#%s\n' "$verdict" "$n"
+      if match_verdict "$title"$'\n'"$body"; then
+        printf '%s: issue=#%s\n' "$VERDICT" "$n"
         hit=1
       fi
     done < <("$GH_BIN" issue list --state open --limit 200 --json number,title,body \
       --jq '.[] | [.number, .title, (.body // "" | gsub("\n";" "))] | @tsv' 2> /dev/null)
     while IFS=$'\t' read -r n title body; do
       [[ -n $n ]] || continue
-      if verdict="$(match_verdict "$title"$'\n'"$body")"; then
-        printf '%s: pr=#%s\n' "$verdict" "$n"
+      if match_verdict "$title"$'\n'"$body"; then
+        printf '%s: pr=#%s\n' "$VERDICT" "$n"
         hit=1
       fi
     done < <("$GH_BIN" pr list --state open --limit 200 --json number,title,body \
@@ -747,6 +848,7 @@ selftest() {
 
   export BLEEP_CONFIG_DIR="$tmp/config"
   export BLEEP_STATE_DIR="$tmp/state"
+  export BLEEP_LEDGER_DIR="$tmp/agent-verdicts"
   export BLEEP_ORGS_FILE="$tmp/config/orgs.txt"
   export BLEEP_REPOS_FILE="$tmp/config/repos.txt"
   export BLEEP_ALLOW_STOPWORDS_FILE="$tmp/config/allow-stopwords.txt"
@@ -786,7 +888,7 @@ STUB
   expect_verdict() { # $1=expected(deny/ask/pass) $2=text
     local got
     build_patterns
-    if got="$(match_verdict "$2")"; then :; else got="pass"; fi
+    if match_verdict "$2"; then got="$VERDICT"; else got="pass"; fi
     if [[ $got != "$1" ]]; then
       echo "FAIL(期待=$1, 実際=$got): $2" >&2
       fails=$((fails + 1))
@@ -845,6 +947,69 @@ acme で議論した"
   printf 'acme-forum\\.example' > "$BLEEP_ALLOW_REGEXES_FILE"
   expect_verdict pass "問い合わせは acme-forum.example の acme 宛"
   : > "$BLEEP_ALLOW_REGEXES_FILE"
+
+  # ---- 判定レッジャー ------------------------------------------------------
+  local ledger_line
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  (BLEEP_HOST=claude BLEEP_SESSION_ID=sess-1 BLEEP_TOOL_NAME=Bash "$SELF" scan <<< "acme/secret-project の件") > /dev/null 2>&1
+  set -e
+  if [[ ! -f "$BLEEP_LEDGER_DIR/bleep.jsonl" ]]; then
+    echo "FAIL(ledger: deny で1行書かれるはず): ファイルが無い" >&2
+    fails=$((fails + 1))
+  else
+    ledger_line="$(tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl")"
+    local want
+    for want in '"verdict":"deny"' '"reason_id":"repo-ref"' '"match_class":"plain"' \
+      '"host":"claude"' '"session_id":"sess-1"' '"tool_name":"Bash"' '"repo":"tarotene/bleep"'; do
+      [[ $ledger_line == *"$want"* ]] || { echo "FAIL(ledger: $want が無い): $ledger_line" >&2; fails=$((fails + 1)); }
+    done
+    if [[ $ledger_line == *"acme/secret-project"* ]]; then
+      echo "FAIL(ledger: 平文のマッチ語が書かれている): $ledger_line" >&2
+      fails=$((fails + 1))
+    fi
+    if [[ "$(wc -l < "$BLEEP_LEDGER_DIR/bleep.jsonl")" -ne 1 ]]; then
+      echo "FAIL(ledger: 1回の deny で1行のはず): $(cat "$BLEEP_LEDGER_DIR/bleep.jsonl")" >&2
+      fails=$((fails + 1))
+    fi
+  fi
+
+  # pass では書かない。
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  (BLEEP_HOST=claude "$SELF" scan <<< "これは無関係な文章です") > /dev/null 2>&1
+  set -e
+  if [[ -f "$BLEEP_LEDGER_DIR/bleep.jsonl" ]]; then
+    echo "FAIL(ledger: pass で書かれてはいけない): $(cat "$BLEEP_LEDGER_DIR/bleep.jsonl")" >&2
+    fails=$((fails + 1))
+  fi
+
+  # DO_NOT_TRACK / BLEEP_NO_LEDGER で無効化できる。
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  (DO_NOT_TRACK=1 "$SELF" scan <<< "acme/secret-project の件") > /dev/null 2>&1
+  set -e
+  [[ -f "$BLEEP_LEDGER_DIR/bleep.jsonl" ]] && { echo "FAIL(ledger: DO_NOT_TRACK=1 で書かれてはいけない)" >&2; fails=$((fails + 1)); }
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  (BLEEP_NO_LEDGER=1 "$SELF" scan <<< "acme/secret-project の件") > /dev/null 2>&1
+  set -e
+  [[ -f "$BLEEP_LEDGER_DIR/bleep.jsonl" ]] && { echo "FAIL(ledger: BLEEP_NO_LEDGER=1 で書かれてはいけない)" >&2; fails=$((fails + 1)); }
+
+  # require_orgs_file の fail-loud ask にも reason_id が付く。
+  rm -rf "$BLEEP_LEDGER_DIR"
+  local missing_orgs_ledger="$tmp/config/orgs-notexist-ledger.txt"
+  set +e
+  (BLEEP_ORGS_FILE="$missing_orgs_ledger" "$SELF" scan <<< "hello") > /dev/null 2>&1
+  set -e
+  if [[ -f "$BLEEP_LEDGER_DIR/bleep.jsonl" ]]; then
+    ledger_line="$(tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl")"
+    [[ $ledger_line == *'"reason_id":"unconfigured"'* ]] || { echo "FAIL(ledger: unconfigured): $ledger_line" >&2; fails=$((fails + 1)); }
+  else
+    echo "FAIL(ledger: orgs.txt 不在の ask でも記録されるはず)" >&2
+    fails=$((fails + 1))
+  fi
+  rm -rf "$BLEEP_LEDGER_DIR"
 
   # gather 相当: gh/git push の検出とフォールスルー(scan-bash-command 経由)
   local out rc

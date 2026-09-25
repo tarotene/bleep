@@ -47,8 +47,16 @@ impl Env {
             .env("BLEEP_ORGS_FILE", self.tmp.path().join("config/orgs.txt"))
             .env("BLEEP_REPOS_FILE", self.tmp.path().join("config/repos.txt"))
             .env("BLEEP_OWNER", "test-owner")
-            .env("BLEEP_GH_BIN", self.tmp.path().join("bin-gh"));
+            .env("BLEEP_GH_BIN", self.tmp.path().join("bin-gh"))
+            // 判定レッジャーをテスト用 tmp に隔離する — これが無いと
+            // テスト実行のたびに実マシンの ~/.local/state/agent-verdicts/
+            // を汚してしまう。
+            .env("BLEEP_LEDGER_DIR", self.ledger_dir());
         cmd
+    }
+
+    fn ledger_dir(&self) -> PathBuf {
+        self.tmp.path().join("agent-verdicts")
     }
 
     /// tests/fixtures/push-cwd-repo.sh の build_cwd_push_repo を bash 経由で
@@ -187,6 +195,52 @@ fn cwd_passthrough_claude() {
         .assert()
         .success();
     assert_eq!(decision_wrapped(&assert.get_output().stdout), None);
+}
+
+#[test]
+fn session_id_and_host_reach_ledger() {
+    // host.rs が受け取った session_id/host/tool_name が BLEEP_SESSION_ID/
+    // BLEEP_HOST/BLEEP_TOOL_NAME として bleep(bash)に渡り、判定レッジャーに
+    // 記録されること。マッチした平文の語(acme/secret-project)はレッジャーの
+    // どのフィールドにも現れないこと。
+    let env = Env::new();
+    // MCP 系ツール(tool_name != "Bash")は cmd_scan(素の text scan)を通る
+    // ため、字句解析(lex)を挟まず match_verdict まで確実に到達する —
+    // Bash コマンドだと "git push"/"gh ... create" の形でないと
+    // fall-through pass になり、この検証には向かない。
+    let input = serde_json::json!({
+        "tool_name": "mcp__github__create_issue",
+        "tool_input": {"title": "t", "body": "acme/secret-project"},
+        "cwd": ".",
+        "session_id": "sess-xyz",
+    });
+    let assert = env
+        .pg_command()
+        .arg("--host=claude")
+        .write_stdin(input.to_string())
+        .assert()
+        .success();
+    assert_eq!(
+        decision_wrapped(&assert.get_output().stdout),
+        Some("deny".to_string())
+    );
+
+    let ledger_file = env.ledger_dir().join("bleep.jsonl");
+    let contents = std::fs::read_to_string(&ledger_file)
+        .unwrap_or_else(|e| panic!("ledger not written at {ledger_file:?}: {e}"));
+    let line = contents.lines().next().expect("at least one ledger line");
+    let record: serde_json::Value = serde_json::from_str(line).expect("ledger line is valid JSON");
+    assert_eq!(record["tool"], "bleep");
+    assert_eq!(record["repo"], "tarotene/bleep");
+    assert_eq!(record["host"], "claude");
+    assert_eq!(record["session_id"], "sess-xyz");
+    assert_eq!(record["tool_name"], "mcp__github__create_issue");
+    assert_eq!(record["verdict"], "deny");
+    assert_eq!(record["reason_id"], "repo-ref");
+    assert!(
+        !line.contains("acme/secret-project"),
+        "ledger line must not contain the plaintext match: {line}"
+    );
 }
 
 #[test]
