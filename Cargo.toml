@@ -1,6 +1,6 @@
 [package]
 name = "bleep-hook"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Host adapter + command lexer for bleep's PreToolUse hooks"
 license = "MIT"
@@ -19,6 +19,11 @@ serde_json = "1"
 # 149M+ ダウンロード・2018年から継続的にメンテナンスされている事実で選定
 # — 詳細は先行例との対比(D6)を参照。
 shell-words = "1.1"
+# 判定レッジャー(#33)のマッチ語ハッシュ化専用。RustCrypto の中核実装で
+# 依存グラフが軽い(乱数生成は自前で /dev/urandom を読み、rand crate は
+# 追加しない — 鍵生成はプロセス起動あたり高々1回)。
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 assert_cmd = "2"

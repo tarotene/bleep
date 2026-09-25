@@ -26,6 +26,15 @@ impl Host {
     }
 }
 
+/// 判定レッジャーの `host` フィールド(bleep 側 BLEEP_HOST env)に使う名前。
+fn host_env_name(host: Host) -> &'static str {
+    match host {
+        Host::Claude => "claude",
+        Host::Codex => "codex",
+        Host::Copilot => "copilot",
+    }
+}
+
 /// tool_input/toolArgs の文字列リーフだけを出現順に再帰収集する
 /// (`[.. | strings] | join("\n")` の移植)。tostring は使わない — JSON
 /// エスケープが残ると改行が "\n"(バックスラッシュ+n)になり、
@@ -63,19 +72,22 @@ struct Decoded<'a> {
     bash_command: Option<&'a str>,
     tool_payload: Option<&'a Value>,
     cwd: Option<&'a str>,
+    session_id: Option<&'a str>,
 }
 
 fn decode(host: Host, v: &Value) -> Decoded<'_> {
-    let (tool_name, payload, bash_marker) = match host {
+    let (tool_name, payload, bash_marker, session_id) = match host {
         Host::Claude | Host::Codex => (
             v.get("tool_name").and_then(Value::as_str),
             v.get("tool_input"),
             "Bash",
+            v.get("session_id").and_then(Value::as_str),
         ),
         Host::Copilot => (
             v.get("toolName").and_then(Value::as_str),
             v.get("toolArgs"),
             "bash",
+            v.get("sessionId").and_then(Value::as_str),
         ),
     };
     let cwd = v.get("cwd").and_then(Value::as_str);
@@ -93,6 +105,7 @@ fn decode(host: Host, v: &Value) -> Decoded<'_> {
         bash_command,
         tool_payload: payload,
         cwd,
+        session_id,
     }
 }
 
@@ -102,7 +115,19 @@ enum Verdict {
     Deny(String),
 }
 
-fn run_pg(pg_bin: &str, cwd: Option<&str>, args: &[&str], stdin_text: Option<&str>) -> Verdict {
+/// host/session_id/tool_name を子プロセスの env に渡す。bleep(Bash)側の
+/// 判定レッジャー(`ledger_write`)がこれらを読んで記録する — 値そのものに
+/// 秘匿情報は含まない(host 名・セッション ID・呼ばれたツール名はどれも
+/// bleep が守ろうとしている「private リポ名」ではない)。
+fn run_pg(
+    pg_bin: &str,
+    cwd: Option<&str>,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    host: Host,
+    session_id: Option<&str>,
+    tool_name: &str,
+) -> Verdict {
     let mut cmd = Command::new(pg_bin);
     if let Some(cwd) = cwd {
         if !cwd.is_empty() {
@@ -110,6 +135,13 @@ fn run_pg(pg_bin: &str, cwd: Option<&str>, args: &[&str], stdin_text: Option<&st
         }
     }
     cmd.args(args);
+    cmd.env("BLEEP_HOST", host_env_name(host));
+    if let Some(sid) = session_id {
+        if !sid.is_empty() {
+            cmd.env("BLEEP_SESSION_ID", sid);
+        }
+    }
+    cmd.env("BLEEP_TOOL_NAME", tool_name);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     if stdin_text.is_some() {
         cmd.stdin(Stdio::piped());
@@ -184,20 +216,34 @@ pub fn run(host: Host, pg_bin: &str) {
     };
 
     let d = decode(host, &v);
-    let Some(_tool_name) = d.tool_name else {
+    let Some(tool_name) = d.tool_name else {
         return; // tool_name が無い入力はこの hook の対象外
     };
 
     let verdict = if d.is_bash {
         match d.bash_command {
-            Some(cmd) if !cmd.is_empty() => {
-                run_pg(pg_bin, d.cwd, &["scan-bash-command", cmd], None)
-            }
+            Some(cmd) if !cmd.is_empty() => run_pg(
+                pg_bin,
+                d.cwd,
+                &["scan-bash-command", cmd],
+                None,
+                host,
+                d.session_id,
+                tool_name,
+            ),
             _ => Verdict::Pass, // Bash だが command が空 = 何もしない(既存 Bash 版と同じ)
         }
     } else {
         let text = join_string_leaves(d.tool_payload);
-        run_pg(pg_bin, d.cwd, &["scan", "-"], Some(&text))
+        run_pg(
+            pg_bin,
+            d.cwd,
+            &["scan", "-"],
+            Some(&text),
+            host,
+            d.session_id,
+            tool_name,
+        )
     };
 
     emit(host, verdict);
