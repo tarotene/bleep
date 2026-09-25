@@ -60,5 +60,10 @@ Schroeder 1975, CWE-184). When adding new detection logic:
   `cmd_scan`/`cmd_scan_push` for the pattern.
 - Never name the bypass mechanism (`BLEEP_ALLOW=1`) in a deny
   reason's text.
+- Never write a plaintext denylist term (or the command text, `cwd`, or the
+  deny/ask reason text) to the verdict ledger (`ledger_write` in `bleep`,
+  README's "Verdict ledger" section) — only closed-vocabulary fields and a
+  keyed hash of the matched term. Writing plaintext there would defeat this
+  tool's own purpose.
 - Both `./bleep selftest` and `shellcheck -S error bleep`
   must pass.

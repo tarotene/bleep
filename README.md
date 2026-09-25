@@ -377,6 +377,34 @@ constrained party (the agent) could otherwise read the deny reason and
 re-run the bypass itself. The existence of this bypass is meant to be known
 only to the human who configures this tool.
 
+## Verdict ledger (local only, never sent anywhere)
+
+Every `deny`/`ask` verdict from `scan`/`scan-push`/`scan-bash-command`
+(including the fail-loud `ask`s such as a missing `orgs.txt`) is appended,
+one JSON object per line, to
+`$XDG_STATE_HOME/agent-verdicts/bleep.jsonl` (default
+`~/.local/state/agent-verdicts/bleep.jsonl`). Nothing is transmitted
+anywhere — this exists so an agent that keeps getting blocked by the same
+judgment can have that fact surfaced locally and, if you choose to, turned
+into a bug report against this repository, instead of silently working
+around the denial. See
+[tarotene/dotfiles docs/adr/](https://github.com/tarotene/dotfiles/tree/main/docs/adr)
+(search for "agent-verdict-ledger") for the consuming side and the
+canonical [JSON Schema](https://github.com/tarotene/dotfiles/blob/main/docs/schemas/agent-verdict.schema.json)
+for the record shape.
+
+- **What is written**: a closed-vocabulary `reason_id` and `match_class`,
+  the host name, an optional session id, the invoked tool name, and an
+  HMAC-SHA256 hash (keyed by a random, machine-local key at
+  `$XDG_STATE_HOME/agent-verdicts/hmac-key`, generated on first use) of
+  whichever denylist term matched.
+- **What is never written**: the command text, `cwd`, the plaintext
+  matched term, or the deny/ask reason text itself. Writing any of these
+  would defeat this tool's own purpose.
+- **Opt out**: set `DO_NOT_TRACK` (any non-empty value) or
+  `BLEEP_NO_LEDGER=1`. A write failure never affects the verdict itself
+  (fail-open).
+
 ## Development
 
 - `cargo build` (builds `target/debug/bleep-hook`, which the Bash
