@@ -1,3 +1,4 @@
+mod hash;
 mod host;
 mod lex;
 
@@ -8,6 +9,7 @@ fn usage() -> String {
     "\
 usage: bleep-hook --host=<claude|codex|copilot>
        bleep-hook lex [--cwd DIR] -- CMD
+       bleep-hook hash --key-file FILE -- TERM
 
 --host=<name>   PreToolUse hook adapter モード。stdin から host 固有の JSON
                 を読み、BLEEP_BIN(既定 \"bleep\")を呼び出して
@@ -17,6 +19,9 @@ lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
                 ヘッダ(found_push/push_dir/found_gh/gh_repo_override/
                 gh_effective_dir)に続けて scan_subject を書く固定書式(jq 非
                 依存 — 呼び出し側の bleep 本体を jq フリーに保つ)。
+hash            bleep(Bash)本体の判定レッジャー(ledger_write)から呼ばれる。
+                FILE に保存された鍵(無ければ新規生成)で TERM を
+                HMAC-SHA256 し、hex を1行 stdout に印字する。
 "
     .to_string()
 }
@@ -95,6 +100,32 @@ fn main() -> ExitCode {
             };
             cmd_lex(&cwd, cmd);
             return ExitCode::SUCCESS;
+        }
+        if first == "hash" {
+            let mut rest = &args[1..];
+            let Some(flag) = rest.first() else {
+                eprintln!("hash: missing --key-file\n\n{}", usage());
+                return ExitCode::from(2);
+            };
+            if flag != "--key-file" {
+                eprintln!("hash: expected --key-file\n\n{}", usage());
+                return ExitCode::from(2);
+            }
+            let Some(key_file) = rest.get(1) else {
+                eprintln!("--key-file requires a value\n\n{}", usage());
+                return ExitCode::from(2);
+            };
+            rest = &rest[2..];
+            let rest = if rest.first().map(String::as_str) == Some("--") {
+                &rest[1..]
+            } else {
+                rest
+            };
+            let Some(term) = rest.first() else {
+                eprintln!("hash: missing TERM\n\n{}", usage());
+                return ExitCode::from(2);
+            };
+            return ExitCode::from(hash::run(key_file, term) as u8);
         }
         if first == "--help" || first == "-h" {
             print!("{}", usage());
