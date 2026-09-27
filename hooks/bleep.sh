@@ -89,6 +89,11 @@ selftest() {
     export BLEEP_REPOS_FILE="$tmp/config/repos.txt"
     export BLEEP_OWNER="test-owner"
     export BLEEP_GH_BIN="$tmp/bin-gh"
+    # tests/host_test.rs と揃え、判定レッジャーも隔離する。無指定だと
+    # bleep 本体は既定の $XDG_STATE_HOME/agent-verdicts/bleep.jsonl に
+    # 書くため、この selftest 経路の判定(fixture 由来の偽の verdict)が
+    # 実行環境の実レッジャーに混入してしまう。
+    export BLEEP_LEDGER_DIR="$tmp/agent-verdicts"
     mkdir -p "$tmp/config" "$tmp/state"
     printf 'acme\n' > "$BLEEP_ORGS_FILE"
     printf 'acme/secret-project\n' > "$BLEEP_REPOS_FILE"
@@ -102,7 +107,7 @@ selftest() {
       fails=$((fails + 1))
     fi
     unset BLEEP_HOOK_BIN BLEEP_LEX_BIN BLEEP_CONFIG_DIR BLEEP_STATE_DIR \
-      BLEEP_ORGS_FILE BLEEP_REPOS_FILE BLEEP_OWNER BLEEP_GH_BIN
+      BLEEP_ORGS_FILE BLEEP_REPOS_FILE BLEEP_OWNER BLEEP_GH_BIN BLEEP_LEDGER_DIR
   else
     echo "SKIP(exec 経路): $real_bin が無い — 先に cargo build してください" >&2
   fi
