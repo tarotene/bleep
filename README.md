@@ -63,6 +63,14 @@ so explicitly:
 $ touch ~/.config/bleep/orgs.txt   # explicit opt-out: no company org
 ```
 
+If your `orgs.txt`/`repos.txt` are generated declaratively (e.g. a
+home-manager module, as opposed to hand-placed), a missing file more often
+means the generation didn't run on this host than an intentional opt-out —
+re-apply whatever generates them instead of writing one by hand. Either way,
+deciding what org name to register (or that there is none) is a human
+decision: an agent that hits this `ask` should surface it and wait, not
+recreate the file itself from a backup or a guess.
+
 Other config files you can add (all optional, one entry per line, `#`
 comments and blank lines ignored):
 
