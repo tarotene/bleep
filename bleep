@@ -502,7 +502,7 @@ require_orgs_file() {
   if [[ -d $LEGACY_CONFIG_DIR ]]; then
     emit_verdict ask "bleep の設定が改名前の場所に残っています(${LEGACY_CONFIG_DIR} → ${CONFIG_DIR} への移行が未了)。org denylist が読まれていません。README の Upgrading 手順で移行してください。" legacy-config
   fi
-  emit_verdict ask "bleep が未設定です(${ORGS_FILE} がありません)。org denylist が空のまま公開面を検査しています。org 名を 1 行書くか、登録しないなら空ファイルを置いて明示してください。" unconfigured
+  emit_verdict ask "bleep が未設定です(${ORGS_FILE} がありません)。org denylist が空のまま公開面を検査しています。この設定を宣言的に生成している場合(dotfiles 等の home-manager 管理)は、その適用を再実行してください。手で作る場合も、登録する org 名(または空ファイルによる明示的な opt-out)を決めるのは人間の判断です — エージェントが推測で作らないでください。" unconfigured
 }
 
 # ---- push 差分 / リポジトリ可視性 ------------------------------------------
