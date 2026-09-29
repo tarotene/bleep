@@ -244,11 +244,15 @@ sitting wherever the agent's session started (#10, #14).
 into segments on `;`, `&&`, `||`, `|`, and newlines (quote-aware — `&&`
 inside a quoted string is not treated as a separator). Each segment is
 tokenized and walked by **position**, skipping recognized global options
-(`git`'s `-C`/`-c`/`--git-dir`/etc., `gh`'s `--repo`/`-R`), before checking
-whether the next token is the actual subcommand. This means `git -C <dir>
-push` and `gh --repo owner/repo pr create` are correctly recognized as
-push/publish actions — a plain adjacency regex (the previous implementation)
-missed both (#9, #14). The recognized `gh` publish surface is
+(`git`'s `-C`/`-c`/`--git-dir`/etc.), before checking whether the next token
+is the actual subcommand. This means `git -C <dir> push` is correctly
+recognized as a push action — a plain adjacency regex (the previous
+implementation) missed it (#9, #14). `gh`'s `--repo`/`-R` (`--repo=value`
+form included) is detected **independently of position** — it's a flag `gh`
+itself inherits into every subcommand, so `gh --repo owner/repo pr create`
+and `gh pr create --repo owner/repo` are both recognized (the latter was a
+known gap, #23; a plain adjacency/position scan missed it whenever `--repo`
+came after the subcommand). The recognized `gh` publish surface is
 `pr|issue create|edit|comment`, `release create|edit`, `repo edit`,
 `gist create`, and `api` with a write method (`-X`/`--method` set to `POST`,
 `PUT`, or `PATCH` — a plain `gh api <endpoint>` read defaults to GET and is
@@ -258,16 +262,24 @@ If any of these segments is found, the denylist match runs against `CMD`
 with any segment that is
 **exactly** `cd <single token>` removed — not against the whole command
 string — so a `cd`'s path argument merely containing a private repo name no
-longer triggers a false-positive hard-deny (#9); everything else (including
-any oddly-split fragment) stays in the scanned text, so this narrowing never
-creates a new blind spot. If a `git push` segment is found, its effective
-target directory is resolved from that segment's own `-C` override, or
-failing that, from the cumulative effect of every preceding bare `cd <dir>`
-segment (not just the first one) starting at `--cwd`/the hook's own cwd —
-this is what makes `cd /other/repo && git push` and `cd /other/repo && gh pr
-create ...` correctly resolve visibility/diffs against `/other/repo` instead
-of the hook process's own cwd (#10, #14). Nested `$(...)` command
-substitutions are not tracked — this is an approximation within the "not a
+longer triggers a false-positive hard-deny (#9). Within a `gh` segment that
+has an explicit `--repo`/`-R` override, that flag and its value are also
+removed from the scanned text (#43) — the destination a command explicitly
+names is not itself a leak, the same reasoning `cd` already gets; everything
+the destination doesn't cover (titles, bodies, and any oddly-split fragment)
+still stays in the scanned text, so neither narrowing creates a new blind
+spot. If a `git push` segment is found, its effective target directory is
+resolved from that segment's own `-C` override — an absolute `-C` value wins
+outright, a relative one is joined onto the cumulative effect of every
+preceding bare `cd <dir>` segment (not just the first one), matching how a
+real shell resolves a relative `-C` argument (#41; before this, any relative
+`-C` value was used as-is, ignoring both `cd` history and `--cwd`) — or,
+absent a `-C` override, directly from that same cumulative `cd` effect,
+starting at `--cwd`/the hook's own cwd. This is what makes `cd /other/repo
+&& git push` and `cd /other/repo && gh pr create ...` correctly resolve
+visibility/diffs against `/other/repo` instead of the hook process's own cwd
+(#10, #14). Nested `$(...)` command substitutions and other shell-variable
+expansions are not tracked — this is an approximation within the "not a
 security boundary" scope already stated below.
 
 `bleep scan`/`scan-push`/`scan-bash-command` all share the same exit

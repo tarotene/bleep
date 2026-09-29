@@ -244,21 +244,20 @@ pub fn classify_segment(seg: &str) -> SegClassification {
             }
         }
         "gh" => {
+            // サブコマンドの位置を確定するためだけの読み飛ばしループ。
+            // --repo/-R/--hostname の値も消費するが、repo_override の捕捉は
+            // ここでは行わない(#23 — 以前はこのループの中でしか --repo を
+            // 見ておらず、サブコマンドで break した後ろにある --repo を
+            // 一切検出できなかった)。
             let mut idx = 1usize;
             while idx < n {
                 match t[idx].as_str() {
-                    "--repo" | "-R" => {
-                        result.repo_override = t.get(idx + 1).cloned();
+                    "--repo" | "-R" | "--hostname" => {
                         idx += 2;
                         continue;
                     }
                     s if s.starts_with("--repo=") => {
-                        result.repo_override = Some(s.trim_start_matches("--repo=").to_string());
                         idx += 1;
-                        continue;
-                    }
-                    "--hostname" => {
-                        idx += 2;
                         continue;
                     }
                     s if s.starts_with('-') => {
@@ -268,6 +267,32 @@ pub fn classify_segment(seg: &str) -> SegClassification {
                     _ => break,
                 }
             }
+
+            // --repo/-R/--repo= は gh の persistent flag(gh CLI manual
+            // "Options inherited from parent commands")で、サブコマンドの
+            // 前後どちらに置いても解釈される。位置に依存せず全トークンを
+            // 走査して検出する(#23、#43)。複数回指定された場合は最後の
+            // 一致を採用する(gh api の書き込みメソッド判定と同じ、舐めて
+            // 最後を採用する意味論)。
+            let mut j = 1usize;
+            while j < n {
+                match t[j].as_str() {
+                    "--repo" | "-R" => {
+                        result.repo_override = t.get(j + 1).cloned();
+                        j += 2;
+                        continue;
+                    }
+                    s if s.starts_with("--repo=") => {
+                        result.repo_override = Some(s.trim_start_matches("--repo=").to_string());
+                        j += 1;
+                        continue;
+                    }
+                    _ => {
+                        j += 1;
+                    }
+                }
+            }
+
             if idx < n {
                 let sub = t[idx].as_str();
                 let action = t.get(idx + 1).map(|s| s.as_str()).unwrap_or("");
@@ -327,32 +352,80 @@ pub struct AnalyzeResult {
     pub gh_effective_dir: String,
 }
 
+/// gh セグメントの生テキストから `--repo`/`-R`(値を伴う2トークン形)と
+/// `--repo=値`(1トークン形)を取り除き、残りのトークンを
+/// `shell_words::join`(`split` の逆演算、必要最小限の再クォート)で
+/// 再結合したテキストを返す(#43、D2)。宛先そのものを指すトークンは
+/// 「漏洩ではない」という #9(cd セグメント全体除外)と同じ考え方を、
+/// セグメント単位からトークン単位に広げたもの。複数回指定されていても
+/// 全て取り除く(scan_subject からは常に除外してよい — どの occurrence が
+/// 実際に採用されるかに関わらず、どれも宛先参照であることに変わりないため)。
+fn strip_repo_override_tokens(seg: &str) -> String {
+    let t = tokenize_segment(seg);
+    let mut kept: Vec<String> = Vec::with_capacity(t.len());
+    let mut j = 0usize;
+    while j < t.len() {
+        match t[j].as_str() {
+            "--repo" | "-R" => {
+                j += 2; // フラグ+値の2トークンを両方取り除く
+                continue;
+            }
+            s if s.starts_with("--repo=") => {
+                j += 1;
+                continue;
+            }
+            _ => {
+                kept.push(t[j].clone());
+                j += 1;
+            }
+        }
+    }
+    shell_words::join(kept)
+}
+
 pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult {
     let segments = split_command_segments(cmd);
-
-    let mut scan_subject = String::new();
-    for seg in &segments {
-        if as_single_cd_target(seg).is_some() {
-            continue;
-        }
-        scan_subject.push_str(seg);
-        scan_subject.push('\n');
-    }
-
-    let mut result = AnalyzeResult {
-        scan_subject,
-        ..Default::default()
-    };
+    let mut result = AnalyzeResult::default();
 
     for (i, seg) in segments.iter().enumerate() {
         let c = classify_segment(seg);
+
+        if as_single_cd_target(seg).is_none() {
+            if c.kind_is_gh_publish && c.repo_override.is_some() {
+                result
+                    .scan_subject
+                    .push_str(&strip_repo_override_tokens(seg));
+            } else {
+                result.scan_subject.push_str(seg);
+            }
+            result.scan_subject.push('\n');
+        }
+
         if c.kind_is_push && !result.found_push {
             result.found_push = true;
             result.push_dir = match c.dir_override {
                 // git -C <dir> の <dir> にも同じ展開を適用する(#39) —
                 // resolve_effective_dir を経由しない唯一の経路なので、
-                // ここで expand_home を直接通す。
-                Some(d) => expand_home(&d, home),
+                // ここで expand_home を直接通す。展開後も絶対パスでなく
+                // (先頭 `/` 無し)、かつ未展開の `$` 参照(`$HOMEBREW/x` の
+                // ような閉集合外の変数)を含まないときだけ、cd 追跡結果に
+                // 連結する(#41 — 相対パスは直前の実効ディレクトリからの
+                // 相対、という git -C 自体の意味論に合わせる)。`$` が残る
+                // ケースは静的に解決できないため、以前と同じく無加工で返す
+                // (#34 の対象— 検出して ask にエスカレートするかどうかは
+                // 別の継ぎ目で判断する)。
+                Some(d) => {
+                    let expanded = expand_home(&d, home);
+                    if expanded.starts_with('/') || expanded.contains('$') {
+                        expanded
+                    } else {
+                        format!(
+                            "{}/{}",
+                            resolve_effective_dir(start_dir, &segments, i, home),
+                            expanded
+                        )
+                    }
+                }
                 None => resolve_effective_dir(start_dir, &segments, i, home),
             };
         }
@@ -391,12 +464,43 @@ mod tests {
     }
 
     #[test]
-    fn repo_after_subcommand_is_not_detected() {
-        // #23 の既知の未対応(サブコマンド後の --repo は検出しない、
-        // Bash 版と同じ挙動を保つことを固定 — 直す場合は #23 で対応する)。
+    fn repo_after_subcommand_is_detected() {
+        // #23: --repo/-R は gh の persistent flag で位置に依存しない。
+        // 以前はサブコマンド確定ループで break した後ろを一切見ておらず、
+        // ここは None(未対応)を固定するテストだった。
         let c = classify_segment(r#"gh pr create --repo acme/other --title t"#);
         assert!(c.kind_is_gh_publish);
-        assert_eq!(c.repo_override, None);
+        assert_eq!(c.repo_override.as_deref(), Some("acme/other"));
+    }
+
+    #[test]
+    fn dash_r_after_subcommand_is_detected() {
+        // #23: -R(短縮形)もサブコマンド後で検出できる。
+        let c = classify_segment(r#"gh issue create -R acme/other --title t"#);
+        assert!(c.kind_is_gh_publish);
+        assert_eq!(c.repo_override.as_deref(), Some("acme/other"));
+    }
+
+    #[test]
+    fn repo_equals_after_subcommand_is_detected() {
+        // #23: --repo=値 形もサブコマンド後で検出できる。
+        let c = classify_segment(r#"gh pr create --repo=acme/other --title t"#);
+        assert!(c.kind_is_gh_publish);
+        assert_eq!(c.repo_override.as_deref(), Some("acme/other"));
+    }
+
+    #[test]
+    fn repo_override_token_excluded_from_scan_subject() {
+        // #43(D2): 明示された --repo の宛先トークン自体は scan_subject から
+        // 除外される(#9 の cd 除外と同じ考え方)。body の内容は残る。
+        let r = analyze(
+            r#"gh pr create --repo acme/public-oss --title t --body "unrelated""#,
+            ".",
+            None,
+        );
+        assert!(r.found_gh);
+        assert!(!r.scan_subject.contains("acme/public-oss"));
+        assert!(r.scan_subject.contains("unrelated"));
     }
 
     #[test]
@@ -425,6 +529,25 @@ mod tests {
         let r = analyze(r#"cd /a && git -C /b push origin main"#, ".", None);
         assert!(r.found_push);
         assert_eq!(r.push_dir, "/b");
+    }
+
+    #[test]
+    fn git_dash_c_relative_path_joins_cd_history() {
+        // #41: 相対 -C は resolve_effective_dir と同じ規則(直前の実効
+        // ディレクトリに連結)で解決する。以前は cd 履歴を無視して
+        // 素通しの "b" になっていた。
+        let r = analyze(r#"cd /a && git -C b push origin main"#, ".", None);
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "/a/b");
+    }
+
+    #[test]
+    fn git_dash_c_relative_path_without_cd_joins_start_dir() {
+        // #41: cd が無い場合も、相対 -C は呼び出しプロセスの --cwd(ここでは
+        // start_dir)からの相対として解決する(以前は "b" のまま素通しだった)。
+        let r = analyze(r#"git -C b push origin main"#, "/x", None);
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "/x/b");
     }
 
     // ---- HOME 展開(#39) ----------------------------------------------
