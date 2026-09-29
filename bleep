@@ -1391,6 +1391,59 @@ STUB
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#9+#14: cd の private 名 + --repo public/other): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
 
+  # #41: git -C <相対パス> push は cd 履歴に連結して解決すること。以前は
+  # cd を無視して呼び出しプロセス自身の cwd 基準の相対パスとして扱われ、
+  # 誤った(存在しない)ディレクトリに解決していた。repo_b は #14 の
+  # テストで denylist 文字列 "acme/secret-project" を含むコミットを push
+  # 済みなので、正しく repo_b を指せれば deny になる。
+  set +e
+  "$SELF" scan-bash-command "cd $(dirname "$repo_b") && git -C $(basename "$repo_b") push origin main" > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(#41: 相対 -C は cd 履歴に連結): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #23/#43: gh --repo/-R はサブコマンドの後ろにあっても検出する。対象が
+  # PRIVATE なら検査自体をスキップする(以前はここが検出漏れで denylist
+  # 全文照合にフォールバックし、無関係な body でも cwd 由来の誤判定を
+  # 起こし得た)。
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view") printf 'PRIVATE' ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  mkdir -p "$tmp/not-a-repo2"
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  (cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command 'gh pr create --repo acme/secret-project --title t --body "unrelated"') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#23/#43: サブコマンド後の --repo で PRIVATE 宛先を検出): 期待=0(pass、visibility skip) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #43(D2): 対象が PUBLIC なリポでも、明示された --repo/-R の宛先トークン
+  # 自体は scan_subject から除外されるため、宛先名が denylist の org 名に
+  # 前方一致していても(org/repo の PLAIN_PATTERNS)、body に無関係な内容
+  # しか無ければ pass する。visibility skip には入らない(PUBLIC)ため、
+  # scan_subject 除外そのものが効いていることを確認する。
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view") printf 'PUBLIC' ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  (cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command 'gh pr create --repo acme/secret-project --title t --body "unrelated"') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#43 D2: PUBLIC 宛先でも --repo トークン自体は照合対象外): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
+
   # 変数展開を含む cd は静的には解決できない。無言 pass にはせず、既存の
   # fail-loud 経路(push 差分計算の失敗 = default branch/merge-base が
   # ガラクタなパスでは解けない)を通って ask にエスカレートする。
