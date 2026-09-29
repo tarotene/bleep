@@ -775,13 +775,13 @@ cmd_scan_push() {
 # ディレクトリ解決)は $LEX_BIN(bleep-hook、D1)に委ねる。この
 # バイナリは純粋関数のみで I/O・gh を一切行わないため、判定不能を無言 pass
 # にしない fail-loud の格は落ちない — 起動自体に失敗したら ask にエスカレート
-# する(下記 lex_out の読み取り失敗を参照)。出力は5行の固定ヘッダ
-# (found_push/push_dir/found_gh/gh_repo_override/gh_effective_dir)+
-# scan_subject(jq 非依存を保つための独自の単純書式、bleep-hook
-# lex --help 参照)。照合対象(scan subject)は CMD 全文から `cd <単一
-# トークン>` セグメントだけを除いたもの(#9)。push/gh のどちらの形も
-# 見つからなければ無検査で pass(フォールスルー)。Claude/Codex/Copilot の
-# Bash 系 host が共通で呼ぶ、シェルコマンド用の唯一の判定入口。
+# する(下記 lex_out の読み取り失敗を参照)。出力は6行の固定ヘッダ
+# (found_push/push_dir/found_gh/gh_repo_override/gh_effective_dir/
+# unresolved_var)+ scan_subject(jq 非依存を保つための独自の単純書式、
+# bleep-hook lex --help 参照)。照合対象(scan subject)は CMD 全文から
+# `cd <単一トークン>` セグメントだけを除いたもの(#9)。push/gh のどちらの
+# 形も見つからなければ無検査で pass(フォールスルー)。Claude/Codex/Copilot
+# の Bash 系 host が共通で呼ぶ、シェルコマンド用の唯一の判定入口。
 cmd_scan_bash_command() {
   local cmd="${1-}"
   [[ -n $cmd ]] || { usage >&2; exit 2; }
@@ -791,15 +791,23 @@ cmd_scan_bash_command() {
     emit_verdict ask "コマンドの字句解析に失敗しました(bleep-hook が見つからないか実行できません)。" lex-failed
   fi
 
-  local found_push found_gh push_dir gh_repo_override gh_effective_dir scan_subject
+  local found_push found_gh push_dir gh_repo_override gh_effective_dir unresolved_var scan_subject
   {
     IFS= read -r found_push
     IFS= read -r push_dir
     IFS= read -r found_gh
     IFS= read -r gh_repo_override
     IFS= read -r gh_effective_dir
+    IFS= read -r unresolved_var
     scan_subject="$(cat)"
   } <<< "$lex_out"
+
+  # #34: cd/-C/--repo/-R の対象に未展開のシェル変数が残り、静的に解決
+  # できなかった場合は、denylist 照合にフォールバックせず即座に ask へ
+  # エスカレートする(値を推測で使わない — 検出して人間に委ねる設計)。
+  if [[ $unresolved_var == "1" ]]; then
+    emit_verdict ask "コマンド中の cd/-C/--repo/-R の対象にシェル変数(未展開の \$...)が含まれ、対象リポジトリを静的に解決できません。パスをリテラルで書き直してください。" unresolved-var
+  fi
 
   if [[ $found_gh == "1" ]]; then
     local gh_nwo="$gh_repo_override"
@@ -1530,14 +1538,33 @@ STUB
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#43 D2: PUBLIC 宛先でも --repo トークン自体は照合対象外): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
 
-  # 変数展開を含む cd は静的には解決できない。無言 pass にはせず、既存の
-  # fail-loud 経路(push 差分計算の失敗 = default branch/merge-base が
-  # ガラクタなパスでは解けない)を通って ask にエスカレートする。
+  # 変数展開を含む cd は静的には解決できない。無言 pass にはせず、lex が
+  # 検出した unresolved_var フラグにより denylist 照合の前で即座に ask に
+  # エスカレートする(#34。以前は push 差分計算の失敗(default branch/
+  # merge-base がガラクタなパスでは解けない)経由で偶然同じ rc になって
+  # いたが、それとは別の、より早い経路になった)。
   set +e
-  "$SELF" scan-bash-command 'cd "$D" && git push origin main' > /dev/null 2>&1
+  out="$("$SELF" scan-bash-command 'cd "$D" && git push origin main' 2>&1)"
   rc=$?
   set -e
-  [[ $rc -eq 1 ]] || { echo "FAIL(変数展開を含む cd は ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 1 && $out == *'シェル変数'* ]] || { echo "FAIL(変数展開を含む cd は ask、unresolved_var 経由): 期待=1(ask) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+
+  # #34 の再現そのもの: --repo が無く、cd "$D" だけに頼る gh セグメント。
+  # 以前は無言で denylist 全文照合にフォールバックし、cwd 由来の誤判定
+  # (fail-wrong)を起こし得た。
+  set +e
+  out="$("$SELF" scan-bash-command 'cd "$D" && gh pr create --title t --body b' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 1 && $out == *'シェル変数'* ]] || { echo "FAIL(#34: --repo 無しの cd \"\$D\" は ask): 期待=1(ask) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+
+  # #23 の修正後、--repo が明示されていれば cd 側の未解決変数は無関係
+  # (実際に使われるのは --repo のリテラル値)。pass する既存ケースの回帰。
+  set +e
+  "$SELF" scan-bash-command 'cd "$D" && gh pr create --repo public/other --title t --body b' > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#34+#23: --repo 明示があれば cd の未解決変数は無関係): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # gh の公開面網羅(段3): pr|issue create/edit/comment 以外にも
   # release create/edit・repo edit・gist create・api の書き込みメソッドが

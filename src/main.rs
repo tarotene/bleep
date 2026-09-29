@@ -15,10 +15,13 @@ usage: bleep-hook --host=<claude|codex|copilot>
                 を読み、BLEEP_BIN(既定 \"bleep\")を呼び出して
                 判定結果を host 固有の出力 JSON に翻訳する。
 lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
-                純粋な字句解析モード。I/O・gh は一切行わない。出力は5行の
+                純粋な字句解析モード。I/O・gh は一切行わない。出力は6行の
                 ヘッダ(found_push/push_dir/found_gh/gh_repo_override/
-                gh_effective_dir)に続けて scan_subject を書く固定書式(jq 非
-                依存 — 呼び出し側の bleep 本体を jq フリーに保つ)。
+                gh_effective_dir/unresolved_var)に続けて scan_subject を
+                書く固定書式(jq 非依存 — 呼び出し側の bleep 本体を jq
+                フリーに保つ)。unresolved_var=1 は、found_push/found_gh の
+                対象解決に使った値が未展開の $ 参照を含み静的に解決できな
+                かったことを示す(#34)。
 hash            bleep(Bash)本体の判定レッジャー(ledger_write)から呼ばれる。
                 FILE に保存された鍵(無ければ新規生成)で TERM を
                 HMAC-SHA256 し、hex を1行 stdout に印字する。
@@ -40,6 +43,7 @@ fn cmd_lex(cwd: &str, cmd: &str) {
     println!("{}", if r.found_gh { "1" } else { "0" });
     println!("{}", escape_line(&r.gh_repo_override));
     println!("{}", escape_line(&r.gh_effective_dir));
+    println!("{}", if r.unresolved_var { "1" } else { "0" });
     print!("{}", r.scan_subject); // 既に各セグメント末尾に \n が付いている
 }
 

@@ -350,6 +350,12 @@ pub struct AnalyzeResult {
     /// (Bash)がこのディレクトリを基準に resolve_repo_nwo(git remote 参照、
     /// I/O)を実行する。
     pub gh_effective_dir: String,
+    /// found_push/found_gh の対象を実際に解決するのに使った値(cd 追跡、
+    /// `-C`/`--repo`/`-R` の override)が、未展開の `$` 参照(閉集合外の
+    /// 変数)を含むために静的に解決できなかったかどうか(#34)。呼び出し側
+    /// はこの場合、値を無理に使わず ask にエスカレートする。found_push も
+    /// found_gh も立っていない(push/gh セグメントが無い)ときは常に false。
+    pub unresolved_var: bool,
 }
 
 /// gh セグメントの生テキストから `--repo`/`-R`(値を伴う2トークン形)と
@@ -383,9 +389,28 @@ fn strip_repo_override_tokens(seg: &str) -> String {
     shell_words::join(kept)
 }
 
+/// `segments[..upto]` の中で、`cd <単一トークン>` として実際に消費される
+/// (= resolve_effective_dir が読む)ターゲットのいずれかが、`expand_home`
+/// 適用後も未展開の `$` 参照(`~`/`$HOME`/`${HOME}` の閉集合外)を含むかを
+/// 返す(#34)。resolve_effective_dir 自身の絶対/相対分岐を変えず、同じ
+/// 対象を辿って `$` の有無だけを見る副関数として持つ(判断を運ばない継ぎ目
+/// — 実際の実効ディレクトリの計算は resolve_effective_dir の正本のまま)。
+fn cd_chain_has_unresolved_var(segments: &[String], upto: usize, home: Option<&str>) -> bool {
+    segments.iter().take(upto).any(|seg| {
+        as_single_cd_target(seg)
+            .map(|tgt| expand_home(tgt, home).contains('$'))
+            .unwrap_or(false)
+    })
+}
+
 pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult {
     let segments = split_command_segments(cmd);
     let mut result = AnalyzeResult::default();
+    // found_push/found_gh の対象を実際に解決するのに使った値が未展開の `$`
+    // 参照を含むかどうか(#34)。gh > push の優先順位(下記ループ後の
+    // 確定処理)は cmd_scan_bash_command(Bash 本体)の分岐順序と揃える。
+    let mut push_unresolved_var = false;
+    let mut gh_unresolved_var = false;
 
     for (i, seg) in segments.iter().enumerate() {
         let c = classify_segment(seg);
@@ -416,7 +441,10 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
                 // 別の継ぎ目で判断する)。
                 Some(d) => {
                     let expanded = expand_home(&d, home);
-                    if expanded.starts_with('/') || expanded.contains('$') {
+                    if expanded.contains('$') {
+                        push_unresolved_var = true;
+                        expanded
+                    } else if expanded.starts_with('/') {
                         expanded
                     } else {
                         format!(
@@ -426,19 +454,40 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
                         )
                     }
                 }
-                None => resolve_effective_dir(start_dir, &segments, i, home),
+                None => {
+                    push_unresolved_var = cd_chain_has_unresolved_var(&segments, i, home);
+                    resolve_effective_dir(start_dir, &segments, i, home)
+                }
             };
         }
         if c.kind_is_gh_publish && !result.found_gh {
             result.found_gh = true;
             match c.repo_override {
-                Some(r) => result.gh_repo_override = r,
+                Some(r) => {
+                    // gh の --repo/-R の値自体は cd/-C と異なりパスではない
+                    // ため expand_home は適用しない。未展開の `$` が残って
+                    // いれば、その値をそのまま静的な解決不能として扱う。
+                    gh_unresolved_var = r.contains('$');
+                    result.gh_repo_override = r;
+                }
                 None => {
+                    gh_unresolved_var = cd_chain_has_unresolved_var(&segments, i, home);
                     result.gh_effective_dir = resolve_effective_dir(start_dir, &segments, i, home);
                 }
             }
         }
     }
+
+    // gh > push の優先順位(cmd_scan_bash_command は found_gh を先に見て、
+    // 見つかれば push 側を一切参照しない)に合わせて、実際に使われる方の
+    // 未解決フラグだけを採用する。
+    result.unresolved_var = if result.found_gh {
+        gh_unresolved_var
+    } else if result.found_push {
+        push_unresolved_var
+    } else {
+        false
+    };
 
     result
 }
@@ -631,6 +680,65 @@ mod tests {
         let r = analyze("cd ~/repo && git push origin main", ".", None);
         assert!(r.found_push);
         assert_eq!(r.push_dir, "./~/repo");
+    }
+
+    // ---- 未展開のシェル変数参照の検出(#34) -----------------------------
+
+    #[test]
+    fn cd_with_shell_variable_sets_unresolved_var_for_gh() {
+        // --repo が無く、gh_effective_dir の解決が cd 履歴だけに頼る場合、
+        // cd の対象が未展開の $ を含めば unresolved_var が立つ。
+        let r = analyze(r#"cd "$D" && gh pr create --title t"#, ".", None);
+        assert!(r.found_gh);
+        assert!(r.unresolved_var);
+    }
+
+    #[test]
+    fn cd_with_shell_variable_sets_unresolved_var_for_push() {
+        let r = analyze(r#"cd "$D" && git push origin main"#, ".", None);
+        assert!(r.found_push);
+        assert!(r.unresolved_var);
+    }
+
+    #[test]
+    fn git_dash_c_with_shell_variable_sets_unresolved_var() {
+        let r = analyze(r#"git -C "$D" push origin main"#, ".", None);
+        assert!(r.found_push);
+        assert!(r.unresolved_var);
+    }
+
+    #[test]
+    fn gh_repo_with_shell_variable_sets_unresolved_var() {
+        let r = analyze(r#"gh --repo "$X" pr create --title t"#, ".", None);
+        assert!(r.found_gh);
+        assert!(r.unresolved_var);
+    }
+
+    #[test]
+    fn literal_only_commands_do_not_set_unresolved_var() {
+        let r = analyze(r#"cd /a && git -C b push origin main"#, ".", None);
+        assert!(r.found_push);
+        assert!(!r.unresolved_var);
+
+        let r = analyze(r#"gh pr create --repo acme/other --title t"#, ".", None);
+        assert!(r.found_gh);
+        assert!(!r.unresolved_var);
+    }
+
+    #[test]
+    fn explicit_repo_override_wins_over_unresolved_cd_for_gh() {
+        // #23 の修正後、--repo が明示されていれば gh_effective_dir(cd
+        // 追跡)は使われない。cd 側に未展開の $ が残っていても、実際に
+        // 使われるのは --repo のリテラル値なので unresolved_var は立たない
+        // (#34 の対象は「実際の解決に使った値」に限る)。
+        let r = analyze(
+            r#"cd "$D" && gh pr create --repo acme/other --title t"#,
+            ".",
+            None,
+        );
+        assert!(r.found_gh);
+        assert_eq!(r.gh_repo_override, "acme/other");
+        assert!(!r.unresolved_var);
     }
 
     #[test]
