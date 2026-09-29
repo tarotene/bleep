@@ -566,6 +566,17 @@ require_orgs_file() {
   if [[ -d $LEGACY_CONFIG_DIR ]]; then
     emit_verdict ask "bleep の設定が改名前の場所に残っています(${LEGACY_CONFIG_DIR} → ${CONFIG_DIR} への移行が未了)。org denylist が読まれていません。README の Upgrading 手順で移行してください。" legacy-config
   fi
+  # #42: home-manager 等の宣言的な設定生成が、対象ファイルを一時的に
+  # `<file>.backup` へ退避してから再生成する運用(dotfiles 側 ADR の
+  # 「wrapper flake 経由でない直接適用」事故と同型)だと、この退避直後の
+  # 数秒〜数分だけ orgs.txt が不在になる。`.backup` が隣にあれば、その
+  # 可能性が高いことと、エージェントが自分の判断で復元してはいけないこと
+  # (denylist の中身は人間が決める値であり、`.backup` の内容が正しいとも
+  # 限らない)を理由文に加える — 診断性のためだけで、bleep 自身が復元する
+  # わけではない。
+  if [[ -f "${ORGS_FILE}.backup" ]]; then
+    emit_verdict ask "bleep が未設定です(${ORGS_FILE} がありません)。隣に ${ORGS_FILE}.backup があるため、宣言的な設定生成(dotfiles 等の home-manager 管理)が対象ファイルを退避した直後である可能性が高いです。宣言の再適用で復元してください — .backup の中身が正しいとも限らないため、エージェントが自分の判断でそこから復元してはいけません。人間の判断を待ってください。" unconfigured
+  fi
   emit_verdict ask "bleep が未設定です(${ORGS_FILE} がありません)。org denylist が空のまま公開面を検査しています。この設定を宣言的に生成している場合(dotfiles 等の home-manager 管理)は、その適用を再実行してください。手で作る場合も、登録する org 名(または空ファイルによる明示的な opt-out)を決めるのは人間の判断です — エージェントが推測で作らないでください。" unconfigured
 }
 
@@ -1644,6 +1655,18 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 1 && $out9 == *'未設定'* ]] || { echo "FAIL(orgs.txt 不在の scan は ask(未設定)): rc=$rc out=$out9" >&2; fails=$((fails + 1)); }
+  [[ $out9 != *'.backup'* ]] || { echo "FAIL(.backup が無いのに理由文に触れている): out=$out9" >&2; fails=$((fails + 1)); }
+
+  # #42: 隣に <orgs.txt>.backup があれば、home-manager 等の宣言的設定
+  # 生成が退避した直後である可能性が高いことを理由文に加える(診断性の
+  # 向上のみ — bleep 自身は復元しない)。
+  : > "${missing_orgs}.backup"
+  set +e
+  out9="$(BLEEP_ORGS_FILE="$missing_orgs" "$SELF" scan <<< 'hello' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 1 && $out9 == *'.backup'* && $out9 == *'退避した直後'* ]] || { echo "FAIL(.backup 検知のヒントが理由文に無い): rc=$rc out=$out9" >&2; fails=$((fails + 1)); }
+  rm -f "${missing_orgs}.backup"
 
   mkdir -p "$tmp/legacy-config"
   set +e
