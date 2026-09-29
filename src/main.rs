@@ -33,7 +33,8 @@ fn escape_line(s: &str) -> String {
 }
 
 fn cmd_lex(cwd: &str, cmd: &str) {
-    let r = lex::analyze(cmd, cwd);
+    let home = env::var("HOME").ok();
+    let r = lex::analyze(cmd, cwd, home.as_deref());
     println!("{}", if r.found_push { "1" } else { "0" });
     println!("{}", escape_line(&r.push_dir));
     println!("{}", if r.found_gh { "1" } else { "0" });

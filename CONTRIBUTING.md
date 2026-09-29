@@ -55,9 +55,11 @@ information. Code, README, Issues/PRs, and commit messages must all satisfy:
 README's "This is not a security boundary" premise (Lampson 1973, Saltzer &
 Schroeder 1975, CWE-184). When adding new detection logic:
 
-- Never let an indeterminate verdict silently pass (fail-loud). Look at the
-  existing `PUSH_DIFF_FAIL_REASON` and the read-failure handling in
-  `cmd_scan`/`cmd_scan_push` for the pattern.
+- Never let an indeterminate verdict silently pass (fail-loud). Look at
+  `compute_push_diff_text` (which reports its failure reason on stdout, not a
+  global — a `text="$(fn)"` call site only sees stdout, not variables the
+  callee set) and the read-failure handling in `cmd_scan`/`cmd_scan_push` for
+  the pattern.
 - Never name the bypass mechanism (`BLEEP_ALLOW=1`) in a deny
   reason's text.
 - Never write a plaintext denylist term (or the command text, `cwd`, or the
