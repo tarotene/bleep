@@ -421,6 +421,70 @@ build_patterns() {
   filter_stopwords WORD_WARN
 }
 
+# ---- WORD_HARD/WORD_WARN の単語境界(#35) ----------------------------------
+#
+# grep -Fw は POSIX の単語構成文字([_[:alnum:]])以外を全て境界とみなす
+# ため、`.`/`-` も境界扱いになる。private リポ名が一般語1語(例: "gizmo")
+# のとき、無関係な公開リポの拡張子付きファイル名("gizmo.json")や複合語
+# ("app-gizmo")まで単語一致してしまい誤 deny/ask する(#35)。拡張子
+# (`.` + 英数字)と `-` を非境界にした ERE の境界クラスに置き換える —
+# gitleaks の denylist ルールも汎用 `\b` ではなく明示的な境界クラスで前後を
+# 書く同種の設計を採る(config/gitleaks.toml)。
+
+ere_escape() { # $1=生の文字列 -> ERE の特殊文字をエスケープしたもの
+  printf '%s' "$1" | sed \
+    -e 's/\\/\\\\/g' \
+    -e 's/\./\\./g' \
+    -e 's/\*/\\*/g' \
+    -e 's/\^/\\^/g' \
+    -e 's/\$/\\$/g' \
+    -e 's/+/\\+/g' \
+    -e 's/?/\\?/g' \
+    -e 's/(/\\(/g' \
+    -e 's/)/\\)/g' \
+    -e 's/{/\\{/g' \
+    -e 's/}/\\}/g' \
+    -e 's/|/\\|/g' \
+    -e 's/\[/\\[/g' \
+    -e 's/\]/\\]/g'
+}
+
+# word_boundary_pattern: $1=語(生) -> 1行の ERE パターン。行頭/非境界文字
+# のいずれかに続き、語の後ろは行末/非境界文字/「ドット+(行末または非英数字)」
+# のいずれかで終わる(拡張子として続く場合だけドットを境界として扱う —
+# 文末のドット(「〜gizmo.」のような文)は引き続き一致させる)。
+word_boundary_pattern() {
+  local esc
+  esc="$(ere_escape "$1")"
+  printf '(^|[^A-Za-z0-9_.-])%s($|[^A-Za-z0-9_.-]|\\.($|[^A-Za-z0-9]))' "$esc"
+}
+
+# word_boundary_pattern_file: $1=配列名 -> 各要素を1行のパターンに変換した
+# ものを stdout に印字する。grep -f に渡す複数行は独立した alternative として
+# OR 評価される(-F の複数パターンファイルと同じ使い方)。
+word_boundary_pattern_file() {
+  local -n arr_ref="$1"
+  local w
+  for w in "${arr_ref[@]}"; do
+    word_boundary_pattern "$w"
+    printf '\n'
+  done
+}
+
+# find_matched_word: $1=配列名 $2=text -> 配列中で実際に一致した最初の語を
+# 平文で stdout に印字する(MATCH_TERM 用)。grep -Eo で全体マッチ文字列を
+# 拾うと境界クラスの文字(先頭1文字・末尾最大2文字)が混入するため、既知の
+# 語彙を1件ずつ当て直して裸の語をそのまま採用する(還元 — 新しい抽出
+# ロジックを増やさず、既に持っている語のリストに戻す)。
+find_matched_word() {
+  local -n arr_ref="$1"
+  local text="$2" w
+  for w in "${arr_ref[@]}"; do
+    grep -Eq "$(word_boundary_pattern "$w")" <<< "$text" && { printf '%s' "$w"; return 0; }
+  done
+  return 1
+}
+
 # match_verdict: $1 の中身を denylist と突き合わせ、一致すれば 0 を返す。
 # 一致しなければ非 0 を返す(何も印字しない)。判定結果はグローバル変数
 # VERDICT(deny/ask)に、判定レッジャー用の付随情報は MATCH_CLASS/
@@ -444,16 +508,16 @@ match_verdict() {
     VERDICT='deny'
     return 0
   fi
-  if ((${#WORD_HARD[@]} > 0)) && grep -Fwqf <(printf '%s\n' "${WORD_HARD[@]}") <<< "$text"; then
+  if ((${#WORD_HARD[@]} > 0)) && grep -Eqf <(word_boundary_pattern_file WORD_HARD) <<< "$text"; then
     MATCH_CLASS='word-hard'
-    MATCH_TERM="$(grep -Fwof <(printf '%s\n' "${WORD_HARD[@]}") <<< "$text" | head -n1 || true)"
+    MATCH_TERM="$(find_matched_word WORD_HARD "$text" || true)"
     VERDICT='deny'
     return 0
   fi
-  if ((${#WORD_WARN[@]} > 0)) && grep -Fwqf <(printf '%s\n' "${WORD_WARN[@]}") <<< "$text"; then
+  if ((${#WORD_WARN[@]} > 0)) && grep -Eqf <(word_boundary_pattern_file WORD_WARN) <<< "$text"; then
     text_allow_suppressed "$text" && return 1
     MATCH_CLASS='word-warn'
-    MATCH_TERM="$(grep -Fwof <(printf '%s\n' "${WORD_WARN[@]}") <<< "$text" | head -n1 || true)"
+    MATCH_TERM="$(find_matched_word WORD_WARN "$text" || true)"
     VERDICT='ask'
     return 0
   fi
@@ -951,6 +1015,17 @@ acme で議論した"
   printf 'acme/widget\n' >> "$BLEEP_REPOS_FILE"
   expect_verdict pass "widget の話"
   : > "$BLEEP_ALLOW_STOPWORDS_FILE"
+  printf 'acme/secret-project\n' > "$BLEEP_REPOS_FILE"
+
+  # #35: 単語境界は拡張子(`.` + 英数字)と `-` を非境界とする。private
+  # リポ名が一般語1語(例: "gizmo")のとき、無関係な公開リポの拡張子
+  # 付きファイル名や複合語まで誤って単語一致しないこと。
+  printf 'acme/gizmo\n' >> "$BLEEP_REPOS_FILE"
+  expect_verdict pass "gizmo.json を更新した" # 拡張子は非境界
+  expect_verdict pass "app-gizmo の設定" # ハイフン複合語(前)は非境界
+  expect_verdict pass "gizmo-app の設定" # ハイフン複合語(後)は非境界
+  expect_verdict deny "see gizmo." # 文末のドットは引き続き一致
+  expect_verdict deny "gizmo の話" # 裸の単語一致は変わらず deny
   printf 'acme/secret-project\n' > "$BLEEP_REPOS_FILE"
 
   # allow-regexes: ask だけを無効化する(deny は緩めない)

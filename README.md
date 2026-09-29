@@ -113,6 +113,14 @@ What this does and does not cover:
   stopwords don't filter (intentional: `orgs.txt` encodes "definitely keep
   this secret," and a stopword shouldn't be able to fully undo that for a
   company/org repo).
+- `WORD_HARD`/`WORD_WARN` word-boundary matching treats a file extension
+  (a `.` immediately followed by an alphanumeric run) and a hyphen as
+  **non**-boundary characters, unlike a plain `grep -w` (#35). Without this,
+  a private repo name that happens to be a single common word (e.g.
+  `gizmo`) false-positives on any unrelated public repo's
+  `gizmo.json`/`app-gizmo`/`gizmo-app`. A `.` that ends a sentence
+  (not followed by an extension-like run) still counts as a boundary, so
+  `see gizmo.` still matches.
 - Precede the entry with a whole-line `#` comment recording *why* it's there
   and what to do if the decision reverses — a bare word in this file
   doesn't otherwise distinguish "known false-positive trigger" from "opted
