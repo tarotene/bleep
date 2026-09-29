@@ -122,16 +122,46 @@ fn as_single_cd_target(seg: &str) -> Option<&str> {
     }
 }
 
+/// `~`/`~/…`/`$HOME`/`$HOME/…`/`${HOME}`/`${HOME}/…` の先頭一致だけを、呼び
+/// 出し元(main.rs)が読んだ hook プロセス自身の `HOME` に展開する
+/// (#39)。閉じた集合以外(`~user`、`$HOMEBREW/…`、
+/// `${HOME_X}` 等)は展開しない — 変数一般の静的解決は依然しない設計を維持
+/// する(#34 とは別問題のまま切り分ける)。`home` が `None`(HOME 未設定)
+/// なら常に未加工で返す。
+fn expand_home(tok: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return tok.to_string();
+    };
+    for prefix in ["~", "$HOME", "${HOME}"] {
+        if tok == prefix {
+            return home.to_string();
+        }
+        if let Some(rest) = tok.strip_prefix(prefix) {
+            if rest.starts_with('/') {
+                return format!("{home}{rest}");
+            }
+        }
+    }
+    tok.to_string()
+}
+
 /// resolve_effective_dir の移植: `segments[..upto]` を先頭から歩き、厳密に
 /// `cd <単一トークン>` と一致するセグメントだけを反映した実効ディレクトリを
 /// 返す。絶対パスはそのまま、相対パスは直前の実効ディレクトリに連結する。
-/// `~` 展開や変数展開はしない(静的解析の範囲外)。
-pub fn resolve_effective_dir(start_dir: &str, segments: &[String], upto: usize) -> String {
+/// ターゲットには `expand_home` を通す(#39) — それ以外の変数展開はしない
+/// (静的解析の範囲外)。
+pub fn resolve_effective_dir(
+    start_dir: &str,
+    segments: &[String],
+    upto: usize,
+    home: Option<&str>,
+) -> String {
     let mut dir = start_dir.to_string();
     for seg in segments.iter().take(upto) {
         if let Some(tgt) = as_single_cd_target(seg) {
+            let tgt = expand_home(tgt, home);
             if tgt.starts_with('/') {
-                dir = tgt.to_string();
+                dir = tgt;
             } else {
                 dir = format!("{dir}/{tgt}");
             }
@@ -297,7 +327,7 @@ pub struct AnalyzeResult {
     pub gh_effective_dir: String,
 }
 
-pub fn analyze(cmd: &str, start_dir: &str) -> AnalyzeResult {
+pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult {
     let segments = split_command_segments(cmd);
 
     let mut scan_subject = String::new();
@@ -318,16 +348,20 @@ pub fn analyze(cmd: &str, start_dir: &str) -> AnalyzeResult {
         let c = classify_segment(seg);
         if c.kind_is_push && !result.found_push {
             result.found_push = true;
-            result.push_dir = c
-                .dir_override
-                .unwrap_or_else(|| resolve_effective_dir(start_dir, &segments, i));
+            result.push_dir = match c.dir_override {
+                // git -C <dir> の <dir> にも同じ展開を適用する(#39) —
+                // resolve_effective_dir を経由しない唯一の経路なので、
+                // ここで expand_home を直接通す。
+                Some(d) => expand_home(&d, home),
+                None => resolve_effective_dir(start_dir, &segments, i, home),
+            };
         }
         if c.kind_is_gh_publish && !result.found_gh {
             result.found_gh = true;
             match c.repo_override {
                 Some(r) => result.gh_repo_override = r,
                 None => {
-                    result.gh_effective_dir = resolve_effective_dir(start_dir, &segments, i);
+                    result.gh_effective_dir = resolve_effective_dir(start_dir, &segments, i, home);
                 }
             }
         }
@@ -367,22 +401,113 @@ mod tests {
 
     #[test]
     fn cd_segment_excluded_from_scan_subject() {
-        let r = analyze(r#"cd /x/secret-repo-work && gh pr create --title t"#, ".");
+        let r = analyze(
+            r#"cd /x/secret-repo-work && gh pr create --title t"#,
+            ".",
+            None,
+        );
         assert!(!r.scan_subject.contains("secret-repo-work"));
     }
 
     #[test]
     fn multiple_cd_accumulate_in_order() {
-        let r = analyze(r#"cd /a && cd b && gh pr create --title t --body "x""#, ".");
+        let r = analyze(
+            r#"cd /a && cd b && gh pr create --title t --body "x""#,
+            ".",
+            None,
+        );
         assert!(r.found_gh);
         assert_eq!(r.gh_effective_dir, "/a/b");
     }
 
     #[test]
     fn git_dash_c_overrides_cd_history() {
-        let r = analyze(r#"cd /a && git -C /b push origin main"#, ".");
+        let r = analyze(r#"cd /a && git -C /b push origin main"#, ".", None);
         assert!(r.found_push);
         assert_eq!(r.push_dir, "/b");
+    }
+
+    // ---- HOME 展開(#39) ----------------------------------------------
+
+    #[test]
+    fn cd_tilde_slash_expands_to_home() {
+        let r = analyze("cd ~/repo && git push origin main", ".", Some("/home/x"));
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "/home/x/repo");
+    }
+
+    #[test]
+    fn cd_bare_tilde_expands_to_home() {
+        let r = analyze("cd ~ && git push origin main", ".", Some("/home/x"));
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "/home/x");
+    }
+
+    #[test]
+    fn cd_dollar_home_expands() {
+        let r = analyze(
+            "cd $HOME/repo && git push origin main",
+            ".",
+            Some("/home/x"),
+        );
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "/home/x/repo");
+    }
+
+    #[test]
+    fn git_dash_c_tilde_expands() {
+        let r = analyze("git -C ~/repo push origin main", ".", Some("/home/x"));
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "/home/x/repo");
+    }
+
+    #[test]
+    fn git_dash_c_quoted_dollar_home_brace_expands() {
+        // -C の値は shell_words 経由(classify_segment)なのでクォートが
+        // 外れた後の "${HOME}/repo" に対して expand_home が働く。
+        let r = analyze(
+            r#"git -C "${HOME}/repo" push origin main"#,
+            ".",
+            Some("/home/x"),
+        );
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "/home/x/repo");
+    }
+
+    #[test]
+    fn tilde_user_form_is_not_expanded() {
+        // ~user は passwd 引きが要る形で、閉集合の対象外(還元性、#39 とは
+        // 切り分ける)。展開されず素通しのまま resolve_effective_dir に渡る。
+        let r = analyze("cd ~someone && git push origin main", ".", Some("/home/x"));
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "./~someone");
+    }
+
+    #[test]
+    fn dollar_home_prefixed_other_var_is_not_expanded() {
+        // $HOMEBREW は $HOME の前方一致だけでは弾けない罠 — 次の文字が '/'
+        // でも文字列末でもないので展開しない。
+        let r = analyze("git -C $HOMEBREW/x push origin main", ".", Some("/home/x"));
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "$HOMEBREW/x");
+    }
+
+    #[test]
+    fn braced_home_with_suffix_is_not_expanded() {
+        let r = analyze(
+            "cd ${HOME_X}/y && git push origin main",
+            ".",
+            Some("/home/x"),
+        );
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "./${HOME_X}/y");
+    }
+
+    #[test]
+    fn home_none_leaves_tilde_unexpanded() {
+        let r = analyze("cd ~/repo && git push origin main", ".", None);
+        assert!(r.found_push);
+        assert_eq!(r.push_dir, "./~/repo");
     }
 
     #[test]

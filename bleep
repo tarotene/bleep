@@ -526,22 +526,32 @@ resolve_default_branch() {
 # compute_push_diff_text: これから push する範囲の「追加行」+ 新規/rename 先
 # ファイルパス + コミットメッセージを連結して出力する(#7 — 削除行は既公開
 # 内容の除去であり新規公開ではないため検査対象外)。default branch /
-# merge-base が解決できない場合は非 0 を返し、PUSH_DIFF_FAIL_REASON に理由を
-# セットする(fail-loud — 呼び出し側はこれを ask にエスカレートする。無言の
-# pass にはしない)。
-PUSH_DIFF_FAIL_REASON=''
+# merge-base が解決できない場合は非 0 を返し、理由文を stdout に1行書く
+# (fail-loud — 呼び出し側はこれを ask にエスカレートする。無言の pass には
+# しない)。以前は理由文をグローバル変数 PUSH_DIFF_FAIL_REASON に積んでいたが、
+# 呼び出し側が常に `text="$(compute_push_diff_text)"` の形(コマンド置換 =
+# サブシェル)で呼ぶため、その代入はサブシェル内で消え、呼び出し元には一切
+# 伝わっていなかった(#39 の調査中に発見。以前の理由文が常に空だった実際の
+# 原因)。コマンド置換は stdout だけを親シェルに持ち帰るため、理由文も stdout
+# に乗せる形に直した。
 compute_push_diff_text() {
-  PUSH_DIFF_FAIL_REASON=''
   local dir="${TARGET_CWD:-.}"
+  # dir が存在しなければ、この時点で切り分け可能な理由を出す(#39 —
+  # 以前は merge-base 失敗の理由文に埋もれ、tilde 未展開等による無効な
+  # --cwd/push_dir を利用者が特定できなかった)。
+  if [[ ! -d $dir ]]; then
+    printf 'push 対象ディレクトリが存在しません: %s\n' "$dir"
+    return 1
+  fi
   local default_branch base
   default_branch="$(resolve_default_branch)"
   if [[ -z $default_branch ]]; then
-    PUSH_DIFF_FAIL_REASON='default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。'
+    printf '%s\n' 'default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。'
     return 1
   fi
   base="$(git -C "$dir" merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
   if [[ -z $base ]]; then
-    PUSH_DIFF_FAIL_REASON="origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性、または --cwd の解決失敗)。"
+    printf 'origin/%s との merge-base を解決できませんでした(未 fetch の可能性)。\n' "$default_branch"
     return 1
   fi
 
@@ -650,7 +660,7 @@ cmd_scan_push() {
 
   local text
   if ! text="$(compute_push_diff_text)"; then
-    emit_verdict ask "push 差分を検査できませんでした: ${PUSH_DIFF_FAIL_REASON}" push-diff-failed
+    emit_verdict ask "push 差分を検査できませんでした: ${text}" push-diff-failed
   fi
   require_orgs_file
   build_patterns
@@ -1211,13 +1221,44 @@ acme で議論した"
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(--cwd gh pr create ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
 
-  # --cwd の解決失敗は push 差分の fail-loud 経路(merge-base 解決失敗)を通って
-  # ask にエスカレートする — 無言 pass にはしない。
+  # --cwd の解決失敗は push 差分の fail-loud 経路(dir 存在チェック、#39)を
+  # 通って ask にエスカレートする — 無言 pass にはしない。理由文に解決後の
+  # パスが出ること(原因切り分けの回帰)も確認する。
   set +e
-  "$SELF" --cwd "$tmp/does-not-exist" scan-bash-command 'git push origin main' > /dev/null 2>&1
+  out="$("$SELF" --cwd "$tmp/does-not-exist" scan-bash-command 'git push origin main' 2>&1)"
   rc=$?
   set -e
-  [[ $rc -eq 1 ]] || { echo "FAIL(--cwd 解決不能): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 1 ]] || { echo "FAIL(--cwd 解決不能): 期待=1(ask) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  case "$out" in
+    *"$tmp/does-not-exist"*) ;;
+    *) echo "FAIL(--cwd 解決不能 理由文): 解決後パスが出ていない: $out" >&2; fails=$((fails + 1)) ;;
+  esac
+
+  # tilde 展開の end-to-end 回帰(#39): $repo と同じ構成のリポジトリを HOME
+  # 配下に置き、`cd ~/repo && git push` 形式で deny(denylist 一致)になる
+  # ことを確認する — bleep-hook lex の HOME 展開が実際に効いている証跡。
+  local home_tmp="$tmp/home-tilde" repo_tilde="$tmp/home-tilde/repo"
+  mkdir -p "$repo_tilde"
+  git -C "$repo_tilde" init -qb main
+  git -C "$repo_tilde" config core.hooksPath /dev/null
+  git -C "$repo_tilde" config user.email test@example.invalid
+  git -C "$repo_tilde" config user.name test
+  git -C "$repo_tilde" config commit.gpgsign false
+  echo "clean content" > "$repo_tilde/a.txt"
+  git -C "$repo_tilde" add a.txt
+  git -C "$repo_tilde" commit -qm initial
+  git init -q --bare "$tmp/remote-tilde.git"
+  git -C "$repo_tilde" remote add origin "$tmp/remote-tilde.git"
+  git -C "$repo_tilde" push -q origin main
+  git -C "$repo_tilde" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  echo "acme/secret-project が話題" >> "$repo_tilde/a.txt"
+  git -C "$repo_tilde" add a.txt
+  git -C "$repo_tilde" commit -qm "mentions acme/secret-project"
+  set +e
+  out="$(HOME="$home_tmp" "$SELF" scan-bash-command 'cd ~/repo && git push origin main' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(tilde 展開 e2e): 期待=2(deny) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   # BLEEP_ALLOW=1 は --cwd を剥がした後の "$1"(サブコマンド名)を見る
   # ため、--cwd 付きでも bypass が効くこと(dispatch 前段の並び順の回帰)。
