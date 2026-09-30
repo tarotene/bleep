@@ -433,6 +433,31 @@ for the record shape.
   `BLEEP_NO_LEDGER=1`. A write failure never affects the verdict itself
   (fail-open).
 
+**Diagnosing a repeated denial: `bleep explain TERM_HASH`** (#44). Because
+the ledger only ever stores an HMAC of the matched term, an agent that keeps
+getting denied by the same judgment has no way to identify — even by
+brute-forcing every word in its own diff — which denylist entry actually
+matched; the false-positive reports filed against this tool as a result
+could never name the offending word. Run this **on your own terminal**,
+never inside an agent session, since it prints denylist entries (org/repo
+names) in plaintext:
+
+```
+$ jq -r 'select(.match_class != "none") | .term_hash' \
+    ~/.local/state/agent-verdicts/bleep.jsonl | tail -1
+4fe91aa1f4f5089de7f37664256681d75908f013dde5bec9cb43cc0e67b0837f
+$ bleep explain 4fe91aa1f4f5089de7f37664256681d75908f013dde5bec9cb43cc0e67b0837f
+word-hard	gizmo
+```
+
+This rehashes every current denylist entry with the same machine-local key
+and prints whichever one matches, alongside its `match_class`. It does not
+touch `match_verdict` and writes nothing to the ledger — it is purely a
+read of the current denylist, not a re-run of any verdict. **The deny/ask
+reason text never mentions this subcommand**, for the same reason it never
+mentions `BLEEP_ALLOW` (see above): the constrained party should not be
+able to read its own way out of a false positive.
+
 ## Development
 
 - `cargo build` (builds `target/debug/bleep-hook`, which the Bash

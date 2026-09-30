@@ -144,7 +144,7 @@ usage() {
   cat <<'EOF'
 usage: bleep [--cwd DIR] <scan [FILE]|scan-push|scan-bash-command CMD|
                        audit [path...] [--remote] [--since REV]|
-                       refresh-cache|selftest>
+                       explain TERM_HASH|refresh-cache|selftest>
 
 エージェント非依存の denylist 判定エンジン。scan/scan-push/scan-bash-command
 は exit code で判定を返す: 0=pass, 1=ask(理由を stdout に1行), 2=deny(同)。
@@ -162,6 +162,14 @@ BLEEP_ALLOW=1 で3つの scan* サブコマンドを意識的に bypass でき�
 設定は $XDG_CONFIG_HOME/bleep/ 以下、一切コミットしない:
   orgs.txt / repos.txt / allow-stopwords.txt / allow-regexes.txt / allow-paths.txt
 orgs.txt が存在しなければ scan* は ask を返す(空ファイルは明示的な opt-out)。
+
+explain TERM_HASH: 判定レッジャー(agent-verdicts/bleep.jsonl)の term_hash
+  1件から、現在の denylist のどの語がそれに一致するかを人間の端末で復元する
+  (#44)。denylist の各語を(bleep-hook hash が使う同じ鍵で)ハッシュし直し、
+  一致した語を match_class と共に平文で印字する。判定は変えない(scan* の
+  exit code とは無関係)。レッジャーへの追記は行わない。org 名/private repo
+  名を平文で印字するため、あなた自身の端末以外(agent が読む Bash 出力など)
+  では実行しないこと。
 EOF
 }
 
@@ -721,6 +729,54 @@ cmd_scan() {
   exit 0
 }
 
+# explain_scan_array: $1=match_class $2=配列名 $3=探す term_hash -> 配列の
+# 各語を term_hash() で再ハッシュし、一致した語があれば
+# "<match_class>\t<平文>" を1行印字して 0 を返す(見つからなければ非 0、
+# 何も印字しない)。cmd_explain から PLAIN_PATTERNS/WORD_HARD/WORD_WARN の
+# 3系列に対して呼ぶ小さな純粋ヘルパー(既存の find_matched_word と同じ
+# 「既知の語彙を1件ずつ当て直す」還元)。
+explain_scan_array() {
+  local -n arr_ref="$2"
+  local target="$3" w h
+  for w in "${arr_ref[@]}"; do
+    h="$(term_hash "$w")"
+    if [[ -n $h && $h == "$target" ]]; then
+      printf '%s\t%s\n' "$1" "$w"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# cmd_explain: $1=term_hash(hex64) -> 現在の denylist の各語を term_hash()
+# で同じ鍵で再ハッシュし、一致した語を match_class と共に平文で stdout に
+# 印字する(#44 — レッジャーは HMAC のみ保持し、どの語が deny/ask を
+# 引いたか事後に人間が特定する手段が無かった)。判定エンジン(match_verdict)
+# には一切触れない — 診断専用で scan* の判定結果に影響しない。orgs.txt
+# 不在でも動く(require_orgs_file を呼ばない。診断コマンドで ask を返す
+# 意味がないため)。レッジャーへの書き込みも行わない(ledger_write を
+# 呼ばない — 診断行為自体を判定として記録しない)。
+cmd_explain() {
+  local target="${1-}"
+  if [[ -z $target ]] || [[ ! $target =~ ^[0-9a-f]{64}$ ]]; then
+    printf '使い方: bleep explain TERM_HASH(agent-verdicts/bleep.jsonl の term_hash、hex64)\n' >&2
+    return 2
+  fi
+  [[ -f $ORGS_FILE ]] || printf '注意: %s が存在しません。org 由来の denylist は空のまま照合します。\n' "$ORGS_FILE" >&2
+  build_patterns
+
+  local found=0
+  explain_scan_array plain PLAIN_PATTERNS "$target" && found=1
+  explain_scan_array word-hard WORD_HARD "$target" && found=1
+  explain_scan_array word-warn WORD_WARN "$target" && found=1
+
+  if [[ $found -eq 0 ]]; then
+    printf '現在の denylist に一致なし(cache/allow-stopwords が判定時と変わった可能性があります)。\n' >&2
+    return 1
+  fi
+  return 0
+}
+
 # cmd_scan_push: cwd の git リポジトリで、これから push する差分を検査する。
 # 対象リポジトリが PRIVATE/INTERNAL と判明していれば検査自体をスキップする
 # (これは「検査しない」という正当な判定であり、fail-loud の対象ではない)。
@@ -1001,6 +1057,30 @@ STUB
   # pass: 無関係
   expect_verdict pass "これは無関係な文章です"
   expect_verdict pass "academia という単語だけの文章"
+
+  # explain(#44): レッジャーの term_hash から現在の denylist の一致語を
+  # 平文で復元できること。判定エンジン(match_verdict)には触れないので
+  # build_patterns の呼び直しだけで検証できる。
+  local explain_out explain_hash
+  explain_hash="$(term_hash secret-project)"
+  explain_out="$(cmd_explain "$explain_hash")"
+  [[ $explain_out == $'word-hard\tsecret-project' ]] || {
+    echo "FAIL(explain: word-hard 一致): out=[$explain_out]" >&2
+    fails=$((fails + 1))
+  }
+  explain_out="$(cmd_explain "$(term_hash acme)")"
+  [[ $explain_out == $'word-warn\tacme' ]] || {
+    echo "FAIL(explain: word-warn 一致): out=[$explain_out]" >&2
+    fails=$((fails + 1))
+  }
+  if cmd_explain "$(term_hash no-such-term-xyz)" > /dev/null 2>&1; then
+    echo "FAIL(explain: 未知の hash は非 0 を返すべき)" >&2
+    fails=$((fails + 1))
+  fi
+  if cmd_explain 'not-a-hash' > /dev/null 2>&1; then
+    echo "FAIL(explain: hex64 でない引数は非 0 を返すべき)" >&2
+    fails=$((fails + 1))
+  fi
 
   # 改行直後の単語境界(adapter が tool_input を丸ごと文字列化するときの
   # 回帰 — 実改行であれば単語境界は正しく機能する。adapter 側のテスト
@@ -1774,6 +1854,10 @@ case "${1-}" in
   audit)
     shift
     audit "$@"
+    ;;
+  explain)
+    shift
+    cmd_explain "$@"
     ;;
   refresh-cache)
     refresh_private_repo_cache && printf 'private-repos-cache.txt を更新しました。\n' || printf 'キャッシュ更新に失敗しました(gh の認証状態を確認してください)。\n' >&2
