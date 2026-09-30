@@ -6,18 +6,29 @@ mod lex;
 use std::env;
 use std::process::ExitCode;
 
+/// `lex` の出力形式の版。出力形式を変えたら上げる。bleep(Bash)本体の
+/// `LEX_PROTOCOL` と一致しなければ、本体は ask にする(古いバイナリと新しい
+/// 本体、またはその逆の組み合わせが、行のずれで黙って誤判定するのを防ぐ、
+/// docs/adr/0002-gh-intent-and-layers.md)。版 1 = 6 行ヘッダのみ、
+/// 版 2 = 先頭に `#lex <版>` 行、push_spec・本文の入力元(#54/#55)を追加。
+const LEX_PROTOCOL: u32 = 2;
+
 fn usage() -> String {
     "\
 usage: bleep-hook --host=<claude|codex|copilot>
        bleep-hook lex [--cwd DIR] -- CMD
        bleep-hook intent [--cwd DIR] -- CMD
+       bleep-hook --protocol
        bleep-hook hash --key-file FILE -- TERM
 
 --host=<name>   PreToolUse hook adapter モード。stdin から host 固有の JSON
                 を読み、BLEEP_BIN(既定 \"bleep\")を呼び出して
                 判定結果を host 固有の出力 JSON に翻訳する。
+--protocol      lex の出力形式の版(整数)を1行印字する。`bleep doctor` が
+                bash 本体との整合の検査に使う。
 lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
-                純粋な字句解析モード。I/O・gh は一切行わない。出力は6行の
+                純粋な字句解析モード。I/O・gh は一切行わない。出力は
+                先頭の `#lex <版>` 行(--protocol と同じ版)に続けて、6行の
                 ヘッダ(found_push/push_dir/found_gh/gh_repo_override/
                 gh_effective_dir/unresolved_var)、push_spec(`git push` の
                 「<remote> <src>…」。静的に決められなければ空、#54)、
@@ -82,6 +93,7 @@ fn parse_cwd_and_cmd(name: &str, args: &[String]) -> Result<(String, String), Ex
 fn cmd_lex(cwd: &str, cmd: &str) {
     let home = env::var("HOME").ok();
     let r = lex::analyze(cmd, cwd, home.as_deref());
+    println!("#lex {LEX_PROTOCOL}");
     println!("{}", if r.found_push { "1" } else { "0" });
     println!("{}", escape_line(&r.push_dir));
     println!("{}", if r.found_gh { "1" } else { "0" });
@@ -168,6 +180,10 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             return ExitCode::from(hash::run(key_file, term) as u8);
+        }
+        if first == "--protocol" {
+            println!("{LEX_PROTOCOL}");
+            return ExitCode::SUCCESS;
         }
         if first == "--help" || first == "-h" {
             print!("{}", usage());

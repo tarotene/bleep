@@ -481,6 +481,16 @@ reason text never mentions this subcommand**, for the same reason it never
 mentions `BLEEP_ALLOW` (see above): the constrained party should not be
 able to read its own way out of a false positive.
 
+## Checking your install
+
+`bleep doctor` prints `ok:` / `NG:` lines and exits 1 on any `NG`. It checks that
+`bleep-hook` runs, that its lex output version matches the `bleep` script (a
+mismatched pair would otherwise misread each other's output; `scan-bash-command`
+also asks in that case, with reason id `lex-protocol-mismatch`), and that
+`hooks/hooks.json` matches both `Bash` and `mcp__` tools (`BLEEP_HOOKS_JSON`
+points it at another file). Design notes:
+[docs/adr/0002-gh-intent-and-layers.md](docs/adr/0002-gh-intent-and-layers.md).
+
 ## Development
 
 - `cargo build` (builds `target/debug/bleep-hook`, which the Bash

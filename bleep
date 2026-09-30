@@ -103,6 +103,10 @@ set -euo pipefail
 # 側の集約は tool_version を fingerprint に使わない)。
 BLEEP_VERSION='0.2.0'
 
+# bleep-hook lex の出力形式の版(src/main.rs の LEX_PROTOCOL と揃える)。
+# 出力の先頭行 `#lex <版>` と一致しなければ ask にする(bleep doctor でも検査)。
+LEX_PROTOCOL=2
+
 SELF="$(realpath "$0")"
 TEST_TMP=''
 TARGET_CWD='' # --cwd で明示された対象ディレクトリ(#10/#14 対応)。空なら "." 扱い。
@@ -151,7 +155,7 @@ usage() {
   cat <<'EOF'
 usage: bleep [--cwd DIR] <scan [FILE]|scan-push|scan-bash-command CMD|
                        audit [path...] [--remote] [--since REV]|
-                       explain TERM_HASH|refresh-cache|selftest>
+                       explain TERM_HASH|refresh-cache|doctor|selftest>
 
 エージェント非依存の denylist 判定エンジン。scan/scan-push/scan-bash-command
 は exit code で判定を返す: 0=pass, 1=ask(理由を stdout に1行), 2=deny(同)。
@@ -169,6 +173,10 @@ BLEEP_ALLOW=1 で3つの scan* サブコマンドを意識的に bypass でき�
 設定は $XDG_CONFIG_HOME/bleep/ 以下、一切コミットしない:
   orgs.txt / repos.txt / allow-stopwords.txt / allow-regexes.txt / allow-paths.txt
 orgs.txt が存在しなければ scan* は ask を返す(空ファイルは明示的な opt-out)。
+
+doctor: 導入の健全性を検査する。hooks/hooks.json の matcher が Bash と mcp__
+  を覆っているか、bleep-hook を実行できるか、bash 本体と bleep-hook の lex
+  出力形式の版が一致しているかを ok/NG で印字し、NG があれば exit 1。
 
 explain TERM_HASH: 判定レッジャー(agent-verdicts/bleep.jsonl)の term_hash
   1件から、現在の denylist のどの語がそれに一致するかを人間の端末で復元する
@@ -1003,9 +1011,13 @@ cmd_scan_bash_command() {
   fi
 
   local found_push found_gh push_dir gh_repo_override gh_effective_dir unresolved_var scan_subject
-  local push_spec body_unresolved body_n body_path i
+  local lex_header push_spec body_unresolved body_n body_path i
   local -a body_paths=()
   {
+    IFS= read -r lex_header
+    if [[ $lex_header != "#lex ${LEX_PROTOCOL}" ]]; then
+      emit_verdict ask "bleep-hook の lex 出力形式(${lex_header:-空})が bleep 本体(#lex ${LEX_PROTOCOL})と一致しません。bleep と bleep-hook を同じ版に揃えてください(bleep doctor で確認できます)。" lex-protocol-mismatch
+    fi
     IFS= read -r found_push
     IFS= read -r push_dir
     IFS= read -r found_gh
@@ -2165,11 +2177,87 @@ STUB
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(orgs.txt 不在の gh issue create は ask): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
 
+  # bleep doctor / lex protocol(#56 提案3)。正常系は実バイナリ、異常系は
+  # 版の違うスタブ bleep-hook と matcher の欠けた hooks.json で確かめる。
+  set +e
+  "$SELF" doctor > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(doctor 正常系): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  printf '#!/usr/bin/env bash\n[[ "$1" == --protocol ]] && echo 1\n' > "$tmp/fake-lex"
+  chmod +x "$tmp/fake-lex"
+  set +e
+  BLEEP_LEX_BIN="$tmp/fake-lex" "$SELF" doctor > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(doctor: protocol 不一致は NG): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  set +e
+  BLEEP_LEX_BIN="$tmp/does-not-exist" "$SELF" doctor > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(doctor: bleep-hook 不在は NG): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  printf '{"PreToolUse":[{"matcher":"Read","hooks":[]}]}\n' > "$tmp/hooks-bad.json"
+  set +e
+  BLEEP_HOOKS_JSON="$tmp/hooks-bad.json" "$SELF" doctor > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(doctor: matcher 欠落は NG): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # 旧形式(先頭に #lex 行が無い)を出すバイナリと組み合わせたら、行のずれで
+  # 黙って誤判定せず ask にする。
+  printf '#!/usr/bin/env bash\nprintf "0\\n\\n0\\n\\n\\n0\\nx\\n"\n' > "$tmp/old-lex"
+  chmod +x "$tmp/old-lex"
+  set +e
+  out="$(BLEEP_LEX_BIN="$tmp/old-lex" "$SELF" scan-bash-command 'gh issue create --title t --body b' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 1 && $out == *"#lex"* ]] || { echo "FAIL(旧形式の lex 出力は ask): 期待=1(#lex を含む理由) 実際=$rc / $out" >&2; fails=$((fails + 1)); }
+
   if [[ $fails -gt 0 ]]; then
     echo "selftest: ${fails} 件失敗" >&2
     exit 1
   fi
   echo "selftest: OK"
+}
+
+# cmd_doctor: 導入の健全性の最小検査(#56 提案3、docs/adr/0002-gh-intent-and-layers.md)。
+# 合成した denylist で実コマンドに canary を通す検査は後続。
+cmd_doctor() {
+  local fail=0 proto hj
+  doctor_ok() { printf 'ok: %s\n' "$1"; }
+  doctor_ng() { printf 'NG: %s\n' "$1"; fail=1; }
+
+  if proto="$("$LEX_BIN" --protocol 2>/dev/null)"; then
+    doctor_ok "bleep-hook を実行できる (${LEX_BIN})"
+    if [[ $proto == "$LEX_PROTOCOL" ]]; then
+      doctor_ok "lex 出力形式の版が一致している (${proto})"
+    else
+      doctor_ng "lex 出力形式の版が一致しない: bleep 本体=${LEX_PROTOCOL} bleep-hook=${proto:-空}(同じ版に揃えてください)"
+    fi
+  else
+    doctor_ng "bleep-hook を実行できない (${LEX_BIN})。PATH か BLEEP_LEX_BIN を確認してください"
+  fi
+
+  hj="${BLEEP_HOOKS_JSON:-$(dirname "$SELF")/hooks/hooks.json}"
+  if [[ -f $hj ]]; then
+    if grep -Eq '"matcher"[[:space:]]*:[[:space:]]*"[^"]*Bash' "$hj"; then
+      doctor_ok "hooks.json の matcher が Bash を覆っている (${hj})"
+    else
+      doctor_ng "hooks.json の matcher が Bash を覆っていない (${hj})"
+    fi
+    if grep -Eq '"matcher"[[:space:]]*:[[:space:]]*"[^"]*mcp__' "$hj"; then
+      doctor_ok "hooks.json の matcher が MCP (mcp__) を覆っている"
+    else
+      doctor_ng "hooks.json の matcher が MCP (mcp__) を覆っていない (${hj})"
+    fi
+  else
+    printf 'skip: hooks.json が見つからない (%s)。hook の登録は検査していません(BLEEP_HOOKS_JSON で指定できます)\n' "$hj"
+  fi
+
+  [[ $fail -eq 0 ]] || exit 1
 }
 
 # ---- --cwd グローバルオプション --------------------------------------------
@@ -2214,6 +2302,7 @@ case "${1-}" in
     shift
     cmd_explain "$@"
     ;;
+  doctor) cmd_doctor ;;
   refresh-cache)
     refresh_private_repo_cache && printf 'private-repos-cache.txt を更新しました。\n' || printf 'キャッシュ更新に失敗しました(gh の認証状態を確認してください)。\n' >&2
     ;;

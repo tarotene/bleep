@@ -94,8 +94,13 @@
 - `tests/intent_test.rs` — fixture を実バイナリに通すテスト(CI の
   `cargo test` で実行される)
 
-提案3(`bleep doctor`)の執行点(`bleep` の `doctor` サブコマンド、
-`bleep-hook --protocol`)は、この ADR の続きの段で追記する。
+提案3(`bleep doctor` の最小版)の執行点:
+
+- `bleep` — `doctor` サブコマンド(`cmd_doctor`)と、`cmd_scan_bash_command` の
+  lex protocol 検査(`lex-protocol-mismatch`)、selftest のケース
+- `src/main.rs` — `--protocol` と、`lex` 出力の先頭行 `#lex <版>`
+- `tests/lex_protocol_test.rs` — 版の期待値と、bash 本体の `LEX_PROTOCOL` との
+  一致を検査するテスト
 
 ## Consequences
 
