@@ -188,6 +188,58 @@ pub struct SegClassification {
     /// 静的に内容を解決できない(#55)。ヒアドキュメント(`<<`)を含む場合は
     /// 本文がコマンド文字列に含まれるので対象外。
     pub body_dynamic: bool,
+    /// `git push` の実際の push 範囲を求めるための「<remote> <src>…」
+    /// (空白区切り、ref 名に空白は使えない)。--all/--mirror/--delete・
+    /// URL の remote・未展開の変数を含む refspec など静的に決められない
+    /// ものは空(呼び出し側は default branch 基準の従来経路に戻る、#54)。
+    pub push_spec: String,
+}
+
+/// `git push [opts] [<remote> [<refspec>…]]` の引数(`push` の後ろ)から
+/// push_spec を作る(#54)。refspec 省略時は HEAD(push.default の現在の
+/// ブランチ)。
+fn parse_push_spec(args: &[String]) -> String {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut j = 0usize;
+    while j < args.len() {
+        let a = args[j].as_str();
+        match a {
+            "--all" | "--mirror" | "--delete" | "-d" => return String::new(),
+            "-o" | "--push-option" | "--receive-pack" | "--exec" | "--repo" => j += 2,
+            s if s.starts_with('-') => j += 1,
+            s => {
+                positional.push(s);
+                j += 1;
+            }
+        }
+    }
+    let remote = positional.first().copied().unwrap_or("origin");
+    if remote.is_empty()
+        || !remote
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return String::new();
+    }
+    let mut srcs: Vec<&str> = Vec::new();
+    for spec in positional.iter().skip(1) {
+        let spec = spec.strip_prefix('+').unwrap_or(spec);
+        let src = spec.split(':').next().unwrap_or("");
+        if src.is_empty() {
+            continue; // `:dst` は削除。push する内容は無い。
+        }
+        if src.starts_with('-') || src.contains(['$', '`', '*', '\\']) {
+            return String::new();
+        }
+        srcs.push(src);
+    }
+    if positional.len() <= 1 {
+        srcs.push("HEAD");
+    }
+    if srcs.is_empty() {
+        return String::new();
+    }
+    format!("{remote} {}", srcs.join(" "))
 }
 
 /// 値がコマンド置換で作られ、コマンド文字列だけでは内容が定まらないか。
@@ -367,6 +419,7 @@ pub fn classify_segment(seg: &str) -> SegClassification {
             }
             if idx < n && t[idx] == "push" {
                 result.kind_is_push = true;
+                result.push_spec = parse_push_spec(&t[idx + 1..]);
             }
         }
         "gh" => {
@@ -545,6 +598,8 @@ pub struct AnalyzeResult {
     /// 本文がコマンド置換)。unresolved_var と分けるのは、宛先が PRIVATE と
     /// 判明していれば検査自体が不要なので、その判定の後で ask にするため。
     pub body_unresolved: bool,
+    /// found_push のセグメントの push_spec(SegClassification 参照、#54)。
+    pub push_spec: String,
 }
 
 /// gh セグメントの生テキストから `--repo`/`-R`(値を伴う2トークン形)と
@@ -644,6 +699,7 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
 
         if c.kind_is_push && !result.found_push {
             result.found_push = true;
+            result.push_spec = c.push_spec.clone();
             result.push_dir = match c.dir_override {
                 // git -C <dir> の <dir> にも同じ展開を適用する(#39) —
                 // resolve_effective_dir を経由しない唯一の経路なので、
@@ -1083,6 +1139,30 @@ mod tests {
             None,
         );
         assert!(r.body_unresolved);
+    }
+
+    #[test]
+    fn push_spec_from_refspecs() {
+        let spec = |cmd: &str| classify_segment(cmd).push_spec;
+        assert_eq!(spec("git push"), "origin HEAD");
+        assert_eq!(spec("git push origin"), "origin HEAD");
+        assert_eq!(spec("git push origin main"), "origin main");
+        assert_eq!(
+            spec("git push --force-with-lease --force-if-includes origin feat"),
+            "origin feat"
+        );
+        assert_eq!(
+            spec("git push -u upstream HEAD:refs/heads/x"),
+            "upstream HEAD"
+        );
+        assert_eq!(spec("git push origin +a:b c"), "origin a c");
+        assert_eq!(spec("git -C /x push -o ci.skip origin main"), "origin main");
+        // 静的に決められないものは空(従来の default branch 経路に戻る)。
+        assert_eq!(spec("git push --all origin"), "");
+        assert_eq!(spec("git push --mirror"), "");
+        assert_eq!(spec("git push origin :gone"), "");
+        assert_eq!(spec("git push https://example.invalid/r.git main"), "");
+        assert_eq!(spec("git push origin $BR"), "");
     }
 
     #[test]

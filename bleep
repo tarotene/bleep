@@ -221,9 +221,13 @@ term_hash() {
 
 # ledger_write: $1=deny|ask $2=reason_id $3=match_class(既定 none)
 #               $4=平文のマッチ語(既定空、無ければ term_hash は null)
+#               $5=detail(既定空。空なら "detail" 欄自体を書かない。閉じた語彙の
+#                 失敗コードだけを渡す — 自由文・パス・git の stderr は入れない、#54)
 ledger_write() {
   ledger_enabled || return 0
-  local verdict="$1" reason_id="$2" match_class="${3:-none}" term="${4-}"
+  local verdict="$1" reason_id="$2" match_class="${3:-none}" term="${4-}" detail="${5-}"
+  local detail_json=""
+  [[ $detail =~ ^[a-z][a-z-]*$ ]] && detail_json=",\"detail\":\"$detail\""
   local hash="" hash_json="null"
   if [[ -n "$term" ]]; then
     hash="$(term_hash "$term")"
@@ -235,8 +239,8 @@ ledger_write() {
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   host_field="${BLEEP_HOST:-cli}"
   tool_name_field="${BLEEP_TOOL_NAME:-}"
-  line="$(printf '{"v":1,"ts":"%s","tool":"bleep","tool_version":"%s","repo":"tarotene/bleep","host":"%s","session_id":%s,"verdict":"%s","reason_id":"%s","match_class":"%s","term_hash":%s,"tool_name":"%s"}' \
-    "$ts" "$BLEEP_VERSION" "$host_field" "$sid_json" "$verdict" "$reason_id" "$match_class" "$hash_json" "$tool_name_field")"
+  line="$(printf '{"v":1,"ts":"%s","tool":"bleep","tool_version":"%s","repo":"tarotene/bleep","host":"%s","session_id":%s,"verdict":"%s","reason_id":"%s","match_class":"%s","term_hash":%s,"tool_name":"%s"%s}' \
+    "$ts" "$BLEEP_VERSION" "$host_field" "$sid_json" "$verdict" "$reason_id" "$match_class" "$hash_json" "$tool_name_field" "$detail_json")"
   mkdir -p "$LEDGER_DIR" 2>/dev/null || return 0
   chmod 700 "$LEDGER_DIR" 2>/dev/null || true
   (
@@ -648,8 +652,8 @@ reason_id_for_verdict() {
 #               $4=match_class(既定 none) $5=平文のマッチ語(既定空)
 # レッジャーに書いてから理由を印字し、対応する exit code で終了する。
 emit_verdict() {
-  local verdict="$1" reason="$2" reason_id="$3" match_class="${4:-none}" term="${5-}"
-  ledger_write "$verdict" "$reason_id" "$match_class" "$term"
+  local verdict="$1" reason="$2" reason_id="$3" match_class="${4:-none}" term="${5-}" detail="${6-}"
+  ledger_write "$verdict" "$reason_id" "$match_class" "$term" "$detail"
   printf '%s\n' "$reason"
   case "$verdict" in
     deny) exit 2 ;;
@@ -703,52 +707,102 @@ resolve_default_branch() {
   printf ''
 }
 
+# push_diff_fail: compute_push_diff_text の失敗を「[コード] 理由文」の1行で
+# stdout に書いて非 0 を返す。コードは閉じた語彙(dir-missing / not-a-repo /
+# default-branch / merge-base / range)で、呼び出し側が判定レッジャーの
+# detail 欄に残す(#54 — 以前は理由文が画面にしか出ず、後から原因を辿れなかった)。
+push_diff_fail() {
+  printf '[%s] %s\n' "$1" "$2"
+  return 1
+}
+
 # compute_push_diff_text: これから push する範囲の「追加行」+ 新規/rename 先
 # ファイルパス + コミットメッセージを連結して出力する(#7 — 削除行は既公開
-# 内容の除去であり新規公開ではないため検査対象外)。default branch /
-# merge-base が解決できない場合は非 0 を返し、理由文を stdout に1行書く
-# (fail-loud — 呼び出し側はこれを ask にエスカレートする。無言の pass には
-# しない)。以前は理由文をグローバル変数 PUSH_DIFF_FAIL_REASON に積んでいたが、
-# 呼び出し側が常に `text="$(compute_push_diff_text)"` の形(コマンド置換 =
-# サブシェル)で呼ぶため、その代入はサブシェル内で消え、呼び出し元には一切
-# 伝わっていなかった(#39 の調査中に発見。以前の理由文が常に空だった実際の
-# 原因)。コマンド置換は stdout だけを親シェルに持ち帰るため、理由文も stdout
-# に乗せる形に直した。
+# 内容の除去であり新規公開ではないため検査対象外)。範囲が解決できない場合は
+# 非 0 を返し、「[コード] 理由文」を stdout に1行書く(fail-loud — 呼び出し側は
+# これを ask にエスカレートする。無言の pass にはしない)。以前は理由文を
+# グローバル変数に積んでいたが、呼び出し側が常に `text="$(compute_push_diff_text)"`
+# の形(コマンド置換 = サブシェル)で呼ぶため、その代入は呼び出し元に伝わら
+# なかった(#39)。コマンド置換は stdout だけを持ち帰るため、理由文も stdout
+# に乗せる。
+#
+# 範囲は2通り(#54):
+#   - PUSH_SPEC(lex が git push の引数から求めた「<remote> <src>…」)があり、
+#     その remote の追跡 ref が1つでもあるとき: `<src>… --not --remotes=<remote>`
+#     — 実際に push される ref を、remote が既に持つ内容を除いて検査する。
+#     default branch や merge-base の解決に依存しない(githooks の pre-push が
+#     stdin で受け取る local ref / remote oid の考え方に相当。PreToolUse の
+#     時点では stdin が無いので、コマンド文字列から求める)。
+#   - それ以外: 従来どおり default branch との merge-base..HEAD。
 compute_push_diff_text() {
   local dir="${TARGET_CWD:-.}"
   # dir が存在しなければ、この時点で切り分け可能な理由を出す(#39 —
   # 以前は merge-base 失敗の理由文に埋もれ、tilde 未展開等による無効な
   # --cwd/push_dir を利用者が特定できなかった)。
   if [[ ! -d $dir ]]; then
-    printf 'push 対象ディレクトリが存在しません: %s\n' "$dir"
+    push_diff_fail dir-missing "push 対象ディレクトリが存在しません: ${dir}"
     return 1
   fi
-  local default_branch base
-  default_branch="$(resolve_default_branch)"
-  if [[ -z $default_branch ]]; then
-    printf '%s\n' 'default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。'
-    return 1
-  fi
-  base="$(git -C "$dir" merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
-  if [[ -z $base ]]; then
-    printf 'origin/%s との merge-base を解決できませんでした(未 fetch の可能性)。\n' "$default_branch"
+  local git_err
+  if ! git_err="$(git -C "$dir" rev-parse --git-dir 2>&1 >/dev/null)"; then
+    push_diff_fail not-a-repo "push 対象が git リポジトリとして読めません: ${dir} (${git_err%%$'\n'*})"
     return 1
   fi
 
-  local patches
+  local -a range=()
+  local spec="${PUSH_SPEC:-}" remote src srcs_str
+  local -a srcs=()
+  if [[ -n $spec ]]; then
+    read -r remote srcs_str <<< "$spec"
+    read -r -a srcs <<< "$srcs_str"
+    if [[ -n $(git -C "$dir" for-each-ref --count=1 "refs/remotes/$remote/" 2>/dev/null) ]]; then
+      for src in "${srcs[@]}"; do
+        if ! git -C "$dir" rev-parse --verify --quiet "${src}^{commit}" > /dev/null 2>&1; then
+          push_diff_fail range "push 元の ref を解決できません: ${src}"
+          return 1
+        fi
+      done
+      range=("${srcs[@]}" --not "--remotes=$remote")
+    fi
+  fi
+  if [[ ${#range[@]} -eq 0 ]]; then
+    local default_branch base
+    default_branch="$(resolve_default_branch)"
+    if [[ -z $default_branch ]]; then
+      push_diff_fail default-branch "default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。"
+      return 1
+    fi
+    base="$(git -C "$dir" merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
+    if [[ -z $base ]]; then
+      push_diff_fail merge-base "origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性)。"
+      return 1
+    fi
+    range=("$base..HEAD")
+  fi
+
+  local patches names msgs
   # per-commit patch(--format= でメッセージを混ぜない)。merge コミットは
   # --diff-merges=first-parent で第1親との diff を出す — evil merge(どちらの
   # 親にも無い行を解決結果に足す)の追加行もここに現れる。--no-renames で
   # rename を add+delete に展開し、-U0 で無関係な文脈行を落とす。
-  patches="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= "$base"..HEAD 2>/dev/null)"
-  grep '^+' <<< "$patches" || true # 追加行のみ抽出。無一致(grep の非 0)は空でよい
-
+  # git log 自体の失敗は空出力と区別できないので、終了コードで検出する(#54 —
+  # 以前は失敗が「追加行なし」= pass になり得た)。
+  if ! patches="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= "${range[@]}" 2>/dev/null)"; then
+    push_diff_fail range "git log が失敗しました(範囲: ${range[*]})。"
+    return 1
+  fi
   # 追加/rename 先のファイルパスは patch 本文に依存せず明示的に列挙する
   # (空ファイル・バイナリには +++ ヘッダ自体が出ないため、grep '^+' だけでは
   # パス名検出が漏れる)。
-  git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "$base"..HEAD 2>/dev/null
+  if ! names="$(git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "${range[@]}" 2>/dev/null)" ||
+    ! msgs="$(git -C "$dir" log --format=%B "${range[@]}" 2>/dev/null)"; then
+    push_diff_fail range "git log が失敗しました(範囲: ${range[*]})。"
+    return 1
+  fi
 
-  git -C "$dir" log --format=%B "$base"..HEAD 2>/dev/null
+  grep '^+' <<< "$patches" || true # 追加行のみ抽出。無一致(grep の非 0)は空でよい
+  printf '%s\n' "$names"
+  printf '%s\n' "$msgs"
   return 0
 }
 
@@ -890,7 +944,9 @@ cmd_scan_push() {
 
   local text
   if ! text="$(compute_push_diff_text)"; then
-    emit_verdict ask "push 差分を検査できませんでした: ${text}" push-diff-failed
+    local code="${text#\[}"
+    code="${code%%\]*}"
+    emit_verdict ask "push 差分を検査できませんでした: ${text}" push-diff-failed none "" "$code"
   fi
   require_orgs_file
   build_patterns
@@ -947,7 +1003,7 @@ cmd_scan_bash_command() {
   fi
 
   local found_push found_gh push_dir gh_repo_override gh_effective_dir unresolved_var scan_subject
-  local body_unresolved body_n body_path i
+  local push_spec body_unresolved body_n body_path i
   local -a body_paths=()
   {
     IFS= read -r found_push
@@ -956,6 +1012,7 @@ cmd_scan_bash_command() {
     IFS= read -r gh_repo_override
     IFS= read -r gh_effective_dir
     IFS= read -r unresolved_var
+    IFS= read -r push_spec
     IFS= read -r body_unresolved
     IFS= read -r body_n
     for ((i = 0; i < body_n; i++)); do
@@ -1014,6 +1071,7 @@ cmd_scan_bash_command() {
 
   if [[ $found_push == "1" ]]; then
     TARGET_CWD="$push_dir"
+    PUSH_SPEC="$push_spec"
     cmd_scan_push
     return
   fi
@@ -1789,6 +1847,68 @@ CASES
 1|gh issue create -R pub/repo --body "\$(cat $tmp/bodies/leak.md)"
 1|gh api -X POST repos/pub/repo/issues -f body="\$(cat $tmp/bodies/leak.md)"
 CASES55
+
+  # #54: push の範囲は「実際に push される ref」から、remote が既に持つ内容を
+  # 除いて求める(default branch / merge-base に依存しない)。
+  local repo_b1="$tmp/repo_b1" wt_b1="$tmp/wt_b1" repo_b2="$tmp/repo_b2"
+  new_pushed_repo "$repo_b1"
+  echo base > "$repo_b1/f.txt"
+  git -C "$repo_b1" add f.txt
+  git -C "$repo_b1" commit -qm initial
+  git init -q --bare "$tmp/remote_b1.git"
+  git -C "$repo_b1" remote add origin "$tmp/remote_b1.git"
+  git -C "$repo_b1" push -q origin main
+  git -C "$repo_b1" switch -qc other
+  echo "acme/secret-project" >> "$repo_b1/f.txt"
+  git -C "$repo_b1" commit -qam "mentions secret"
+  git -C "$repo_b1" switch -q main
+  # herdr 管理の worktree 構成の再現。リポジトリごと $tmp に閉じており、
+  # $tmp は selftest 終了時に丸ごと消えるので、実リポジトリに stale な
+  # worktree 登録は残らない。
+  git -C "$repo_b1" worktree add -q "$wt_b1" -b feat-wt
+  echo "acme/secret-project" >> "$wt_b1/g.txt"
+  git -C "$wt_b1" add g.txt
+  git -C "$wt_b1" commit -qm "wt secret"
+  # repo_b2: origin/HEAD が無く、default branch も main/master でない(bare
+  # clone から作った worktree 構成に近い)。従来は default-branch で ask。
+  new_pushed_repo "$repo_b2"
+  git -C "$repo_b2" branch -m trunk
+  echo base > "$repo_b2/f.txt"
+  git -C "$repo_b2" add f.txt
+  git -C "$repo_b2" commit -qm initial
+  git init -q --bare "$tmp/remote_b2.git"
+  git -C "$repo_b2" remote add origin "$tmp/remote_b2.git"
+  git -C "$repo_b2" push -q origin trunk
+  echo "acme/secret-project" >> "$repo_b2/f.txt"
+  git -C "$repo_b2" commit -qam "mentions secret"
+  local push_dir push_cmd push_want
+  while IFS='|' read -r push_want push_dir push_cmd; do
+    set +e
+    (cd "${push_dir//@tmp@/$tmp}" && "$SELF" scan-bash-command "$push_cmd") > /dev/null 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq $push_want ]] || { echo "FAIL(#54 push 範囲: $push_dir $push_cmd): 期待=$push_want 実際=$rc" >&2; fails=$((fails + 1)); }
+  done <<'CASES54'
+2|@tmp@/repo_b1|git push origin other
+0|@tmp@/repo_b1|git push origin main
+2|@tmp@/wt_b1|git push --force-with-lease --force-if-includes origin feat-wt
+2|@tmp@/wt_b1|git push -u origin HEAD
+2|@tmp@/repo_b2|git push origin trunk
+CASES54
+
+  # #54: 失敗理由は閉じた語彙のコードでレッジャーの detail 欄に残す(パス・
+  # git の stderr は入れない)。
+  mkdir -p "$tmp/plain-dir"
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  (cd "$tmp/plain-dir" && GIT_CEILING_DIRECTORIES="$tmp" "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(#54 not-a-repo は ask): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
+  if ! tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl" 2>/dev/null | grep -q '"reason_id":"push-diff-failed".*"detail":"not-a-repo"'; then
+    echo "FAIL(#54 ledger の detail に not-a-repo が残らない): $(tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl" 2>/dev/null)" >&2
+    fails=$((fails + 1))
+  fi
 
   # #9/#14 の組み合わせ: cd のパスに private リポ名を含み、かつ gh 側に
   # --repo で別の PUBLIC リポを明示している場合、visibility は --repo 側で

@@ -17,7 +17,9 @@ usage: bleep-hook --host=<claude|codex|copilot>
 lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
                 純粋な字句解析モード。I/O・gh は一切行わない。出力は6行の
                 ヘッダ(found_push/push_dir/found_gh/gh_repo_override/
-                gh_effective_dir/unresolved_var)、body_unresolved、
+                gh_effective_dir/unresolved_var)、push_spec(`git push` の
+                「<remote> <src>…」。静的に決められなければ空、#54)、
+                body_unresolved、
                 本文の入力元パスの件数 N と N 行のパス、に続けて
                 scan_subject を書く固定書式(jq 非依存 — 呼び出し側の
                 bleep 本体を jq フリーに保つ)。unresolved_var=1 は、
@@ -48,6 +50,7 @@ fn cmd_lex(cwd: &str, cmd: &str) {
     println!("{}", escape_line(&r.gh_repo_override));
     println!("{}", escape_line(&r.gh_effective_dir));
     println!("{}", if r.unresolved_var { "1" } else { "0" });
+    println!("{}", escape_line(&r.push_spec));
     println!("{}", if r.body_unresolved { "1" } else { "0" });
     println!("{}", r.body_sources.len());
     for p in &r.body_sources {
