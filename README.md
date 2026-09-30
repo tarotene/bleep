@@ -82,6 +82,26 @@ comments and blank lines ignored):
 | `allow-regexes.txt` | If this regex matches the scanned text, it disables **only the ask** verdict (it does not loosen deny) |
 | `allow-paths.txt` | Regex of file paths excluded from `audit` |
 
+**Short repo names are downgraded to `ask` by default** (`BLEEP_SOFT_MAXLEN`,
+default `4`, #44): a live-swept private repo name that's `BLEEP_SOFT_MAXLEN`
+characters or shorter — the kind of short, generic name that's more likely to
+collide with ordinary prose in an unrelated public repo (`gizmo.json`,
+`app-gizmo`, a short code name reused across many repos) — is checked as
+`ask` instead of hard-`deny`. This is not a dictionary lookup (no bundled or
+system word list is consulted, so the check is the same on every host
+regardless of what's installed); it's purely a length threshold, applied
+**after** `allow-stopwords.txt` filtering, so a stopworded short name is
+still fully exempt (see below). To keep recall from dropping, the downgraded
+name's `owner/repo` form is still hard-`deny`ed (a word-boundary match, not
+`PLAIN_PATTERNS`' substring match) — so an explicit `owner/repo` reference to
+the same repo is unaffected by the downgrade; only the bare, ambiguous name
+is softened. Set `BLEEP_SOFT_MAXLEN=0` to disable the downgrade and
+hard-deny every live-swept name regardless of length (the pre-#44 behavior).
+The cache this reads from (`private-repos-cache.txt`) now stores `owner/name`
+per line instead of a bare name, so this downgrade has an owner to fall back
+to; an old-format cache from before #44 is detected and refreshed
+automatically the next time it's read.
+
 **Marking a private repo as "prospectively public"** (#15): a personal side
 project that's private only because it isn't polished yet — not because its
 name or existence is sensitive — can be exempted from the hard-deny tier
@@ -102,7 +122,10 @@ What this does and does not cover:
 - `allow-stopwords.txt` filters **both** `WORD_HARD` (hard-deny, bare repo
   names) and `WORD_WARN` (ask, bare org names) — so a stopword removes a
   live-swept private repo name from the hard-deny tier just as it would a
-  `repos.txt` entry.
+  `repos.txt` entry. It's applied **before** the `BLEEP_SOFT_MAXLEN` length
+  downgrade (#44), so a stopworded short name never reaches `WORD_SOFT`
+  either — both the bare form and its `owner/repo` form (`NWO_HARD`) stay
+  fully exempt, not merely downgraded to `ask`.
 - Your **own personal repos** (the org derived from your authenticated `gh`
   user, not an entry in `orgs.txt`) never appear in `PLAIN_PATTERNS`
   (`org/repo`-shaped literal matches) in the first place — only
@@ -296,7 +319,7 @@ code contract (for anyone scripting against this themselves):
 | exit code | meaning | stdout |
 |---|---|---|
 | 0 | pass (no denylist match) | none |
-| 1 | ask (a bare org-name match — could collide with a legitimate use) | one-line reason |
+| 1 | ask (a bare org-name match, or a bare repo-name match short enough to be downgraded — could collide with a legitimate use, see `BLEEP_SOFT_MAXLEN` above) | one-line reason |
 | 2 | deny (an explicit org/repo reference or a specific repo-name match — almost certainly an unintended leak) | one-line reason |
 
 **What `scan-push` checks**: `bleep scan-push` (and `git push`
