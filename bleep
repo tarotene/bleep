@@ -947,6 +947,8 @@ cmd_scan_bash_command() {
   fi
 
   local found_push found_gh push_dir gh_repo_override gh_effective_dir unresolved_var scan_subject
+  local body_unresolved body_n body_path i
+  local -a body_paths=()
   {
     IFS= read -r found_push
     IFS= read -r push_dir
@@ -954,6 +956,12 @@ cmd_scan_bash_command() {
     IFS= read -r gh_repo_override
     IFS= read -r gh_effective_dir
     IFS= read -r unresolved_var
+    IFS= read -r body_unresolved
+    IFS= read -r body_n
+    for ((i = 0; i < body_n; i++)); do
+      IFS= read -r body_path
+      body_paths+=("$body_path")
+    done
     scan_subject="$(cat)"
   } <<< "$lex_out"
 
@@ -982,6 +990,20 @@ cmd_scan_bash_command() {
       vis="$(repo_visibility "$gh_nwo")"
       [[ $vis == PRIVATE || $vis == INTERNAL ]] && exit 0
     fi
+    # #55: 本文をファイル・API 入力から渡す形は、本文がコマンド文字列に
+    # 現れない。宛先が PRIVATE/INTERNAL なら上で pass 済みなので、ここに来る
+    # のは公開宛て(または判定不能)だけ。入力元が静的に解決できない、または
+    # 読めないときは、読めた範囲だけで pass せず ask にする(fail-loud)。
+    if [[ $body_unresolved == "1" ]]; then
+      emit_verdict ask "gh の本文の入力元(--body-file / -F k=@path / --input のパス、または \$(...) で作った本文)を静的に解決できません。本文をコマンド行に直接書くか、パスをリテラルで書き直してください。" body-source-unresolved
+    fi
+    for body_path in "${body_paths[@]+"${body_paths[@]}"}"; do
+      if [[ -f $body_path && -r $body_path ]]; then
+        scan_subject+=$'\n'"$(cat -- "$body_path" 2>/dev/null)" || true
+      else
+        emit_verdict ask "gh の本文の入力元ファイルを読めません: ${body_path}" body-source-unreadable
+      fi
+    done
     require_orgs_file
     build_patterns
     if match_verdict "$scan_subject"; then
@@ -1740,6 +1762,33 @@ STUB
 0|gh api repos/{owner}/{repo}/issues -f body="acme/secret-project"
 0|gh api -X GET repos/pub/repo/issues -f q="acme/secret-project"
 CASES
+
+  # #55: 本文をファイル・API 入力から渡す形は、内容を読んで照合する。
+  # 読めない/解決できない入力元は ask(fail-loud)。宛先は -R / API パスで
+  # PUBLIC(スタブ)に固定している。
+  mkdir -p "$tmp/bodies"
+  printf 'acme/secret-project の件\n' > "$tmp/bodies/leak.md"
+  printf '{"body":"acme/secret-project"}\n' > "$tmp/bodies/leak.json"
+  printf 'hello\n' > "$tmp/bodies/clean.md"
+  while IFS='|' read -r api_want api_cmd; do
+    set +e
+    (cd "$repo_priv" && "$SELF" scan-bash-command "$api_cmd") > /dev/null 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq $api_want ]] || { echo "FAIL(#55 本文の入力元: $api_cmd): 期待=$api_want 実際=$rc" >&2; fails=$((fails + 1)); }
+  done <<CASES55
+2|gh issue create -R pub/repo --body-file $tmp/bodies/leak.md
+2|cd $tmp/bodies && gh issue create -R pub/repo --body-file leak.md
+2|gh issue create -R pub/repo -F $tmp/bodies/leak.md
+2|gh api -X PATCH repos/pub/repo/issues/1 -F body=@$tmp/bodies/leak.md
+2|gh api repos/pub/repo/issues --input $tmp/bodies/leak.json
+0|gh issue create -R pub/repo --body-file $tmp/bodies/clean.md
+0|gh issue create -R pub/repo --body-file -
+1|gh issue create -R pub/repo --body-file $tmp/bodies/missing.md
+1|S=$tmp/bodies; gh issue create -R pub/repo --body-file \$S/leak.md
+1|gh issue create -R pub/repo --body "\$(cat $tmp/bodies/leak.md)"
+1|gh api -X POST repos/pub/repo/issues -f body="\$(cat $tmp/bodies/leak.md)"
+CASES55
 
   # #9/#14 の組み合わせ: cd のパスに private リポ名を含み、かつ gh 側に
   # --repo で別の PUBLIC リポを明示している場合、visibility は --repo 側で

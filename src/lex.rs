@@ -180,6 +180,101 @@ pub struct SegClassification {
     /// で始まらない、等)。宛先の可視性による pass をせず、公開宛てとみなして
     /// 検査する側(fail-loud)に倒す(#58)。
     pub dest_unknown: bool,
+    /// gh の本文をファイルから読む入力元(`--body-file`、`gh pr|issue` の
+    /// `-F`、`gh api` の `-F k=@path` / `--input`)の、コマンド行に書かれた
+    /// ままのパス。stdin(`-`)は含めない(#55)。
+    pub body_files: Vec<String>,
+    /// 本文がコマンド置換(`$(…)`、バッククォート)で作られ、コマンド行から
+    /// 静的に内容を解決できない(#55)。ヒアドキュメント(`<<`)を含む場合は
+    /// 本文がコマンド文字列に含まれるので対象外。
+    pub body_dynamic: bool,
+}
+
+/// 値がコマンド置換で作られ、コマンド文字列だけでは内容が定まらないか。
+fn is_dynamic_value(v: &str) -> bool {
+    (v.contains("$(") || v.contains('`')) && !v.contains("<<")
+}
+
+/// `gh pr|issue create|edit|comment` の本文入力元を集める(#55)。
+fn collect_pr_issue_body_inputs(args: &[String], out: &mut SegClassification) {
+    let mut j = 0usize;
+    while j < args.len() {
+        let a = args[j].as_str();
+        match a {
+            "--body-file" | "-F" => {
+                if let Some(p) = args.get(j + 1) {
+                    push_body_file(p, out);
+                }
+                j += 2;
+            }
+            "--body" | "-b" => {
+                if args.get(j + 1).is_some_and(|v| is_dynamic_value(v)) {
+                    out.body_dynamic = true;
+                }
+                j += 2;
+            }
+            s if s.starts_with("--body-file=") => {
+                push_body_file(s.trim_start_matches("--body-file="), out);
+                j += 1;
+            }
+            s if s.starts_with("--body=") => {
+                if is_dynamic_value(s.trim_start_matches("--body=")) {
+                    out.body_dynamic = true;
+                }
+                j += 1;
+            }
+            _ => j += 1,
+        }
+    }
+}
+
+/// `gh api` の本文入力元を集める(#55)。`-F`/`--field` の `k=@path` は
+/// ファイルを読む。`-f`/`--raw-field` の値は文字通りに送られる(ファイルは
+/// 読まない)が、コマンド置換で作られていれば内容を解決できない。
+fn collect_api_body_inputs(args: &[String], out: &mut SegClassification) {
+    let mut j = 0usize;
+    while j < args.len() {
+        let a = args[j].as_str();
+        let (kind, val) = match a {
+            "-F" | "--field" => ('F', args.get(j + 1).map(|s| s.as_str())),
+            "-f" | "--raw-field" => ('f', args.get(j + 1).map(|s| s.as_str())),
+            "--input" => ('i', args.get(j + 1).map(|s| s.as_str())),
+            s if s.starts_with("--field=") => ('F', Some(s.trim_start_matches("--field="))),
+            s if s.starts_with("--raw-field=") => ('f', Some(s.trim_start_matches("--raw-field="))),
+            s if s.starts_with("--input=") => ('i', Some(s.trim_start_matches("--input="))),
+            _ => {
+                j += 1;
+                continue;
+            }
+        };
+        j += if a.contains('=') && a.starts_with("--") {
+            1
+        } else {
+            2
+        };
+        let Some(v) = val else { continue };
+        match kind {
+            'i' => push_body_file(v, out),
+            'F' => match v.split_once('=') {
+                Some((_, rest)) if rest.starts_with('@') => push_body_file(&rest[1..], out),
+                Some((_, rest)) if is_dynamic_value(rest) => out.body_dynamic = true,
+                _ => {}
+            },
+            _ => {
+                if v.split_once('=')
+                    .is_some_and(|(_, rest)| is_dynamic_value(rest))
+                {
+                    out.body_dynamic = true;
+                }
+            }
+        }
+    }
+}
+
+fn push_body_file(p: &str, out: &mut SegClassification) {
+    if !p.is_empty() && p != "-" {
+        out.body_files.push(p.to_string());
+    }
 }
 
 enum ApiDest {
@@ -331,6 +426,7 @@ pub fn classify_segment(seg: &str) -> SegClassification {
                     && (action == "create" || action == "edit" || action == "comment")
                 {
                     result.kind_is_gh_publish = true;
+                    collect_pr_issue_body_inputs(&t[idx + 2..], &mut result);
                 } else if sub == "release" && (action == "create" || action == "edit") {
                     result.kind_is_gh_publish = true; // gh release create|edit(#8 由来)
                 } else if sub == "repo" && action == "edit" {
@@ -399,6 +495,7 @@ pub fn classify_segment(seg: &str) -> SegClassification {
                     };
                     if matches!(effective.to_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
                         result.kind_is_gh_publish = true;
+                        collect_api_body_inputs(rest, &mut result);
                         // 宛先は API パスに書かれる(#58)。-R/--repo で明示されて
                         // いればそちらを優先する。`{owner}/{repo}` のプレース
                         // ホルダは gh が cwd の origin で展開するので、従来どおり
@@ -440,6 +537,14 @@ pub struct AnalyzeResult {
     /// はこの場合、値を無理に使わず ask にエスカレートする。found_push も
     /// found_gh も立っていない(push/gh セグメントが無い)ときは常に false。
     pub unresolved_var: bool,
+    /// gh の投稿セグメントが本文をファイルから読む入力元の絶対パス
+    /// (相対パスはそのセグメントの実効ディレクトリ基準で解決済み、#55)。
+    /// lex は I/O を持たない — 中身を読むのは呼び出し側(bleep)。
+    pub body_sources: Vec<String>,
+    /// 本文の入力元を静的に解決できない(パスに未展開の `$` やバッククォート、
+    /// 本文がコマンド置換)。unresolved_var と分けるのは、宛先が PRIVATE と
+    /// 判明していれば検査自体が不要なので、その判定の後で ask にするため。
+    pub body_unresolved: bool,
 }
 
 /// gh セグメントの生テキストから `--repo`/`-R`(値を伴う2トークン形)と
@@ -508,6 +613,33 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
                 result.scan_subject.push_str(seg);
             }
             result.scan_subject.push('\n');
+        }
+
+        if c.kind_is_gh_publish && as_single_cd_target(seg).is_none() {
+            if c.body_dynamic {
+                result.body_unresolved = true;
+            }
+            if !c.body_files.is_empty() {
+                let dir_unresolved = cd_chain_has_unresolved_var(&segments, i, home);
+                let dir = resolve_effective_dir(start_dir, &segments, i, home);
+                for p in &c.body_files {
+                    let p = expand_home(p, home);
+                    let has_var = p.contains('$') || p.contains('`');
+                    let odd = p.contains('\\') || p.contains('\n');
+                    if has_var || odd || (!p.starts_with('/') && dir_unresolved) {
+                        result.body_unresolved = true;
+                        continue;
+                    }
+                    let abs = if p.starts_with('/') {
+                        p
+                    } else {
+                        format!("{dir}/{p}")
+                    };
+                    if !result.body_sources.contains(&abs) {
+                        result.body_sources.push(abs);
+                    }
+                }
+            }
         }
 
         if c.kind_is_push && !result.found_push {
@@ -880,6 +1012,77 @@ mod tests {
             let c = classify_segment(cmd);
             assert!(c.kind_is_gh_publish && c.dest_unknown, "{cmd}");
         }
+    }
+
+    #[test]
+    fn gh_body_inputs_are_extracted() {
+        // #55: -F は gh pr|issue ではファイル、gh api ではフィールド。
+        let c = classify_segment("gh issue create -R p/r --body-file b.md");
+        assert_eq!(c.body_files, ["b.md"]);
+        let c = classify_segment("gh pr create -F b.md --title t");
+        assert_eq!(c.body_files, ["b.md"]);
+        let c = classify_segment("gh issue create --body-file=b.md");
+        assert_eq!(c.body_files, ["b.md"]);
+        let c = classify_segment("gh api -X PATCH repos/p/r/issues/1 -F body=@b.md -F n=1");
+        assert_eq!(c.body_files, ["b.md"]);
+        let c = classify_segment("gh api repos/p/r/issues --input in.json");
+        assert_eq!(c.body_files, ["in.json"]);
+        // -f は文字通り。@ でもファイルを読まない。
+        let c = classify_segment("gh api -X POST repos/p/r/issues -f body=@b.md");
+        assert!(c.body_files.is_empty() && !c.body_dynamic);
+        // stdin は対象外。
+        assert!(classify_segment("gh issue create --body-file -")
+            .body_files
+            .is_empty());
+        assert!(classify_segment("gh api repos/p/r/issues --input -")
+            .body_files
+            .is_empty());
+    }
+
+    #[test]
+    fn gh_body_command_substitution_is_dynamic_unless_heredoc() {
+        assert!(classify_segment(r#"gh issue create --body "$(cat b.md)""#).body_dynamic);
+        assert!(classify_segment("gh issue create --body `cat b.md`").body_dynamic);
+        assert!(
+            classify_segment(r#"gh api -X POST repos/p/r/issues -f body="$(cat b)""#).body_dynamic
+        );
+        // ヒアドキュメントの本文はコマンド文字列に含まれる。
+        assert!(
+            !classify_segment("gh issue create --body \"$(cat <<'EOF'\nx\nEOF\n)\"").body_dynamic
+        );
+    }
+
+    #[test]
+    fn body_sources_resolve_against_effective_dir() {
+        let r = analyze(
+            "cd sub && gh issue create -R p/r --body-file b.md",
+            "/work",
+            None,
+        );
+        assert_eq!(r.body_sources, ["/work/sub/b.md"]);
+        assert!(!r.body_unresolved);
+        let r = analyze(
+            "gh issue create -R p/r --body-file /abs/b.md",
+            "/work",
+            None,
+        );
+        assert_eq!(r.body_sources, ["/abs/b.md"]);
+        // すべての gh 投稿セグメントから集める。
+        let r = analyze(
+            "gh issue create -R p/r --body-file a.md && gh issue comment 1 -R p/r -F c.md",
+            "/work",
+            None,
+        );
+        assert_eq!(r.body_sources, ["/work/a.md", "/work/c.md"]);
+        // 未展開の変数・cd 側の未解決は body_unresolved。
+        let r = analyze("gh issue create -R p/r --body-file $S/b.md", "/work", None);
+        assert!(r.body_unresolved && r.body_sources.is_empty());
+        let r = analyze(
+            "cd $D && gh issue create -R p/r --body-file b.md",
+            "/work",
+            None,
+        );
+        assert!(r.body_unresolved);
     }
 
     #[test]
