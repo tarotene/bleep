@@ -17,11 +17,15 @@ usage: bleep-hook --host=<claude|codex|copilot>
 lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
                 純粋な字句解析モード。I/O・gh は一切行わない。出力は6行の
                 ヘッダ(found_push/push_dir/found_gh/gh_repo_override/
-                gh_effective_dir/unresolved_var)に続けて scan_subject を
-                書く固定書式(jq 非依存 — 呼び出し側の bleep 本体を jq
-                フリーに保つ)。unresolved_var=1 は、found_push/found_gh の
-                対象解決に使った値が未展開の $ 参照を含み静的に解決できな
-                かったことを示す(#34)。
+                gh_effective_dir/unresolved_var)、body_unresolved、
+                本文の入力元パスの件数 N と N 行のパス、に続けて
+                scan_subject を書く固定書式(jq 非依存 — 呼び出し側の
+                bleep 本体を jq フリーに保つ)。unresolved_var=1 は、
+                found_push/found_gh の対象解決に使った値が未展開の $ 参照を
+                含み静的に解決できなかったことを示す(#34)。body_unresolved=1
+                は gh の本文の入力元をコマンド行から静的に解決できなかった
+                ことを示し、パスは gh の --body-file 等をコマンド実行
+                ディレクトリ基準で解決済みの絶対パス(#55)。
 hash            bleep(Bash)本体の判定レッジャー(ledger_write)から呼ばれる。
                 FILE に保存された鍵(無ければ新規生成)で TERM を
                 HMAC-SHA256 し、hex を1行 stdout に印字する。
@@ -44,6 +48,11 @@ fn cmd_lex(cwd: &str, cmd: &str) {
     println!("{}", escape_line(&r.gh_repo_override));
     println!("{}", escape_line(&r.gh_effective_dir));
     println!("{}", if r.unresolved_var { "1" } else { "0" });
+    println!("{}", if r.body_unresolved { "1" } else { "0" });
+    println!("{}", r.body_sources.len());
+    for p in &r.body_sources {
+        println!("{}", escape_line(p));
+    }
     print!("{}", r.scan_subject); // 既に各セグメント末尾に \n が付いている
 }
 
