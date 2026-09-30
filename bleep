@@ -126,6 +126,13 @@ init_vars() {
   GH_BIN="${BLEEP_GH_BIN:-gh}"
   LEX_BIN="${BLEEP_LEX_BIN:-bleep-hook}" # cmd_scan_bash_command の字句解析(D1)
   CACHE_TTL="${BLEEP_CACHE_TTL:-86400}"
+  # #44: WORD_HARD(裸のリポ名 hard-deny)のうち、この長さ以下の語は
+  # word-soft(ask)に降格する。一般的な英単語が私物 private リポ名として
+  # たまたま denylist に載ったとき、無関係な公開リポの散文と衝突して
+  # hard-deny する事故を減らす(辞書は使わない — ホストごとに有無・内容が
+  # 違う `/usr/share/dict/words` に判定を依存させない、build_patterns 参照)。
+  # 0 で降格を無効化し、従来(#46 まで)の挙動に戻せる。
+  SOFT_MAXLEN="${BLEEP_SOFT_MAXLEN:-4}"
   PRIVATE_CACHE="$STATE_DIR/private-repos-cache.txt"
   VIS_CACHE="$STATE_DIR/visibility-cache.tsv"
   OWNER_CACHE="$STATE_DIR/owner-login-cache.txt"
@@ -336,10 +343,12 @@ resolve_owner_login() {
 
 # refresh_private_repo_cache: 自分の owner 一件 + orgs.txt に書かれた org 名
 # それぞれについて、private と internal(gh repo list の --visibility は
-# 単一値しか取らないため2回に分ける)のリポジトリ名を live 取得してキャッシュ
-# する(プレーンテキスト、1行1名。jq 不要 — gh の --jq は内蔵の gojq を使う
-# ため、ローカル jq バイナリに依存しない)。1件でも取得できれば成功とし、
-# 全滅した場合だけ失敗を返す(呼び出し側は古いキャッシュにフォールバック)。
+# 単一値しか取らないため2回に分ける)のリポジトリを live 取得してキャッシュ
+# する(プレーンテキスト、1行1件 "owner/name" 形。#44 — 以前は裸名のみを
+# 保存していたため、WORD_SOFT への降格時に owner が分からず NWO_HARD による
+# recall 補填ができなかった。jq 不要 — gh の --jq は内蔵の gojq を使うため、
+# ローカル jq バイナリに依存しない)。1件でも取得できれば成功とし、全滅した
+# 場合だけ失敗を返す(呼び出し側は古いキャッシュにフォールバック)。
 refresh_private_repo_cache() {
   mkdir -p "$STATE_DIR"
   local -a owners=()
@@ -351,13 +360,13 @@ refresh_private_repo_cache() {
   done < <(read_lines "$ORGS_FILE")
   ((${#owners[@]} > 0)) || return 1
 
-  local tmp got_any=false o vis names
+  local tmp got_any=false o vis nwos
   tmp="$(mktemp "$STATE_DIR/private-repos-cache.txt.XXXXXX")"
   : > "$tmp"
   for o in "${owners[@]}"; do
     for vis in private internal; do
-      if names="$("$GH_BIN" repo list "$o" --visibility "$vis" --limit 500 --json name --jq '.[].name' 2>/dev/null)"; then
-        [[ -n $names ]] && { printf '%s\n' "$names" >> "$tmp"; got_any=true; }
+      if nwos="$("$GH_BIN" repo list "$o" --visibility "$vis" --limit 500 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null)"; then
+        [[ -n $nwos ]] && { printf '%s\n' "$nwos" >> "$tmp"; got_any=true; }
       fi
     done
   done
@@ -371,13 +380,23 @@ refresh_private_repo_cache() {
 }
 
 # private_repo_names: キャッシュが TTL 内ならそれを、無ければ live 取得して
-# 出力する。live 取得に失敗し、古いキャッシュも無ければ何も出力しない
-# (denylist が空になるだけで、検査自体は他の denylist で継続する — orgs.txt/
-# repos.txt が空でなければそれらは引き続き効く)。
+# "owner/name" 形で1行1件出力する。live 取得に失敗し、古いキャッシュも無け
+# れば何も出力しない(denylist が空になるだけで、検査自体は他の denylist で
+# 継続する — orgs.txt/repos.txt が空でなければそれらは引き続き効く)。
+# #44: キャッシュに `/` を含まない行(改名前の裸名のみの旧形式)が1つでも
+# あれば、TTL に関わらず古い形式とみなして無条件に再取得する。再取得も
+# 失敗したら、その旧形式のまま出力する(呼び出し側 build_patterns は `/`
+# の有無で owner を判別済みか裸名かを見分け、いずれの場合も WORD_HARD への
+# 追加自体は継続する — cache 形式の過渡期でも検査を止めない)。
 private_repo_names() {
   local now mtime
   now="$(date +%s)"
   if [[ -f $PRIVATE_CACHE ]]; then
+    if grep -Ev '^[[:space:]]*(#|$)' "$PRIVATE_CACHE" | grep -qv '/'; then
+      refresh_private_repo_cache || true
+      cat "$PRIVATE_CACHE"
+      return 0
+    fi
     mtime="$(stat -c %Y "$PRIVATE_CACHE" 2>/dev/null || stat -f %m "$PRIVATE_CACHE" 2>/dev/null || printf 0)"
     if (( now - mtime < CACHE_TTL )); then
       cat "$PRIVATE_CACHE"
@@ -391,21 +410,35 @@ private_repo_names() {
 
 # ---- denylist パターン構築 + 判定 ------------------------------------------
 
-# build_patterns: denylist 3種を集めて3つのパターン配列をグローバル変数に積み、
+# build_patterns: denylist 3種を集めて4つのパターン配列をグローバル変数に積み、
 # allow-stopwords で WORD_HARD/WORD_WARN をフィルタする。
 #   PLAIN_PATTERNS  — スラッシュを含む固定文字列。-w は使わない(末尾が "/" の
 #                     パターンは -w だと理論上一致し得ない — \> は直前の文字が
 #                     word 文字であることを要求するため、"/" 終端では常に不成立)。
 #                     stopwords は適用しない — "org/repo" 形の明示参照は
 #                     単語単体より曖昧性が無いため。
+#   NWO_HARD        — WORD_SOFT に降格した live sweep 由来の語を補う
+#                     "owner/name" 形(単語境界一致、hard-deny)。PLAIN_PATTERNS
+#                     と違い部分文字列一致ではなく単語境界一致(#44 D3)。
 #   WORD_HARD       — 裸のリポ名(単語境界一致、hard-deny)。
 #   WORD_WARN       — 裸の org 名(単語境界一致、ask)。
+#   WORD_SOFT       — WORD_HARD のうち長さ ≤ SOFT_MAXLEN の裸名(単語境界一致、
+#                     ask に降格。#44 — 一般的な英単語が private リポ名として
+#                     denylist に載ると、無関係な公開リポの散文と衝突して
+#                     hard-deny する事故が起きていた)。
 PLAIN_PATTERNS=()
+NWO_HARD=()
 WORD_HARD=()
 WORD_WARN=()
+WORD_SOFT=()
 build_patterns() {
-  PLAIN_PATTERNS=() WORD_HARD=() WORD_WARN=()
+  PLAIN_PATTERNS=() NWO_HARD=() WORD_HARD=() WORD_WARN=() WORD_SOFT=()
   local org nwo repo
+  # #44: 降格した裸名を live sweep の owner に写して NWO_HARD へ足すための
+  # 対応表(裸名 -> owner/name)。stopword でも除かれるものは load_allowlist/
+  # filter_stopwords の後に降格処理を行うため自然にここへ現れない。
+  local -A live_nwo_of=()
+
   while IFS= read -r org; do
     [[ -n $org ]] || continue
     PLAIN_PATTERNS+=("${org}/")
@@ -419,14 +452,43 @@ build_patterns() {
     [[ -n $repo && $repo != "$nwo" ]] && WORD_HARD+=("$repo")
   done < <(read_lines "$REPOS_FILE")
 
-  while IFS= read -r repo; do
-    [[ -n $repo ]] || continue
-    WORD_HARD+=("$repo")
+  # live sweep(#44): private_repo_names は "owner/name" 形を返す(旧形式の
+  # 裸名キャッシュは private_repo_names 内で検出され自動的に再取得される)。
+  # owner が分からない行(旧形式への live 取得失敗フォールバック等)は裸名
+  # のまま WORD_HARD に積み、live_nwo_of には登録しない — NWO_HARD による
+  # recall 補填が効かないだけで、従来どおり hard-deny は継続する。
+  while IFS= read -r nwo; do
+    [[ -n $nwo ]] || continue
+    repo="${nwo#*/}"
+    if [[ -n $repo && $repo != "$nwo" ]]; then
+      WORD_HARD+=("$repo")
+      live_nwo_of["$repo"]="$nwo"
+    else
+      WORD_HARD+=("$nwo")
+    fi
   done < <(private_repo_names)
 
   load_allowlist
   filter_stopwords WORD_HARD
   filter_stopwords WORD_WARN
+
+  # #44: stopword フィルタの後に、長さ ≤ SOFT_MAXLEN の WORD_HARD を
+  # WORD_SOFT(ask)へ降格する。stopword 済みの語はこの時点で既に WORD_HARD
+  # から除かれているため、README「prospectively public」(#15)の「bare 名の
+  # stopword で owner/repo 形も含めて両方通る」という既存の約束を壊さない。
+  if ((SOFT_MAXLEN > 0)); then
+    local -a hard_kept=()
+    local w
+    for w in "${WORD_HARD[@]}"; do
+      if ((${#w} <= SOFT_MAXLEN)); then
+        WORD_SOFT+=("$w")
+        [[ -n "${live_nwo_of[$w]-}" ]] && NWO_HARD+=("${live_nwo_of[$w]}")
+      else
+        hard_kept+=("$w")
+      fi
+    done
+    WORD_HARD=("${hard_kept[@]}")
+  fi
 }
 
 # ---- WORD_HARD/WORD_WARN の単語境界(#35) ----------------------------------
@@ -516,10 +578,31 @@ match_verdict() {
     VERDICT='deny'
     return 0
   fi
+  # #44 D3: WORD_SOFT に降格した語の "owner/name" 形の recall 補填。
+  # org/repo 形と同じ曖昧性の無さで hard-deny する点は PLAIN_PATTERNS と
+  # 同じ意味を持つため match_class は共用の 'plain' を使う(新しい
+  # match_class を増やさない — reason_id_for_verdict/verdict_reason も
+  # PLAIN_PATTERNS と分岐を共有できる)。
+  if ((${#NWO_HARD[@]} > 0)) && grep -Eqf <(word_boundary_pattern_file NWO_HARD) <<< "$text"; then
+    MATCH_CLASS='plain'
+    MATCH_TERM="$(find_matched_word NWO_HARD "$text" || true)"
+    VERDICT='deny'
+    return 0
+  fi
   if ((${#WORD_HARD[@]} > 0)) && grep -Eqf <(word_boundary_pattern_file WORD_HARD) <<< "$text"; then
     MATCH_CLASS='word-hard'
     MATCH_TERM="$(find_matched_word WORD_HARD "$text" || true)"
     VERDICT='deny'
+    return 0
+  fi
+  # #44: 長さ ≤ SOFT_MAXLEN の裸リポ名は ask に降格(一般語との偶然一致を
+  # 人間に確認させる、pass にはしない — fail-loud)。allow-regexes による
+  # ask の抑止は WORD_WARN と同じ仕組みを流用する。
+  if ((${#WORD_SOFT[@]} > 0)) && grep -Eqf <(word_boundary_pattern_file WORD_SOFT) <<< "$text"; then
+    text_allow_suppressed "$text" && return 1
+    MATCH_CLASS='word-soft'
+    MATCH_TERM="$(find_matched_word WORD_SOFT "$text" || true)"
+    VERDICT='ask'
     return 0
   fi
   if ((${#WORD_WARN[@]} > 0)) && grep -Eqf <(word_boundary_pattern_file WORD_WARN) <<< "$text"; then
@@ -532,18 +615,32 @@ match_verdict() {
   return 1
 }
 
-verdict_reason() { # $1=deny|ask -> 理由文(bypass 手段はここに書かない。README 参照)
-  case "$1" in
-    deny) printf 'denylist に登録された company/private リポジトリの参照と一致しました。' ;;
-    ask) printf 'denylist に登録された org 名の裸の単体出現と一致しました。正当な用途(例: メールドメイン)か確認してください。' ;;
+# verdict_reason: $1=deny|ask $2=match_class -> 理由文(bypass 手段は
+# ここに書かない。README 参照)。#44: word-soft(短いリポ名の裸一致)は
+# word-warn(org 名の裸一致)と文言を分ける — 語は出さない。
+verdict_reason() {
+  local verdict="$1" match_class="${2:-none}"
+  case "$verdict:$match_class" in
+    deny:*) printf 'denylist に登録された company/private リポジトリの参照と一致しました。' ;;
+    ask:word-soft) printf 'denylist に登録された短いリポジトリ名(%s 文字以下)の裸の単体出現と一致しました。一般語との偶然の一致か確認してください。' "$SOFT_MAXLEN" ;;
+    ask:*) printf 'denylist に登録された org 名の裸の単体出現と一致しました。正当な用途(例: メールドメイン)か確認してください。' ;;
   esac
 }
 
 # match_verdict の結果から reason_id(判定レッジャーの閉語彙)を決める。
-reason_id_for_verdict() { # $1=deny|ask
-  case "$1" in
+# $1=deny|ask $2=match_class。#44: ask の reason_id は match_class で
+# 分岐する(word-soft はリポ名一致なので repo-ref、word-warn は org 名
+# 一致なので org-bare — reason_id の閉語彙自体は変更しない)。
+reason_id_for_verdict() {
+  local verdict="$1" match_class="${2:-none}"
+  case "$verdict" in
     deny) printf 'repo-ref' ;;
-    ask) printf 'org-bare' ;;
+    ask)
+      case "$match_class" in
+        word-soft) printf 'repo-ref' ;;
+        *) printf 'org-bare' ;;
+      esac
+      ;;
   esac
 }
 
@@ -724,7 +821,7 @@ cmd_scan() {
   require_orgs_file
   build_patterns
   if match_verdict "$text"; then
-    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT")" "$(reason_id_for_verdict "$VERDICT")" "$MATCH_CLASS" "$MATCH_TERM"
+    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
   fi
   exit 0
 }
@@ -767,7 +864,9 @@ cmd_explain() {
 
   local found=0
   explain_scan_array plain PLAIN_PATTERNS "$target" && found=1
+  explain_scan_array plain NWO_HARD "$target" && found=1
   explain_scan_array word-hard WORD_HARD "$target" && found=1
+  explain_scan_array word-soft WORD_SOFT "$target" && found=1
   explain_scan_array word-warn WORD_WARN "$target" && found=1
 
   if [[ $found -eq 0 ]]; then
@@ -796,7 +895,7 @@ cmd_scan_push() {
   require_orgs_file
   build_patterns
   if match_verdict "$text"; then
-    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT")" "$(reason_id_for_verdict "$VERDICT")" "$MATCH_CLASS" "$MATCH_TERM"
+    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
   fi
   exit 0
 }
@@ -883,7 +982,7 @@ cmd_scan_bash_command() {
     require_orgs_file
     build_patterns
     if match_verdict "$scan_subject"; then
-      emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT")" "$(reason_id_for_verdict "$VERDICT")" "$MATCH_CLASS" "$MATCH_TERM"
+      emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
     fi
     exit 0
   fi
@@ -1013,17 +1112,20 @@ selftest() {
   printf 'acme/secret-project\n' > "$BLEEP_REPOS_FILE"
 
   # gh をスタブし、private/internal リポ一覧の live 取得を固定内容にする。
-  # 実際の呼び出しは常に --jq を付ける(--json name --jq '.[].name' /
-  # --json visibility --jq .visibility)ので、スタブも jq 適用後の値を返す。
+  # 実際の呼び出しは常に --jq を付ける(--json nameWithOwner --jq
+  # '.[].nameWithOwner' / --json visibility --jq .visibility)ので、
+  # スタブも jq 適用後の値を返す。#44: "wren" は長さ4の架空リポ名
+  # (CONTRIBUTING の架空名規約、SOFT_MAXLEN=4 の既定値で降格される側の
+  # 境界例)。
   cat > "$tmp/bin-gh" <<'STUB'
 #!/usr/bin/env bash
-# repo list は private/internal どちらの呼び出しでも同じ名前を返す(重複は
+# repo list は private/internal どちらの呼び出しでも同じ一覧を返す(重複は
 # refresh_private_repo_cache 側の sort -u が畳む)。テストが見たいのは
 # 「orgs.txt の org 名だけから private リポ名が導出される」という経路の
 # 有無であり、private/internal の呼び分け自体は本体側の実装(--visibility
 # を private/internal で2回呼ぶ)でカバーする。
 case "$1 $2" in
-  "repo list") printf 'my-private-tool\n' ;;
+  "repo list") printf 'test-owner/my-private-tool\ntest-owner/wren\n' ;;
   "repo view") printf 'PUBLIC' ;;
   "api user") printf 'test-owner' ;;
   *) exit 1 ;;
@@ -1079,6 +1181,54 @@ STUB
   fi
   if cmd_explain 'not-a-hash' > /dev/null 2>&1; then
     echo "FAIL(explain: hex64 でない引数は非 0 を返すべき)" >&2
+    fails=$((fails + 1))
+  fi
+
+  # #44: WORD_HARD のうち長さ ≤ SOFT_MAXLEN(既定4)の裸名は WORD_SOFT
+  # (ask)へ降格し、live sweep 由来の owner が分かれば "owner/name" 形を
+  # NWO_HARD(hard-deny)へ足して recall を補う。"wren" は長さ4の架空
+  # private リポ名(gh スタブが test-owner/wren を返す)。
+  expect_verdict ask "wren の話"
+  expect_verdict deny "test-owner/wren の話" # NWO_HARD が recall を補う
+  expect_verdict pass "test-owner/wren-app" # ハイフン複合語は非境界(#35 と同じ規律)
+  explain_out="$(cmd_explain "$(term_hash wren)")"
+  [[ $explain_out == $'word-soft\twren' ]] || {
+    echo "FAIL(explain: word-soft 一致): out=[$explain_out]" >&2
+    fails=$((fails + 1))
+  }
+  explain_out="$(cmd_explain "$(term_hash test-owner/wren)")"
+  [[ $explain_out == $'plain\ttest-owner/wren' ]] || {
+    echo "FAIL(explain: NWO_HARD 一致(match_class=plain)): out=[$explain_out]" >&2
+    fails=$((fails + 1))
+  }
+
+  # allow-stopwords は WORD_SOFT にも及ぶ(WORD_HARD からの分岐元と同じ配列
+  # を降格前にフィルタしているため)。
+  printf 'wren\n' > "$BLEEP_ALLOW_STOPWORDS_FILE"
+  expect_verdict pass "wren の話"
+  expect_verdict pass "test-owner/wren の話"
+  : > "$BLEEP_ALLOW_STOPWORDS_FILE"
+
+  # allow-regexes は word-soft の ask も抑止できる(WORD_WARN と同じ経路)。
+  printf 'wren の話ではない\n' > "$BLEEP_ALLOW_REGEXES_FILE"
+  expect_verdict pass "wren の話ではない、別件だ"
+  expect_verdict ask "wren の話" # 抑止対象外の文では引き続き ask
+  : > "$BLEEP_ALLOW_REGEXES_FILE"
+
+  # BLEEP_SOFT_MAXLEN=0 は降格を無効化し、#46 までの挙動(裸名は常に
+  # hard-deny)に戻す。init_vars が読む env var なので外部プロセスで検証する。
+  set +e
+  out="$(BLEEP_SOFT_MAXLEN=0 "$SELF" scan <<< "wren の話" 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(BLEEP_SOFT_MAXLEN=0 で降格無効): rc=$rc out=$out" >&2; fails=$((fails + 1)); }
+
+  # 旧形式(裸名のみ)キャッシュを置いても、次回参照時に TTL 無視で
+  # 自動再取得され owner/name 形に復元される(#44 D5)。
+  printf 'my-private-tool\n' > "$PRIVATE_CACHE"
+  build_patterns
+  if [[ -f $PRIVATE_CACHE ]] && grep -qv '/' "$PRIVATE_CACHE"; then
+    echo "FAIL(旧形式 cache が owner/name 形に再取得されていない): $(cat "$PRIVATE_CACHE")" >&2
     fails=$((fails + 1))
   fi
 
