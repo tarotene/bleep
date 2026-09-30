@@ -176,6 +176,37 @@ pub struct SegClassification {
     pub kind_is_gh_publish: bool,
     pub dir_override: Option<String>,
     pub repo_override: Option<String>,
+    /// gh の宛先を静的に決められない(gh api の API パスが repos/<owner>/<repo>
+    /// で始まらない、等)。宛先の可視性による pass をせず、公開宛てとみなして
+    /// 検査する側(fail-loud)に倒す(#58)。
+    pub dest_unknown: bool,
+}
+
+enum ApiDest {
+    /// `repos/<owner>/<repo>/…` の owner/repo をリテラルで取り出せた。
+    Repo(String),
+    /// `{owner}`/`{repo}` プレースホルダ。gh が cwd の origin で展開する。
+    Cwd,
+}
+
+/// gh api の位置引数(API パス)から宛先を取り出す。`repos/` で始まらない
+/// パスは None(宛先を決められない)。
+fn api_path_repo(path: &str) -> Option<ApiDest> {
+    let rest = path.trim_start_matches('/').strip_prefix("repos/")?;
+    let mut it = rest.split('/');
+    let owner = it.next().filter(|s| !s.is_empty())?;
+    let repo = it
+        .next()
+        .and_then(|s| s.split('?').next())
+        .filter(|s| !s.is_empty())?;
+    if owner.contains('{') || repo.contains('{') {
+        return Some(ApiDest::Cwd);
+    }
+    // 変数展開・コマンド置換を含む値はリテラルとして信用しない。
+    if owner.contains('$') || repo.contains('$') {
+        return None;
+    }
+    Some(ApiDest::Repo(format!("{owner}/{repo}")))
 }
 
 /// tokenize_segment の代替。POSIX のクォート/エスケープ規則で単語分割する
@@ -307,26 +338,79 @@ pub fn classify_segment(seg: &str) -> SegClassification {
                 } else if sub == "gist" && action == "create" {
                     result.kind_is_gh_publish = true; // gh gist create
                 } else if sub == "api" {
-                    // gh api は --repo を取らない。書き込みメソッドの有無だけ見る
-                    // (Bash 版の for ループと同じ意味論 — スキップせず全トークンを
-                    // 舐めて、最後に一致した値を採用する)。
+                    // gh api は --repo を取らない。メソッド(-X/--method、最後に
+                    // 一致した値を採用)、フィールド引数の有無、宛先を決める
+                    // API パス(最初の位置引数)を見る。
                     let mut method = String::new();
+                    let mut has_field = false;
+                    let mut path: Option<&str> = None;
                     let rest = &t[idx + 1..];
-                    for j in 0..rest.len() {
+                    let mut j = 0usize;
+                    while j < rest.len() {
                         match rest[j].as_str() {
                             "-X" | "--method" => {
                                 if let Some(v) = rest.get(j + 1) {
                                     method = v.clone();
                                 }
+                                j += 2;
                             }
                             s if s.starts_with("--method=") => {
                                 method = s.trim_start_matches("--method=").to_string();
+                                j += 1;
                             }
-                            _ => {}
+                            "-f" | "-F" | "--field" | "--raw-field" | "--input" => {
+                                has_field = true;
+                                j += 2;
+                            }
+                            s if s.starts_with("--field=")
+                                || s.starts_with("--raw-field=")
+                                || s.starts_with("--input=") =>
+                            {
+                                has_field = true;
+                                j += 1;
+                            }
+                            // 値を1個取るその他のフラグ。値を位置引数と誤認しない。
+                            "-H" | "--header" | "-q" | "--jq" | "-t" | "--template" | "--cache"
+                            | "-p" | "--preview" | "--hostname" | "-R" | "--repo" => {
+                                j += 2;
+                            }
+                            s if s.starts_with('-') => {
+                                j += 1;
+                            }
+                            s => {
+                                if path.is_none() {
+                                    path = Some(s);
+                                }
+                                j += 1;
+                            }
                         }
                     }
-                    if matches!(method.to_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
+                    // gh api の既定は GET、フィールド引数(-f/-F/--field/
+                    // --raw-field/--input)があれば POST(gh api --help、#57)。
+                    // -X の明示は常にそれを優先する。
+                    let effective = if method.is_empty() {
+                        if has_field {
+                            "POST"
+                        } else {
+                            "GET"
+                        }
+                    } else {
+                        method.as_str()
+                    };
+                    if matches!(effective.to_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
                         result.kind_is_gh_publish = true;
+                        // 宛先は API パスに書かれる(#58)。-R/--repo で明示されて
+                        // いればそちらを優先する。`{owner}/{repo}` のプレース
+                        // ホルダは gh が cwd の origin で展開するので、従来どおり
+                        // cwd から解決する。それ以外(graphql、repos/ 以外のパス、
+                        // パス無し)は宛先を静的に決められない。
+                        if result.repo_override.is_none() {
+                            match path.and_then(api_path_repo) {
+                                Some(ApiDest::Repo(nwo)) => result.repo_override = Some(nwo),
+                                Some(ApiDest::Cwd) => {}
+                                None => result.dest_unknown = true,
+                            }
+                        }
                     }
                 }
             }
@@ -463,6 +547,10 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
         if c.kind_is_gh_publish && !result.found_gh {
             result.found_gh = true;
             match c.repo_override {
+                // 宛先を静的に決められない(#58)。override も effective_dir も
+                // 空のまま返し、呼び出し側(bleep)が可視性による pass を飛ばして
+                // 公開宛てとして検査する。
+                None if c.dest_unknown => {}
                 Some(r) => {
                     // gh の --repo/-R の値自体は cd/-C と異なりパスではない
                     // ため expand_home は適用しない。未展開の `$` が残って
@@ -747,6 +835,60 @@ mod tests {
         assert!(c.kind_is_gh_publish);
         let c = classify_segment(r#"gh api repos/acme/secret --method=GET"#);
         assert!(!c.kind_is_gh_publish);
+    }
+
+    #[test]
+    fn gh_api_field_without_method_is_implicit_post() {
+        // #57: -X が無くても -f/-F/--field/--raw-field/--input があれば POST。
+        for cmd in [
+            r#"gh api repos/pub/repo/issues -f body=x"#,
+            r#"gh api repos/pub/repo/issues -F body=@f"#,
+            r#"gh api repos/pub/repo/issues --field body=x"#,
+            r#"gh api repos/pub/repo/issues --raw-field=body=x"#,
+            r#"gh api repos/pub/repo/issues --input f.json"#,
+        ] {
+            assert!(classify_segment(cmd).kind_is_gh_publish, "{cmd}");
+        }
+        // -X GET の明示は読み取りのまま。フィールド無しの既定も GET。
+        assert!(
+            !classify_segment(r#"gh api -X GET repos/pub/repo/issues -f q=x"#).kind_is_gh_publish
+        );
+        assert!(!classify_segment(r#"gh api repos/pub/repo/issues"#).kind_is_gh_publish);
+    }
+
+    #[test]
+    fn gh_api_destination_from_path() {
+        // #58: 宛先は API パス(先頭 / の有無を問わない)。
+        let c = classify_segment(r#"gh api -X POST repos/pub/repo/issues -f body=x"#);
+        assert_eq!(c.repo_override.as_deref(), Some("pub/repo"));
+        assert!(!c.dest_unknown);
+        let c = classify_segment(r#"gh api -X POST /repos/pub/repo/issues/1/comments -f body=x"#);
+        assert_eq!(c.repo_override.as_deref(), Some("pub/repo"));
+        // フラグの値(-H の値)を位置引数と取り違えない。
+        let c = classify_segment(r#"gh api -H "Accept: x" -X POST repos/pub/repo/issues -f a=b"#);
+        assert_eq!(c.repo_override.as_deref(), Some("pub/repo"));
+        // プレースホルダは cwd 解決(override なし、dest_unknown なし)。
+        let c = classify_segment(r#"gh api -X POST repos/{owner}/{repo}/issues -f a=b"#);
+        assert!(c.repo_override.is_none() && !c.dest_unknown);
+        // graphql・repos/ 以外・パス無し・変数を含むものは宛先不明。
+        for cmd in [
+            r#"gh api graphql -f query=x"#,
+            r#"gh api -X POST user/repos -f name=x"#,
+            r#"gh api -X POST -f a=b"#,
+            r#"gh api -X POST repos/$O/repo/issues -f a=b"#,
+        ] {
+            let c = classify_segment(cmd);
+            assert!(c.kind_is_gh_publish && c.dest_unknown, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn dest_unknown_clears_repo_and_dir() {
+        let r = analyze(r#"gh api graphql -f query=x"#, "/work", None);
+        assert!(r.found_gh);
+        assert_eq!(r.gh_repo_override, "");
+        assert_eq!(r.gh_effective_dir, "");
+        assert!(!r.unresolved_var);
     }
 
     #[test]

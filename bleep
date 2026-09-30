@@ -966,7 +966,10 @@ cmd_scan_bash_command() {
 
   if [[ $found_gh == "1" ]]; then
     local gh_nwo="$gh_repo_override"
-    if [[ -z $gh_nwo ]]; then
+    # gh_effective_dir も空なら宛先を静的に決められなかった(#58: gh api
+    # graphql 等)。cwd の origin に解決して PRIVATE と誤認しないよう、宛先
+    # 解決自体を飛ばして公開宛てとして検査する。
+    if [[ -z $gh_nwo && -n $gh_effective_dir ]]; then
       local saved_target="$TARGET_CWD"
       TARGET_CWD="$gh_effective_dir"
       gh_nwo="$(resolve_repo_nwo)" || gh_nwo=""
@@ -1704,6 +1707,39 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(複数 cd: 最後の cd を反映すること): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #57/#58: gh api の宛先は API パス(repos/<owner>/<repo>/…)から解決し、
+  # -X の無い -f/-F は暗黙の POST として書き込みに分類する。cwd は PRIVATE
+  # な repo_priv(remote-priv)で、宛先だけが違う。
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view")
+    case "$3" in
+      *remote-priv*) printf 'PRIVATE' ;;
+      *) printf 'PUBLIC' ;;
+    esac
+    ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  local api_cmd api_want
+  while IFS='|' read -r api_want api_cmd; do
+    set +e
+    (cd "$repo_priv" && "$SELF" scan-bash-command "$api_cmd") > /dev/null 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq $api_want ]] || { echo "FAIL(gh api 宛先/暗黙 POST: $api_cmd): 期待=$api_want 実際=$rc" >&2; fails=$((fails + 1)); }
+  done <<'CASES'
+2|gh api -X POST repos/pub/repo/issues -f body="acme/secret-project"
+2|gh api repos/pub/repo/issues -f body="acme/secret-project"
+2|gh api graphql -f query="acme/secret-project"
+0|gh api repos/{owner}/{repo}/issues -f body="acme/secret-project"
+0|gh api -X GET repos/pub/repo/issues -f q="acme/secret-project"
+CASES
 
   # #9/#14 の組み合わせ: cd のパスに private リポ名を含み、かつ gh 側に
   # --repo で別の PUBLIC リポを明示している場合、visibility は --repo 側で
