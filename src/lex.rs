@@ -110,7 +110,7 @@ pub fn split_command_segments(cmd: &str) -> Vec<String> {
 /// 文字列を返す(前後の空白は許容、ターゲット自体に空白は含まない)。
 /// resolve_effective_dir と scan_subject の cd 除外の両方で使う共通判定
 /// (Bash 版では同じ正規表現が2箇所にコピーされている — ここでは共有する)。
-fn as_single_cd_target(seg: &str) -> Option<&str> {
+pub(crate) fn as_single_cd_target(seg: &str) -> Option<&str> {
     let rest = seg.trim_start();
     let rest = rest.strip_prefix("cd")?;
     let rest = rest.strip_prefix(|c: char| c.is_ascii_whitespace())?;
@@ -193,6 +193,12 @@ pub struct SegClassification {
     /// URL の remote・未展開の変数を含む refspec など静的に決められない
     /// ものは空(呼び出し側は default branch 基準の従来経路に戻る、#54)。
     pub push_spec: String,
+    /// gh の投稿の面(pr/issue/release/repo/gist/api)と操作(create/edit/
+    /// comment、gh api は小文字のメソッド)。`bleep-hook intent` が使う(#56)。
+    pub gh_surface: String,
+    pub gh_action: String,
+    /// repo_override が -R/--repo ではなく gh api の API パスから取れた(#58)。
+    pub repo_from_api_path: bool,
 }
 
 /// `git push [opts] [<remote> [<refspec>…]]` の引数(`push` の後ろ)から
@@ -554,13 +560,23 @@ pub fn classify_segment(seg: &str) -> SegClassification {
                         // ホルダは gh が cwd の origin で展開するので、従来どおり
                         // cwd から解決する。それ以外(graphql、repos/ 以外のパス、
                         // パス無し)は宛先を静的に決められない。
+                        result.gh_action = effective.to_lowercase();
                         if result.repo_override.is_none() {
                             match path.and_then(api_path_repo) {
-                                Some(ApiDest::Repo(nwo)) => result.repo_override = Some(nwo),
+                                Some(ApiDest::Repo(nwo)) => {
+                                    result.repo_override = Some(nwo);
+                                    result.repo_from_api_path = true;
+                                }
                                 Some(ApiDest::Cwd) => {}
                                 None => result.dest_unknown = true,
                             }
                         }
+                    }
+                }
+                if result.kind_is_gh_publish {
+                    result.gh_surface = sub.to_string();
+                    if sub != "api" {
+                        result.gh_action = action.to_string();
                     }
                 }
             }
@@ -639,12 +655,54 @@ fn strip_repo_override_tokens(seg: &str) -> String {
 /// 返す(#34)。resolve_effective_dir 自身の絶対/相対分岐を変えず、同じ
 /// 対象を辿って `$` の有無だけを見る副関数として持つ(判断を運ばない継ぎ目
 /// — 実際の実効ディレクトリの計算は resolve_effective_dir の正本のまま)。
-fn cd_chain_has_unresolved_var(segments: &[String], upto: usize, home: Option<&str>) -> bool {
+pub(crate) fn cd_chain_has_unresolved_var(
+    segments: &[String],
+    upto: usize,
+    home: Option<&str>,
+) -> bool {
     segments.iter().take(upto).any(|seg| {
         as_single_cd_target(seg)
             .map(|tgt| expand_home(tgt, home).contains('$'))
             .unwrap_or(false)
     })
+}
+
+/// セグメント `segments[i]` の本文の入力元を、実効ディレクトリ基準の絶対
+/// パスに解決する(#55)。戻り値の bool は、静的に解決できないもの(パスに
+/// 未展開の `$`・バッククォート、未解決の cd 経由の相対パス、コマンド置換で
+/// 作った本文)があったか。`bleep-hook intent` と共有する。
+pub(crate) fn resolve_body_sources(
+    c: &SegClassification,
+    segments: &[String],
+    i: usize,
+    start_dir: &str,
+    home: Option<&str>,
+) -> (Vec<String>, bool) {
+    let mut unresolved = c.body_dynamic;
+    let mut out: Vec<String> = Vec::new();
+    if c.body_files.is_empty() {
+        return (out, unresolved);
+    }
+    let dir_unresolved = cd_chain_has_unresolved_var(segments, i, home);
+    let dir = resolve_effective_dir(start_dir, segments, i, home);
+    for p in &c.body_files {
+        let p = expand_home(p, home);
+        let has_var = p.contains('$') || p.contains('`');
+        let odd = p.contains('\\') || p.contains('\n');
+        if has_var || odd || (!p.starts_with('/') && dir_unresolved) {
+            unresolved = true;
+            continue;
+        }
+        let abs = if p.starts_with('/') {
+            p
+        } else {
+            format!("{dir}/{p}")
+        };
+        if !out.contains(&abs) {
+            out.push(abs);
+        }
+    }
+    (out, unresolved)
 }
 
 pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult {
@@ -671,28 +729,11 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
         }
 
         if c.kind_is_gh_publish && as_single_cd_target(seg).is_none() {
-            if c.body_dynamic {
-                result.body_unresolved = true;
-            }
-            if !c.body_files.is_empty() {
-                let dir_unresolved = cd_chain_has_unresolved_var(&segments, i, home);
-                let dir = resolve_effective_dir(start_dir, &segments, i, home);
-                for p in &c.body_files {
-                    let p = expand_home(p, home);
-                    let has_var = p.contains('$') || p.contains('`');
-                    let odd = p.contains('\\') || p.contains('\n');
-                    if has_var || odd || (!p.starts_with('/') && dir_unresolved) {
-                        result.body_unresolved = true;
-                        continue;
-                    }
-                    let abs = if p.starts_with('/') {
-                        p
-                    } else {
-                        format!("{dir}/{p}")
-                    };
-                    if !result.body_sources.contains(&abs) {
-                        result.body_sources.push(abs);
-                    }
+            let (paths, unresolved) = resolve_body_sources(&c, &segments, i, start_dir, home);
+            result.body_unresolved |= unresolved;
+            for abs in paths {
+                if !result.body_sources.contains(&abs) {
+                    result.body_sources.push(abs);
                 }
             }
         }

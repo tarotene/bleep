@@ -1,5 +1,6 @@
 mod hash;
 mod host;
+mod intent;
 mod lex;
 
 use std::env;
@@ -9,6 +10,7 @@ fn usage() -> String {
     "\
 usage: bleep-hook --host=<claude|codex|copilot>
        bleep-hook lex [--cwd DIR] -- CMD
+       bleep-hook intent [--cwd DIR] -- CMD
        bleep-hook hash --key-file FILE -- TERM
 
 --host=<name>   PreToolUse hook adapter モード。stdin から host 固有の JSON
@@ -28,6 +30,11 @@ lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
                 は gh の本文の入力元をコマンド行から静的に解決できなかった
                 ことを示し、パスは gh の --body-file 等をコマンド実行
                 ディレクトリ基準で解決済みの絶対パス(#55)。
+intent          gh の投稿コマンドから「投稿の意図」(面・操作・宛先・本文の
+                入力元パス・解決不能フラグ)を取り出し、投稿セグメントごとの
+                JSON 配列を stdout に書く(#56)。lex と同じく I/O・gh は
+                一切行わない。書式と適合 fixture は src/intent.rs と
+                tests/fixtures/intent/。
 hash            bleep(Bash)本体の判定レッジャー(ledger_write)から呼ばれる。
                 FILE に保存された鍵(無ければ新規生成)で TERM を
                 HMAC-SHA256 し、hex を1行 stdout に印字する。
@@ -39,6 +46,37 @@ fn escape_line(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+fn cmd_intent(cwd: &str, cmd: &str) {
+    let home = env::var("HOME").ok();
+    println!("{}", intent::intents(cmd, cwd, home.as_deref()));
+}
+
+/// `lex` / `intent` 共通の引数解析: `[--cwd DIR] [--] CMD`。
+fn parse_cwd_and_cmd(name: &str, args: &[String]) -> Result<(String, String), ExitCode> {
+    let mut cwd = ".".to_string();
+    let mut rest = args;
+    if let Some(v) = rest.first() {
+        if v == "--cwd" {
+            let Some(dir) = rest.get(1) else {
+                eprintln!("--cwd requires a value\n\n{}", usage());
+                return Err(ExitCode::from(2));
+            };
+            cwd = dir.clone();
+            rest = &rest[2..];
+        }
+    }
+    let rest = if rest.first().map(String::as_str) == Some("--") {
+        &rest[1..]
+    } else {
+        rest
+    };
+    let Some(cmd) = rest.first() else {
+        eprintln!("{name}: missing CMD\n\n{}", usage());
+        return Err(ExitCode::from(2));
+    };
+    Ok((cwd, cmd.clone()))
 }
 
 fn cmd_lex(cwd: &str, cmd: &str) {
@@ -93,29 +131,16 @@ fn main() -> ExitCode {
                 }
             };
         }
-        if first == "lex" {
-            let mut cwd = ".".to_string();
-            let mut rest = &args[1..];
-            if let Some(v) = rest.first() {
-                if v == "--cwd" {
-                    let Some(dir) = rest.get(1) else {
-                        eprintln!("--cwd requires a value\n\n{}", usage());
-                        return ExitCode::from(2);
-                    };
-                    cwd = dir.clone();
-                    rest = &rest[2..];
-                }
-            }
-            let rest = if rest.first().map(String::as_str) == Some("--") {
-                &rest[1..]
+        if first == "lex" || first == "intent" {
+            let (cwd, cmd) = match parse_cwd_and_cmd(first, &args[1..]) {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            if first == "lex" {
+                cmd_lex(&cwd, &cmd);
             } else {
-                rest
-            };
-            let Some(cmd) = rest.first() else {
-                eprintln!("lex: missing CMD\n\n{}", usage());
-                return ExitCode::from(2);
-            };
-            cmd_lex(&cwd, cmd);
+                cmd_intent(&cwd, &cmd);
+            }
             return ExitCode::SUCCESS;
         }
         if first == "hash" {

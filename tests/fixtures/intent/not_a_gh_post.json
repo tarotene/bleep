@@ -1,0 +1,5 @@
+{
+  "command": "git push origin main && gh pr view 1",
+  "cwd": "/work",
+  "expect": []
+}
