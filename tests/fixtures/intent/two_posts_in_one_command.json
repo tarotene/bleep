@@ -1,0 +1,8 @@
+{
+  "command": "gh issue create -R pub/one --body-file a.md && gh issue comment 2 -R pub/two -F c.md",
+  "cwd": "/work",
+  "expect": [
+    {"surface": "issue", "action": "create", "repo_source": "flag", "repo": "pub/one", "cwd": null, "body_sources": ["/work/a.md"], "unresolved": false},
+    {"surface": "issue", "action": "comment", "repo_source": "flag", "repo": "pub/two", "cwd": null, "body_sources": ["/work/c.md"], "unresolved": false}
+  ]
+}

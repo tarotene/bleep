@@ -1,0 +1,7 @@
+{
+  "command": "cd $D && gh pr create --title t",
+  "cwd": "/work",
+  "expect": [
+    {"surface": "pr", "action": "create", "repo_source": "cwd", "repo": null, "cwd": "/work/$D", "body_sources": [], "unresolved": true}
+  ]
+}

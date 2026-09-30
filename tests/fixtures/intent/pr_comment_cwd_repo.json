@@ -1,0 +1,7 @@
+{
+  "command": "gh pr comment 1 --body hi",
+  "cwd": "/work",
+  "expect": [
+    {"surface": "pr", "action": "comment", "repo_source": "cwd", "repo": null, "cwd": "/work", "body_sources": [], "unresolved": false}
+  ]
+}

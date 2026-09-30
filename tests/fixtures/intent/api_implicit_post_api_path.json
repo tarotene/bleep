@@ -1,0 +1,7 @@
+{
+  "command": "gh api repos/pub/repo/issues -f title=t -F body=@b.md",
+  "cwd": "/work",
+  "expect": [
+    {"surface": "api", "action": "post", "repo_source": "api-path", "repo": "pub/repo", "cwd": null, "body_sources": ["/work/b.md"], "unresolved": false}
+  ]
+}

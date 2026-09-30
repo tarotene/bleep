@@ -1,0 +1,7 @@
+{
+  "command": "gh issue create -R pub/repo --title t --body-file body.md",
+  "cwd": "/work",
+  "expect": [
+    {"surface": "issue", "action": "create", "repo_source": "flag", "repo": "pub/repo", "cwd": null, "body_sources": ["/work/body.md"], "unresolved": false}
+  ]
+}
