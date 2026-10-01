@@ -5,6 +5,14 @@ edition = "2021"
 description = "Host adapter + command lexer for bleep's PreToolUse hooks"
 license = "MIT"
 repository = "https://github.com/tarotene/bleep"
+# crates.io へは publish しない。唯一の利用者は tarotene/dotfiles の flake で、
+# `bleepHookOverlay` が pin した git input から crane でビルドして配備する —
+# レジストリ経由では取らない。publish 可能なままにしておくと、release
+# workflow が存在しない crate を publish しようとして毎回失敗する
+# (tarotene/dotfiles#659)。将来 publish するなら、まず手動の bootstrap
+# publish が必要になる(Trusted Publishing は crate が既に crates.io に
+# 存在することを要求する)。
+publish = false
 
 [[bin]]
 name = "bleep-hook"
