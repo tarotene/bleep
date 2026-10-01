@@ -1,0 +1,6 @@
+{
+  "command": "gh gist create /tmp/a.txt --desc d",
+  "expect": [
+    {"surface": "gist", "action": "create", "repo_source": "none", "repo": null, "body_sources": ["/tmp/a.txt"], "canonical": true, "noncanonical_reason": null}
+  ]
+}

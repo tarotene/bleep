@@ -1,0 +1,6 @@
+{
+  "command": "gh issue create --title t --body-file /tmp/body.md",
+  "expect": [
+    {"surface": "issue", "action": "create", "repo_source": "none", "repo": null, "body_sources": ["/tmp/body.md"], "canonical": false, "noncanonical_reason": "no-repo"}
+  ]
+}

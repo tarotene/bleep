@@ -1,0 +1,6 @@
+{
+  "command": "gh release create v1 -R pub/repo --notes-file /tmp/notes.md --title v1",
+  "expect": [
+    {"surface": "release", "action": "create", "repo_source": "flag", "repo": "pub/repo", "body_sources": ["/tmp/notes.md"], "canonical": true, "noncanonical_reason": null}
+  ]
+}

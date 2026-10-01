@@ -1,7 +1,0 @@
-{
-  "command": "gh api -X PATCH /repos/pub/repo/issues/1 --input /tmp/in.json",
-  "cwd": "/work",
-  "expect": [
-    {"surface": "api", "action": "patch", "repo_source": "api-path", "repo": "pub/repo", "cwd": null, "body_sources": ["/tmp/in.json"], "unresolved": false}
-  ]
-}

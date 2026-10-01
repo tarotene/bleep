@@ -1,0 +1,6 @@
+{
+  "command": "gh repo edit pub/repo --description d",
+  "expect": [
+    {"surface": "repo", "action": "edit", "repo_source": "positional", "repo": "pub/repo", "body_sources": [], "canonical": true, "noncanonical_reason": null}
+  ]
+}

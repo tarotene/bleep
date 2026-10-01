@@ -1,0 +1,6 @@
+{
+  "command": "gh issue create -R pub/repo --body-file /dev/stdin <<EOF\nit's here\nEOF",
+  "expect": [
+    {"surface": "unknown", "action": "", "repo_source": "none", "repo": null, "body_sources": [], "canonical": false, "noncanonical_reason": "unparsable"}
+  ]
+}

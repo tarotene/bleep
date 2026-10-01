@@ -1,7 +1,15 @@
-//! bleep 本体(Bash)の `split_command_segments` / `tokenize_segment` /
-//! `classify_segment` / `resolve_effective_dir` の移植(D1)。純粋関数のみ —
-//! I/O・gh・キャッシュは一切触らない。`match_verdict` / `build_patterns` /
-//! `resolve_repo_nwo` は正本が Bash 実装のまま(判断を運ばない継ぎ目)。
+//! コマンド文字列の字句解析(D1)。純粋関数のみ — I/O・gh・キャッシュは一切
+//! 触らない。`match_verdict` / `build_patterns` / `resolve_repo_nwo` は正本が
+//! Bash 実装のまま(判断を運ばない継ぎ目)。
+//!
+//! コマンドを `;` `&&` `||` `|` 改行でセグメントに分け、セグメントごとに
+//! `git push`(pre-push を迂回する形かどうか)と `gh` の投稿(正準形かどうか、
+//! `grammar.rs`)を分類する。`env`・`sudo`・`timeout` などの前置、
+//! `sh -c '…'`・`eval '…'`、`$(…)`・バッククォートの中身は、同じ分類に
+//! 再帰して通す(docs/adr/0003-constructive-grammar.md)。cd の追跡や変数の
+//! 解決はしない — 解決が要る形(相対パス、変数)は、そもそも文法の外にする。
+
+use crate::grammar::{self, GhPost};
 
 /// split_command_segments の移植。演算子(`;` `&&` `||` `|&` 単独の `&`/`|`
 /// および改行)でコマンドをセグメントに分割する。クォート境界の判定は
@@ -108,8 +116,8 @@ pub fn split_command_segments(cmd: &str) -> Vec<String> {
 
 /// セグメントが「厳密に `cd <単一トークン>`」だけであれば、そのターゲット
 /// 文字列を返す(前後の空白は許容、ターゲット自体に空白は含まない)。
-/// resolve_effective_dir と scan_subject の cd 除外の両方で使う共通判定
-/// (Bash 版では同じ正規表現が2箇所にコピーされている — ここでは共有する)。
+/// scan_subject から cd セグメントを除く判定(#9 — cd のパスに private リポ名が
+/// 含まれるだけでは deny しない)。
 pub(crate) fn as_single_cd_target(seg: &str) -> Option<&str> {
     let rest = seg.trim_start();
     let rest = rest.strip_prefix("cd")?;
@@ -122,505 +130,277 @@ pub(crate) fn as_single_cd_target(seg: &str) -> Option<&str> {
     }
 }
 
-/// `~`/`~/…`/`$HOME`/`$HOME/…`/`${HOME}`/`${HOME}/…` の先頭一致だけを、呼び
-/// 出し元(main.rs)が読んだ hook プロセス自身の `HOME` に展開する
-/// (#39)。閉じた集合以外(`~user`、`$HOMEBREW/…`、
-/// `${HOME_X}` 等)は展開しない — 変数一般の静的解決は依然しない設計を維持
-/// する(#34 とは別問題のまま切り分ける)。`home` が `None`(HOME 未設定)
-/// なら常に未加工で返す。
-fn expand_home(tok: &str, home: Option<&str>) -> String {
-    let Some(home) = home else {
-        return tok.to_string();
-    };
-    for prefix in ["~", "$HOME", "${HOME}"] {
-        if tok == prefix {
-            return home.to_string();
+/// 分類の結果。1 つのセグメントから複数出ることがある(`sh -c` や `$(…)` の中)。
+#[derive(Debug, Clone)]
+pub enum Item {
+    /// `git push`。`bypass` は pre-push を無効にする形(`--no-verify`、
+    /// `-c core.hooksPath=…`)。
+    Push { bypass: bool },
+    /// `gh` の投稿(表に載ったコマンド)。正準形かどうかは `noncanonical`。
+    Gh(GhPost),
+}
+
+/// 再帰の深さの上限(`sh -c` の中の `sh -c` …)。超えた中身は見ない — 検出の
+/// 範囲であって、セキュリティ境界ではない(README)。
+const MAX_DEPTH: usize = 3;
+
+/// コマンドの前に付けて、後ろのコマンドをそのまま実行する語。
+const WRAPPERS: [&str; 13] = [
+    "env", "command", "exec", "nohup", "time", "nice", "sudo", "doas", "timeout", "xargs",
+    "stdbuf", "setsid", "ionice",
+];
+const SHELLS: [&str; 5] = ["sh", "bash", "zsh", "dash", "ksh"];
+
+fn basename(s: &str) -> &str {
+    s.rsplit('/').next().unwrap_or(s)
+}
+
+/// 先頭の `(` `{` はサブシェル/グループの開き。語の本体だけを返す。
+fn word(tok: &str) -> &str {
+    tok.trim_start_matches(['(', '{'])
+}
+
+/// `NAME=value` 形の代入か。
+fn is_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((n, _)) => {
+            !n.is_empty()
+                && n.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
-        if let Some(rest) = tok.strip_prefix(prefix) {
-            if rest.starts_with('/') {
-                return format!("{home}{rest}");
-            }
-        }
+        None => false,
     }
-    tok.to_string()
 }
 
-/// resolve_effective_dir の移植: `segments[..upto]` を先頭から歩き、厳密に
-/// `cd <単一トークン>` と一致するセグメントだけを反映した実効ディレクトリを
-/// 返す。絶対パスはそのまま、相対パスは直前の実効ディレクトリに連結する。
-/// ターゲットには `expand_home` を通す(#39) — それ以外の変数展開はしない
-/// (静的解析の範囲外)。
-pub fn resolve_effective_dir(
-    start_dir: &str,
-    segments: &[String],
-    upto: usize,
-    home: Option<&str>,
-) -> String {
-    let mut dir = start_dir.to_string();
-    for seg in segments.iter().take(upto) {
-        if let Some(tgt) = as_single_cd_target(seg) {
-            let tgt = expand_home(tgt, home);
-            if tgt.starts_with('/') {
-                dir = tgt;
-            } else {
-                dir = format!("{dir}/{tgt}");
-            }
+/// 代入・サブシェルの開き・`!`・前置の語を読み飛ばして、実際のコマンド語の
+/// 位置を返す。前置の語(env、sudo、timeout …)はオプションの形が語ごとに違う
+/// ので、後ろに最初に現れる gh / git / シェルの位置までを前置として飛ばす。
+/// 見つからなければ `t.len()`。
+fn command_start(t: &[String]) -> usize {
+    let mut i = 0usize;
+    while i < t.len() {
+        let w = word(&t[i]);
+        if w.is_empty() || w == "!" || is_assignment(w) {
+            i += 1;
+            continue;
         }
+        if WRAPPERS.contains(&basename(w)) {
+            let found = (i + 1..t.len()).find(|&j| {
+                let b = basename(word(&t[j]));
+                b == "gh" || b == "git" || b == "eval" || SHELLS.contains(&b)
+            });
+            return found.unwrap_or(t.len());
+        }
+        return i;
     }
-    dir
+    t.len()
 }
 
-#[derive(Debug, Default)]
-pub struct SegClassification {
-    pub kind_is_push: bool,
-    pub kind_is_gh_publish: bool,
-    pub repo_override: Option<String>,
-    /// gh の宛先を静的に決められない(gh api の API パスが repos/<owner>/<repo>
-    /// で始まらない、等)。宛先の可視性による pass をせず、公開宛てとみなして
-    /// 検査する側(fail-loud)に倒す(#58)。
-    pub dest_unknown: bool,
-    /// gh の本文をファイルから読む入力元(`--body-file`、`gh pr|issue` の
-    /// `-F`、`gh api` の `-F k=@path` / `--input`)の、コマンド行に書かれた
-    /// ままのパス。stdin(`-`)は含めない(#55)。
-    pub body_files: Vec<String>,
-    /// 本文がコマンド置換(`$(…)`、バッククォート)で作られ、コマンド行から
-    /// 静的に内容を解決できない(#55)。ヒアドキュメント(`<<`)を含む場合は
-    /// 本文がコマンド文字列に含まれるので対象外。
-    pub body_dynamic: bool,
-    /// `git push` が pre-push hook を無効にする形(`--no-verify`、または
-    /// `-c core.hooksPath=…`)。push の中身は PreToolUse では見ず、git の
-    /// pre-push が渡す正確な ref と SHA で判定する(ADR-0003)ので、PreToolUse
-    /// が止めるのはこの迂回の形だけ。
-    pub push_bypass: bool,
-    /// gh の投稿の面(pr/issue/release/repo/gist/api)と操作(create/edit/
-    /// comment、gh api は小文字のメソッド)。`bleep-hook intent` が使う(#56)。
-    pub gh_surface: String,
-    pub gh_action: String,
-    /// repo_override が -R/--repo ではなく gh api の API パスから取れた(#58)。
-    pub repo_from_api_path: bool,
-}
-
-/// `git push` の引数に、pre-push hook を無効にする `--no-verify` があるか。
-/// git-push(1) の "With `--no-verify`, the hook is bypassed completely"。
-/// `-c core.hooksPath=…` は git の global option 側で見る(classify_segment)。
-fn push_args_skip_hook(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--no-verify")
-}
-
-/// 値がコマンド置換で作られ、コマンド文字列だけでは内容が定まらないか。
-fn is_dynamic_value(v: &str) -> bool {
-    (v.contains("$(") || v.contains('`')) && !v.contains("<<")
-}
-
-/// `gh pr|issue create|edit|comment` の本文入力元を集める(#55)。
-fn collect_pr_issue_body_inputs(args: &[String], out: &mut SegClassification) {
-    let mut j = 0usize;
-    while j < args.len() {
-        let a = args[j].as_str();
-        match a {
-            "--body-file" | "-F" => {
-                if let Some(p) = args.get(j + 1) {
-                    push_body_file(p, out);
+/// `git [global options] push [args]` の `push` の位置と、`-c core.hooksPath=…`
+/// があったか。global option の値を読み飛ばしてサブコマンド位置を確定する
+/// (`git -C dir push` を取りこぼさない、#9/#14)。
+fn git_push_form(t: &[String], start: usize) -> Option<bool> {
+    let n = t.len();
+    let mut idx = start + 1;
+    let mut hooks_path_overridden = false;
+    while idx < n {
+        match t[idx].as_str() {
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" => idx += 2,
+            "-c" => {
+                if t.get(idx + 1).is_some_and(|v| config_disables_hooks(v)) {
+                    hooks_path_overridden = true;
                 }
-                j += 2;
+                idx += 2;
             }
-            "--body" | "-b" => {
-                if args.get(j + 1).is_some_and(|v| is_dynamic_value(v)) {
-                    out.body_dynamic = true;
+            s if s.starts_with("-c=") => {
+                if config_disables_hooks(&s[3..]) {
+                    hooks_path_overridden = true;
                 }
-                j += 2;
+                idx += 1;
             }
-            s if s.starts_with("--body-file=") => {
-                push_body_file(s.trim_start_matches("--body-file="), out);
-                j += 1;
-            }
-            s if s.starts_with("--body=") => {
-                if is_dynamic_value(s.trim_start_matches("--body=")) {
-                    out.body_dynamic = true;
-                }
-                j += 1;
-            }
-            _ => j += 1,
+            s if s.starts_with('-') => idx += 1, // 未知の global option。安全側に読み飛ばす
+            _ => break,
         }
     }
-}
-
-/// `gh api` の本文入力元を集める(#55)。`-F`/`--field` の `k=@path` は
-/// ファイルを読む。`-f`/`--raw-field` の値は文字通りに送られる(ファイルは
-/// 読まない)が、コマンド置換で作られていれば内容を解決できない。
-fn collect_api_body_inputs(args: &[String], out: &mut SegClassification) {
-    let mut j = 0usize;
-    while j < args.len() {
-        let a = args[j].as_str();
-        let (kind, val) = match a {
-            "-F" | "--field" => ('F', args.get(j + 1).map(|s| s.as_str())),
-            "-f" | "--raw-field" => ('f', args.get(j + 1).map(|s| s.as_str())),
-            "--input" => ('i', args.get(j + 1).map(|s| s.as_str())),
-            s if s.starts_with("--field=") => ('F', Some(s.trim_start_matches("--field="))),
-            s if s.starts_with("--raw-field=") => ('f', Some(s.trim_start_matches("--raw-field="))),
-            s if s.starts_with("--input=") => ('i', Some(s.trim_start_matches("--input="))),
-            _ => {
-                j += 1;
-                continue;
-            }
-        };
-        j += if a.contains('=') && a.starts_with("--") {
-            1
-        } else {
-            2
-        };
-        let Some(v) = val else { continue };
-        match kind {
-            'i' => push_body_file(v, out),
-            'F' => match v.split_once('=') {
-                Some((_, rest)) if rest.starts_with('@') => push_body_file(&rest[1..], out),
-                Some((_, rest)) if is_dynamic_value(rest) => out.body_dynamic = true,
-                _ => {}
-            },
-            _ => {
-                if v.split_once('=')
-                    .is_some_and(|(_, rest)| is_dynamic_value(rest))
-                {
-                    out.body_dynamic = true;
-                }
-            }
-        }
+    if idx < n && t[idx] == "push" {
+        let skip_hook = t[idx + 1..].iter().any(|a| a == "--no-verify");
+        Some(hooks_path_overridden || skip_hook)
+    } else {
+        None
     }
-}
-
-fn push_body_file(p: &str, out: &mut SegClassification) {
-    if !p.is_empty() && p != "-" {
-        out.body_files.push(p.to_string());
-    }
-}
-
-enum ApiDest {
-    /// `repos/<owner>/<repo>/…` の owner/repo をリテラルで取り出せた。
-    Repo(String),
-    /// `{owner}`/`{repo}` プレースホルダ。gh が cwd の origin で展開する。
-    Cwd,
-}
-
-/// gh api の位置引数(API パス)から宛先を取り出す。`repos/` で始まらない
-/// パスは None(宛先を決められない)。
-fn api_path_repo(path: &str) -> Option<ApiDest> {
-    let rest = path.trim_start_matches('/').strip_prefix("repos/")?;
-    let mut it = rest.split('/');
-    let owner = it.next().filter(|s| !s.is_empty())?;
-    let repo = it
-        .next()
-        .and_then(|s| s.split('?').next())
-        .filter(|s| !s.is_empty())?;
-    if owner.contains('{') || repo.contains('{') {
-        return Some(ApiDest::Cwd);
-    }
-    // 変数展開・コマンド置換を含む値はリテラルとして信用しない。
-    if owner.contains('$') || repo.contains('$') {
-        return None;
-    }
-    Some(ApiDest::Repo(format!("{owner}/{repo}")))
 }
 
 /// `git -c <key>=<value>` が hook の置き場を差し替える(= pre-push を外す)
-/// 設定か。git-config(1) の `core.hooksPath`。キーは大文字小文字を区別
-/// しない(`core.hookspath` も同じ設定)。
+/// 設定か。git-config(1) の `core.hooksPath`。キーは大文字小文字を区別しない
+/// (`core.hookspath` も同じ設定)。
 fn config_disables_hooks(kv: &str) -> bool {
     let key = kv.split('=').next().unwrap_or("");
     key.eq_ignore_ascii_case("core.hooksPath")
 }
 
-/// tokenize_segment の代替。POSIX のクォート/エスケープ規則で単語分割する
-/// (shell-words クレート、#22 の Bash 実装と同一の規則を検証済み)。
-/// 閉じていないクォートは shell-words が Err を返す — Bash 版は不正な
-/// 部分トークンのまま処理を続けるが、ここでは安全側に倒してトークン0件
-/// (=classify_segment は Other のまま何も分類しない)として扱う。これは
-/// Bash 版より緩く誤検出することはなく、fail-loud の格を落とさない。
-fn tokenize_segment(seg: &str) -> Vec<String> {
-    shell_words::split(seg).unwrap_or_default()
+/// `$(…)` とバッククォートの中身を取り出す(対応する閉じ括弧まで。引用符は
+/// 見ない — 過剰に取るだけで、取りこぼしはしない)。
+fn substitutions(seg: &str) -> Vec<String> {
+    let chars: Vec<char> = seg.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let end = if depth == 0 { j - 1 } else { chars.len() };
+            out.push(chars[i + 2..end].iter().collect());
+            i += 2;
+        } else if chars[i] == '`' {
+            if let Some(off) = chars[i + 1..].iter().position(|&c| c == '`') {
+                out.push(chars[i + 1..i + 1 + off].iter().collect());
+                i += off + 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
-/// classify_segment の移植: セグメントの種別(push/gh_publish/other)と、
-/// `git -C`/`gh --repo`/`-R` の明示的な override を判定する。global option
-/// をトークン位置で読み飛ばしてからサブコマンド位置を確定するため、
-/// `git -C <dir> push` や `gh --repo x pr create` も正しく分類できる。
-/// 未知の global option(`-` 始まり)は安全側(読み飛ばし)に倒す。
-pub fn classify_segment(seg: &str) -> SegClassification {
-    let t = tokenize_segment(seg);
-    let n = t.len();
-    let mut result = SegClassification::default();
-    if n == 0 {
-        return result;
-    }
+/// トークン化に失敗した(クォートが閉じていない — ヒアドキュメントの本文の
+/// アポストロフィなど)セグメントが、gh の投稿の形に見えるか。見えるなら
+/// 「解釈できない」として文法の外にする(解釈できないものを素通りにしない)。
+fn looks_like_gh_post(seg: &str) -> bool {
+    let words: Vec<&str> = seg.split_whitespace().collect();
+    words.windows(2).any(|w| {
+        basename(word(w[0])) == "gh"
+            && matches!(w[1], "pr" | "issue" | "release" | "repo" | "gist" | "api")
+    })
+}
 
-    match t[0].as_str() {
+fn unparsable_post() -> Item {
+    Item::Gh(GhPost {
+        surface: "unknown".to_string(),
+        action: String::new(),
+        repo_source: grammar::RepoSource::None,
+        repo: None,
+        body_sources: Vec::new(),
+        noncanonical: Some("unparsable"),
+    })
+}
+
+fn classify_tokens(t: &[String], depth: usize) -> Vec<Item> {
+    let mut out = Vec::new();
+    let i = command_start(t);
+    if i >= t.len() {
+        return out;
+    }
+    let cmd = basename(word(&t[i]));
+    match cmd {
         "git" => {
-            let mut idx = 1usize;
-            let mut hooks_path_overridden = false;
-            while idx < n {
-                match t[idx].as_str() {
-                    "-C" => {
-                        idx += 2; // 値を1個消費
-                        continue;
-                    }
-                    "-c" => {
-                        if t.get(idx + 1).is_some_and(|v| config_disables_hooks(v)) {
-                            hooks_path_overridden = true;
-                        }
-                        idx += 2; // 値を1個消費
-                        continue;
-                    }
-                    "--git-dir" | "--work-tree" | "--namespace" => {
-                        idx += 2; // 値を1個消費
-                        continue;
-                    }
-                    s if s.starts_with("-c=") => {
-                        if config_disables_hooks(&s[3..]) {
-                            hooks_path_overridden = true;
-                        }
-                        idx += 1;
-                        continue;
-                    }
-                    s if s.starts_with("--git-dir=")
-                        || s.starts_with("--work-tree=")
-                        || s.starts_with("--namespace=") =>
-                    {
-                        idx += 1;
-                        continue;
-                    }
-                    "--no-pager"
-                    | "--paginate"
-                    | "-p"
-                    | "--bare"
-                    | "--literal-pathspecs"
-                    | "--no-optional-locks" => {
-                        idx += 1;
-                        continue;
-                    }
-                    s if s.starts_with('-') => {
-                        idx += 1; // 未知の global option。読み飛ばす(安全側)。
-                        continue;
-                    }
-                    _ => break,
-                }
-            }
-            if idx < n && t[idx] == "push" {
-                result.kind_is_push = true;
-                result.push_bypass = hooks_path_overridden || push_args_skip_hook(&t[idx + 1..]);
+            if let Some(bypass) = git_push_form(t, i) {
+                out.push(Item::Push { bypass });
             }
         }
         "gh" => {
-            // サブコマンドの位置を確定するためだけの読み飛ばしループ。
-            // --repo/-R/--hostname の値も消費するが、repo_override の捕捉は
-            // ここでは行わない(#23 — 以前はこのループの中でしか --repo を
-            // 見ておらず、サブコマンドで break した後ろにある --repo を
-            // 一切検出できなかった)。
-            let mut idx = 1usize;
-            while idx < n {
-                match t[idx].as_str() {
-                    "--repo" | "-R" | "--hostname" => {
-                        idx += 2;
-                        continue;
-                    }
-                    s if s.starts_with("--repo=") => {
-                        idx += 1;
-                        continue;
-                    }
-                    s if s.starts_with('-') => {
-                        idx += 1;
-                        continue;
-                    }
-                    _ => break,
-                }
+            let mut g: Vec<String> = vec!["gh".to_string()];
+            g.extend(t[i + 1..].iter().cloned());
+            if let Some(post) = grammar::recognize(&g) {
+                out.push(Item::Gh(post));
             }
-
-            // --repo/-R/--repo= は gh の persistent flag(gh CLI manual
-            // "Options inherited from parent commands")で、サブコマンドの
-            // 前後どちらに置いても解釈される。位置に依存せず全トークンを
-            // 走査して検出する(#23、#43)。複数回指定された場合は最後の
-            // 一致を採用する(gh api の書き込みメソッド判定と同じ、舐めて
-            // 最後を採用する意味論)。
-            let mut j = 1usize;
-            while j < n {
-                match t[j].as_str() {
-                    "--repo" | "-R" => {
-                        result.repo_override = t.get(j + 1).cloned();
-                        j += 2;
-                        continue;
+        }
+        c if SHELLS.contains(&c) && depth < MAX_DEPTH => {
+            // sh -c '…' / bash -lc '…': -c を含む短いオプションの束の次が本文。
+            let mut j = i + 1;
+            while j < t.len() {
+                let a = t[j].as_str();
+                if a.starts_with('-') && !a.starts_with("--") && a.contains('c') {
+                    if let Some(script) = t.get(j + 1) {
+                        out.extend(classify_command_depth(script, depth + 1));
                     }
-                    s if s.starts_with("--repo=") => {
-                        result.repo_override = Some(s.trim_start_matches("--repo=").to_string());
-                        j += 1;
-                        continue;
-                    }
-                    _ => {
-                        j += 1;
-                    }
-                }
-            }
-
-            if idx < n {
-                let sub = t[idx].as_str();
-                let action = t.get(idx + 1).map(|s| s.as_str()).unwrap_or("");
-                if (sub == "pr" || sub == "issue")
-                    && (action == "create" || action == "edit" || action == "comment")
-                {
-                    result.kind_is_gh_publish = true;
-                    collect_pr_issue_body_inputs(&t[idx + 2..], &mut result);
-                } else if sub == "release" && (action == "create" || action == "edit") {
-                    result.kind_is_gh_publish = true; // gh release create|edit(#8 由来)
-                } else if sub == "repo" && action == "edit" {
-                    result.kind_is_gh_publish = true; // gh repo edit --description 等
-                } else if sub == "gist" && action == "create" {
-                    result.kind_is_gh_publish = true; // gh gist create
-                } else if sub == "api" {
-                    // gh api は --repo を取らない。メソッド(-X/--method、最後に
-                    // 一致した値を採用)、フィールド引数の有無、宛先を決める
-                    // API パス(最初の位置引数)を見る。
-                    let mut method = String::new();
-                    let mut has_field = false;
-                    let mut path: Option<&str> = None;
-                    let rest = &t[idx + 1..];
-                    let mut j = 0usize;
-                    while j < rest.len() {
-                        match rest[j].as_str() {
-                            "-X" | "--method" => {
-                                if let Some(v) = rest.get(j + 1) {
-                                    method = v.clone();
-                                }
-                                j += 2;
-                            }
-                            s if s.starts_with("--method=") => {
-                                method = s.trim_start_matches("--method=").to_string();
-                                j += 1;
-                            }
-                            "-f" | "-F" | "--field" | "--raw-field" | "--input" => {
-                                has_field = true;
-                                j += 2;
-                            }
-                            s if s.starts_with("--field=")
-                                || s.starts_with("--raw-field=")
-                                || s.starts_with("--input=") =>
-                            {
-                                has_field = true;
-                                j += 1;
-                            }
-                            // 値を1個取るその他のフラグ。値を位置引数と誤認しない。
-                            "-H" | "--header" | "-q" | "--jq" | "-t" | "--template" | "--cache"
-                            | "-p" | "--preview" | "--hostname" | "-R" | "--repo" => {
-                                j += 2;
-                            }
-                            s if s.starts_with('-') => {
-                                j += 1;
-                            }
-                            s => {
-                                if path.is_none() {
-                                    path = Some(s);
-                                }
-                                j += 1;
-                            }
-                        }
-                    }
-                    // gh api の既定は GET、フィールド引数(-f/-F/--field/
-                    // --raw-field/--input)があれば POST(gh api --help、#57)。
-                    // -X の明示は常にそれを優先する。
-                    let effective = if method.is_empty() {
-                        if has_field {
-                            "POST"
-                        } else {
-                            "GET"
-                        }
-                    } else {
-                        method.as_str()
-                    };
-                    if matches!(effective.to_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
-                        result.kind_is_gh_publish = true;
-                        collect_api_body_inputs(rest, &mut result);
-                        // 宛先は API パスに書かれる(#58)。-R/--repo で明示されて
-                        // いればそちらを優先する。`{owner}/{repo}` のプレース
-                        // ホルダは gh が cwd の origin で展開するので、従来どおり
-                        // cwd から解決する。それ以外(graphql、repos/ 以外のパス、
-                        // パス無し)は宛先を静的に決められない。
-                        result.gh_action = effective.to_lowercase();
-                        if result.repo_override.is_none() {
-                            match path.and_then(api_path_repo) {
-                                Some(ApiDest::Repo(nwo)) => {
-                                    result.repo_override = Some(nwo);
-                                    result.repo_from_api_path = true;
-                                }
-                                Some(ApiDest::Cwd) => {}
-                                None => result.dest_unknown = true,
-                            }
-                        }
-                    }
-                }
-                if result.kind_is_gh_publish {
-                    result.gh_surface = sub.to_string();
-                    if sub != "api" {
-                        result.gh_action = action.to_string();
-                    }
+                    break;
+                } else if a.starts_with('-') {
+                    j += 1;
+                } else {
+                    break;
                 }
             }
         }
+        "eval" if depth < MAX_DEPTH => {
+            let script = t[i + 1..].join(" ");
+            out.extend(classify_command_depth(&script, depth + 1));
+        }
         _ => {}
     }
-    result
+    out
 }
 
-/// cmd_scan_bash_command のうち、I/O を伴わない部分(セグメント分割・
-/// scan_subject の構築・push/gh セグメントの検出と実効ディレクトリの解決)
-/// をまとめた結果。
+fn classify_segment_depth(seg: &str, depth: usize) -> Vec<Item> {
+    let mut out = Vec::new();
+    match shell_words::split(seg) {
+        Ok(t) => out.extend(classify_tokens(&t, depth)),
+        Err(_) => {
+            if looks_like_gh_post(seg) {
+                out.push(unparsable_post());
+            }
+        }
+    }
+    if depth < MAX_DEPTH {
+        for inner in substitutions(seg) {
+            out.extend(classify_command_depth(&inner, depth + 1));
+        }
+    }
+    out
+}
+
+fn classify_command_depth(cmd: &str, depth: usize) -> Vec<Item> {
+    split_command_segments(cmd)
+        .iter()
+        .flat_map(|seg| classify_segment_depth(seg, depth))
+        .collect()
+}
+
+/// セグメント 1 つを分類する(`sh -c` や `$(…)` の中身も含む)。
+pub fn classify_segment(seg: &str) -> Vec<Item> {
+    classify_segment_depth(seg, 0)
+}
+
+/// 解析結果。
 #[derive(Debug, Default)]
 pub struct AnalyzeResult {
+    /// denylist の照合対象。CMD 全文から `cd <単一トークン>` セグメントを除き、
+    /// 宛先を `-R`/`--repo` で明示した gh セグメントからはその宛先トークンを
+    /// 除いたもの(#9、#43 — 宛先そのものは漏洩ではない)。
     pub scan_subject: String,
     pub found_push: bool,
-    /// found_push のセグメントが pre-push hook を無効にする形か
-    /// (SegClassification::push_bypass 参照)。
+    /// いずれかの `git push` が pre-push を無効にする形。
     pub push_bypass: bool,
-    pub found_gh: bool,
-    pub gh_repo_override: String,
-    /// found_gh かつ gh_repo_override が空のときだけ意味を持つ — 呼び出し側
-    /// (Bash)がこのディレクトリを基準に resolve_repo_nwo(git remote 参照、
-    /// I/O)を実行する。
-    pub gh_effective_dir: String,
-    /// found_gh の対象を実際に解決するのに使った値(cd 追跡、`--repo`/`-R`
-    /// の override)が、未展開の `$` 参照(閉集合外の変数)を含むために静的に
-    /// 解決できなかったかどうか(#34)。呼び出し側はこの場合、値を無理に使わず
-    /// ask にエスカレートする。found_gh が立っていないときは常に false。
-    /// push は PreToolUse では対象を解決しない(pre-push が判定する、ADR-0003)
-    /// ので、ここには入らない。
-    pub unresolved_var: bool,
-    /// gh の投稿セグメントが本文をファイルから読む入力元の絶対パス
-    /// (相対パスはそのセグメントの実効ディレクトリ基準で解決済み、#55)。
-    /// lex は I/O を持たない — 中身を読むのは呼び出し側(bleep)。
-    pub body_sources: Vec<String>,
-    /// 本文の入力元を静的に解決できない(パスに未展開の `$` やバッククォート、
-    /// 本文がコマンド置換)。unresolved_var と分けるのは、宛先が PRIVATE と
-    /// 判明していれば検査自体が不要なので、その判定の後で ask にするため。
-    pub body_unresolved: bool,
+    /// gh の投稿(表に載ったコマンド)。コマンドの出現順。
+    pub posts: Vec<GhPost>,
 }
 
 /// gh セグメントの生テキストから `--repo`/`-R`(値を伴う2トークン形)と
 /// `--repo=値`(1トークン形)を取り除き、残りのトークンを
 /// `shell_words::join`(`split` の逆演算、必要最小限の再クォート)で
-/// 再結合したテキストを返す(#43、D2)。宛先そのものを指すトークンは
-/// 「漏洩ではない」という #9(cd セグメント全体除外)と同じ考え方を、
-/// セグメント単位からトークン単位に広げたもの。複数回指定されていても
-/// 全て取り除く(scan_subject からは常に除外してよい — どの occurrence が
-/// 実際に採用されるかに関わらず、どれも宛先参照であることに変わりないため)。
+/// 再結合したテキストを返す(#43、D2)。
 fn strip_repo_override_tokens(seg: &str) -> String {
-    let t = tokenize_segment(seg);
+    let t = shell_words::split(seg).unwrap_or_default();
     let mut kept: Vec<String> = Vec::with_capacity(t.len());
     let mut j = 0usize;
     while j < t.len() {
         match t[j].as_str() {
             "--repo" | "-R" => {
                 j += 2; // フラグ+値の2トークンを両方取り除く
-                continue;
             }
-            s if s.starts_with("--repo=") => {
-                j += 1;
-                continue;
-            }
+            s if s.starts_with("--repo=") => j += 1,
             _ => {
                 kept.push(t[j].clone());
                 j += 1;
@@ -630,127 +410,45 @@ fn strip_repo_override_tokens(seg: &str) -> String {
     shell_words::join(kept)
 }
 
-/// `segments[..upto]` の中で、`cd <単一トークン>` として実際に消費される
-/// (= resolve_effective_dir が読む)ターゲットのいずれかが、`expand_home`
-/// 適用後も未展開の `$` 参照(`~`/`$HOME`/`${HOME}` の閉集合外)を含むかを
-/// 返す(#34)。resolve_effective_dir 自身の絶対/相対分岐を変えず、同じ
-/// 対象を辿って `$` の有無だけを見る副関数として持つ(判断を運ばない継ぎ目
-/// — 実際の実効ディレクトリの計算は resolve_effective_dir の正本のまま)。
-pub(crate) fn cd_chain_has_unresolved_var(
-    segments: &[String],
-    upto: usize,
-    home: Option<&str>,
-) -> bool {
-    segments.iter().take(upto).any(|seg| {
-        as_single_cd_target(seg)
-            .map(|tgt| expand_home(tgt, home).contains('$'))
-            .unwrap_or(false)
-    })
-}
-
-/// セグメント `segments[i]` の本文の入力元を、実効ディレクトリ基準の絶対
-/// パスに解決する(#55)。戻り値の bool は、静的に解決できないもの(パスに
-/// 未展開の `$`・バッククォート、未解決の cd 経由の相対パス、コマンド置換で
-/// 作った本文)があったか。`bleep-hook intent` と共有する。
-pub(crate) fn resolve_body_sources(
-    c: &SegClassification,
-    segments: &[String],
-    i: usize,
-    start_dir: &str,
-    home: Option<&str>,
-) -> (Vec<String>, bool) {
-    let mut unresolved = c.body_dynamic;
-    let mut out: Vec<String> = Vec::new();
-    if c.body_files.is_empty() {
-        return (out, unresolved);
-    }
-    let dir_unresolved = cd_chain_has_unresolved_var(segments, i, home);
-    let dir = resolve_effective_dir(start_dir, segments, i, home);
-    for p in &c.body_files {
-        let p = expand_home(p, home);
-        let has_var = p.contains('$') || p.contains('`');
-        let odd = p.contains('\\') || p.contains('\n');
-        if has_var || odd || (!p.starts_with('/') && dir_unresolved) {
-            unresolved = true;
-            continue;
-        }
-        let abs = if p.starts_with('/') {
-            p
-        } else {
-            format!("{dir}/{p}")
-        };
-        if !out.contains(&abs) {
-            out.push(abs);
-        }
-    }
-    (out, unresolved)
-}
-
-pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult {
-    let segments = split_command_segments(cmd);
+pub fn analyze(cmd: &str) -> AnalyzeResult {
     let mut result = AnalyzeResult::default();
-    // found_gh の対象を実際に解決するのに使った値が未展開の `$` 参照を含む
-    // かどうか(#34)。
-    let mut gh_unresolved_var = false;
+    for seg in split_command_segments(cmd) {
+        let items = classify_segment(&seg);
 
-    for (i, seg) in segments.iter().enumerate() {
-        let c = classify_segment(seg);
-
-        if as_single_cd_target(seg).is_none() {
-            if c.kind_is_gh_publish && c.repo_override.is_some() {
+        if as_single_cd_target(&seg).is_none() {
+            let strips = items
+                .iter()
+                .any(|it| matches!(it, Item::Gh(p) if p.repo_source == grammar::RepoSource::Flag));
+            if strips {
                 result
                     .scan_subject
-                    .push_str(&strip_repo_override_tokens(seg));
+                    .push_str(&strip_repo_override_tokens(&seg));
             } else {
-                result.scan_subject.push_str(seg);
+                result.scan_subject.push_str(&seg);
             }
             result.scan_subject.push('\n');
         }
 
-        if c.kind_is_gh_publish && as_single_cd_target(seg).is_none() {
-            let (paths, unresolved) = resolve_body_sources(&c, &segments, i, start_dir, home);
-            result.body_unresolved |= unresolved;
-            for abs in paths {
-                if !result.body_sources.contains(&abs) {
-                    result.body_sources.push(abs);
+        for it in items {
+            match it {
+                Item::Push { bypass } => {
+                    result.found_push = true;
+                    result.push_bypass |= bypass;
                 }
-            }
-        }
-
-        if c.kind_is_push {
-            result.found_push = true;
-            result.push_bypass |= c.push_bypass;
-        }
-        if c.kind_is_gh_publish && !result.found_gh {
-            result.found_gh = true;
-            match c.repo_override {
-                // 宛先を静的に決められない(#58)。override も effective_dir も
-                // 空のまま返し、呼び出し側(bleep)が可視性による pass を飛ばして
-                // 公開宛てとして検査する。
-                None if c.dest_unknown => {}
-                Some(r) => {
-                    // gh の --repo/-R の値自体は cd/-C と異なりパスではない
-                    // ため expand_home は適用しない。未展開の `$` が残って
-                    // いれば、その値をそのまま静的な解決不能として扱う。
-                    gh_unresolved_var = r.contains('$');
-                    result.gh_repo_override = r;
-                }
-                None => {
-                    gh_unresolved_var = cd_chain_has_unresolved_var(&segments, i, home);
-                    result.gh_effective_dir = resolve_effective_dir(start_dir, &segments, i, home);
-                }
+                Item::Gh(p) => result.posts.push(p),
             }
         }
     }
-
-    result.unresolved_var = result.found_gh && gh_unresolved_var;
-
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn posts(cmd: &str) -> Vec<GhPost> {
+        analyze(cmd).posts
+    }
 
     #[test]
     fn backslash_escaped_quote_does_not_close_segment_early() {
@@ -761,261 +459,103 @@ mod tests {
     }
 
     #[test]
-    fn repo_override_with_escaped_quote_extracts_correctly() {
-        // #22 の回帰2と同型: --repo の値に \" があっても正しく抽出できる。
-        let c = classify_segment(r#"gh --repo "x\"y" pr create --title t"#);
-        assert!(c.kind_is_gh_publish);
-        assert_eq!(c.repo_override.as_deref(), Some("x\"y"));
+    fn repo_value_with_escaped_quote_is_not_a_valid_destination() {
+        // #22 の回帰2と同型: --repo の値に \" があっても、引用符の解釈は崩れない。
+        // 値は owner/repo の形ではないので、宛先として受理しない。
+        let p = &posts(r#"gh --repo "x\"y" pr create --title t --body-file /tmp/b.md"#)[0];
+        assert_eq!(p.noncanonical, Some("bad-repo"));
     }
 
     #[test]
-    fn repo_after_subcommand_is_detected() {
-        // #23: --repo/-R は gh の persistent flag で位置に依存しない。
-        // 以前はサブコマンド確定ループで break した後ろを一切見ておらず、
-        // ここは None(未対応)を固定するテストだった。
-        let c = classify_segment(r#"gh pr create --repo acme/other --title t"#);
-        assert!(c.kind_is_gh_publish);
-        assert_eq!(c.repo_override.as_deref(), Some("acme/other"));
-    }
-
-    #[test]
-    fn dash_r_after_subcommand_is_detected() {
-        // #23: -R(短縮形)もサブコマンド後で検出できる。
-        let c = classify_segment(r#"gh issue create -R acme/other --title t"#);
-        assert!(c.kind_is_gh_publish);
-        assert_eq!(c.repo_override.as_deref(), Some("acme/other"));
-    }
-
-    #[test]
-    fn repo_equals_after_subcommand_is_detected() {
-        // #23: --repo=値 形もサブコマンド後で検出できる。
-        let c = classify_segment(r#"gh pr create --repo=acme/other --title t"#);
-        assert!(c.kind_is_gh_publish);
-        assert_eq!(c.repo_override.as_deref(), Some("acme/other"));
+    fn repo_flag_forms_after_subcommand_are_detected() {
+        // #23: --repo/-R/--repo=値 は gh の persistent flag で位置に依存しない。
+        for cmd in [
+            "gh pr create --repo acme/other --body-file /tmp/b.md",
+            "gh issue create -R acme/other --body-file /tmp/b.md",
+            "gh pr create --repo=acme/other --body-file /tmp/b.md",
+            "gh --repo acme/other pr create --body-file /tmp/b.md",
+        ] {
+            let p = &posts(cmd)[0];
+            assert_eq!(p.repo.as_deref(), Some("acme/other"), "{cmd}");
+            assert_eq!(p.noncanonical, None, "{cmd}");
+        }
     }
 
     #[test]
     fn repo_override_token_excluded_from_scan_subject() {
         // #43(D2): 明示された --repo の宛先トークン自体は scan_subject から
-        // 除外される(#9 の cd 除外と同じ考え方)。body の内容は残る。
+        // 除外される(#9 の cd 除外と同じ考え方)。タイトルの内容は残る。
         let r = analyze(
-            r#"gh pr create --repo acme/public-oss --title t --body "unrelated""#,
-            ".",
-            None,
+            r#"gh pr create --repo acme/public-oss --title unrelated --body-file /tmp/b.md"#,
         );
-        assert!(r.found_gh);
+        assert_eq!(r.posts.len(), 1);
         assert!(!r.scan_subject.contains("acme/public-oss"));
         assert!(r.scan_subject.contains("unrelated"));
     }
 
     #[test]
     fn cd_segment_excluded_from_scan_subject() {
-        let r = analyze(
-            r#"cd /x/secret-repo-work && gh pr create --title t"#,
-            ".",
-            None,
-        );
+        let r = analyze(r#"cd /x/secret-repo-work && gh pr create --title t"#);
         assert!(!r.scan_subject.contains("secret-repo-work"));
     }
 
     #[test]
-    fn multiple_cd_accumulate_in_order() {
-        let r = analyze(
-            r#"cd /a && cd b && gh pr create --title t --body "x""#,
-            ".",
-            None,
-        );
-        assert!(r.found_gh);
-        assert_eq!(r.gh_effective_dir, "/a/b");
-    }
-
-    // ---- 未展開のシェル変数参照の検出(#34) -----------------------------
-
-    #[test]
-    fn cd_with_shell_variable_sets_unresolved_var_for_gh() {
-        // --repo が無く、gh_effective_dir の解決が cd 履歴だけに頼る場合、
-        // cd の対象が未展開の $ を含めば unresolved_var が立つ。
-        let r = analyze(r#"cd "$D" && gh pr create --title t"#, ".", None);
-        assert!(r.found_gh);
-        assert!(r.unresolved_var);
-    }
-
-    #[test]
-    fn gh_repo_with_shell_variable_sets_unresolved_var() {
-        let r = analyze(r#"gh --repo "$X" pr create --title t"#, ".", None);
-        assert!(r.found_gh);
-        assert!(r.unresolved_var);
-    }
-
-    #[test]
-    fn literal_only_commands_do_not_set_unresolved_var() {
-        let r = analyze(r#"gh pr create --repo acme/other --title t"#, ".", None);
-        assert!(r.found_gh);
-        assert!(!r.unresolved_var);
-    }
-
-    #[test]
-    fn explicit_repo_override_wins_over_unresolved_cd_for_gh() {
-        // #23 の修正後、--repo が明示されていれば gh_effective_dir(cd
-        // 追跡)は使われない。cd 側に未展開の $ が残っていても、実際に
-        // 使われるのは --repo のリテラル値なので unresolved_var は立たない
-        // (#34 の対象は「実際の解決に使った値」に限る)。
-        let r = analyze(
-            r#"cd "$D" && gh pr create --repo acme/other --title t"#,
-            ".",
-            None,
-        );
-        assert!(r.found_gh);
-        assert_eq!(r.gh_repo_override, "acme/other");
-        assert!(!r.unresolved_var);
-    }
-
-    #[test]
-    fn gh_api_write_method_is_publish() {
-        let c = classify_segment(r#"gh api repos/acme/secret -X POST -f name=x"#);
-        assert!(c.kind_is_gh_publish);
-        let c = classify_segment(r#"gh api repos/acme/secret --method=GET"#);
-        assert!(!c.kind_is_gh_publish);
-    }
-
-    #[test]
-    fn gh_api_field_without_method_is_implicit_post() {
-        // #57: -X が無くても -f/-F/--field/--raw-field/--input があれば POST。
+    fn prefixes_and_wrappers_do_not_hide_a_post() {
         for cmd in [
-            r#"gh api repos/pub/repo/issues -f body=x"#,
-            r#"gh api repos/pub/repo/issues -F body=@f"#,
-            r#"gh api repos/pub/repo/issues --field body=x"#,
-            r#"gh api repos/pub/repo/issues --raw-field=body=x"#,
-            r#"gh api repos/pub/repo/issues --input f.json"#,
+            "env X=1 gh issue create -R a/b --body hi",
+            "X=1 gh issue create -R a/b --body hi",
+            "/usr/bin/gh issue create -R a/b --body hi",
+            "sudo -u me gh issue create -R a/b --body hi",
+            "timeout 30 gh issue create -R a/b --body hi",
+            "nohup gh issue create -R a/b --body hi",
+            "(gh issue create -R a/b --body hi)",
+            "{ gh issue create -R a/b --body hi; }",
+            "sh -c 'gh issue create -R a/b --body hi'",
+            "bash -lc \"gh issue create -R a/b --body hi\"",
+            "eval gh issue create -R a/b --body hi",
+            "env sh -c 'gh issue create -R a/b --body hi'",
+            "echo $(gh issue create -R a/b --body hi)",
+            "x=`gh issue create -R a/b --body hi`",
+            "sh -c 'sh -c \"gh issue create -R a/b --body hi\"'",
         ] {
-            assert!(classify_segment(cmd).kind_is_gh_publish, "{cmd}");
-        }
-        // -X GET の明示は読み取りのまま。フィールド無しの既定も GET。
-        assert!(
-            !classify_segment(r#"gh api -X GET repos/pub/repo/issues -f q=x"#).kind_is_gh_publish
-        );
-        assert!(!classify_segment(r#"gh api repos/pub/repo/issues"#).kind_is_gh_publish);
-    }
-
-    #[test]
-    fn gh_api_destination_from_path() {
-        // #58: 宛先は API パス(先頭 / の有無を問わない)。
-        let c = classify_segment(r#"gh api -X POST repos/pub/repo/issues -f body=x"#);
-        assert_eq!(c.repo_override.as_deref(), Some("pub/repo"));
-        assert!(!c.dest_unknown);
-        let c = classify_segment(r#"gh api -X POST /repos/pub/repo/issues/1/comments -f body=x"#);
-        assert_eq!(c.repo_override.as_deref(), Some("pub/repo"));
-        // フラグの値(-H の値)を位置引数と取り違えない。
-        let c = classify_segment(r#"gh api -H "Accept: x" -X POST repos/pub/repo/issues -f a=b"#);
-        assert_eq!(c.repo_override.as_deref(), Some("pub/repo"));
-        // プレースホルダは cwd 解決(override なし、dest_unknown なし)。
-        let c = classify_segment(r#"gh api -X POST repos/{owner}/{repo}/issues -f a=b"#);
-        assert!(c.repo_override.is_none() && !c.dest_unknown);
-        // graphql・repos/ 以外・パス無し・変数を含むものは宛先不明。
-        for cmd in [
-            r#"gh api graphql -f query=x"#,
-            r#"gh api -X POST user/repos -f name=x"#,
-            r#"gh api -X POST -f a=b"#,
-            r#"gh api -X POST repos/$O/repo/issues -f a=b"#,
-        ] {
-            let c = classify_segment(cmd);
-            assert!(c.kind_is_gh_publish && c.dest_unknown, "{cmd}");
+            let ps = posts(cmd);
+            assert_eq!(ps.len(), 1, "{cmd}");
+            assert_eq!(ps[0].noncanonical, Some("inline-body"), "{cmd}");
         }
     }
 
     #[test]
-    fn gh_body_inputs_are_extracted() {
-        // #55: -F は gh pr|issue ではファイル、gh api ではフィールド。
-        let c = classify_segment("gh issue create -R p/r --body-file b.md");
-        assert_eq!(c.body_files, ["b.md"]);
-        let c = classify_segment("gh pr create -F b.md --title t");
-        assert_eq!(c.body_files, ["b.md"]);
-        let c = classify_segment("gh issue create --body-file=b.md");
-        assert_eq!(c.body_files, ["b.md"]);
-        let c = classify_segment("gh api -X PATCH repos/p/r/issues/1 -F body=@b.md -F n=1");
-        assert_eq!(c.body_files, ["b.md"]);
-        let c = classify_segment("gh api repos/p/r/issues --input in.json");
-        assert_eq!(c.body_files, ["in.json"]);
-        // -f は文字通り。@ でもファイルを読まない。
-        let c = classify_segment("gh api -X POST repos/p/r/issues -f body=@b.md");
-        assert!(c.body_files.is_empty() && !c.body_dynamic);
-        // stdin は対象外。
-        assert!(classify_segment("gh issue create --body-file -")
-            .body_files
-            .is_empty());
-        assert!(classify_segment("gh api repos/p/r/issues --input -")
-            .body_files
-            .is_empty());
+    fn nesting_depth_is_bounded() {
+        // 深すぎる入れ子は見ない(検出の範囲。セキュリティ境界ではない)。
+        let deep = "sh -c 'sh -c \"sh -c \\\"sh -c gh\\\\ issue\\\\ create\\\"\"'";
+        let _ = analyze(deep); // 無限再帰しないこと
     }
 
     #[test]
-    fn gh_body_command_substitution_is_dynamic_unless_heredoc() {
-        assert!(classify_segment(r#"gh issue create --body "$(cat b.md)""#).body_dynamic);
-        assert!(classify_segment("gh issue create --body `cat b.md`").body_dynamic);
-        assert!(
-            classify_segment(r#"gh api -X POST repos/p/r/issues -f body="$(cat b)""#).body_dynamic
-        );
-        // ヒアドキュメントの本文はコマンド文字列に含まれる。
-        assert!(
-            !classify_segment("gh issue create --body \"$(cat <<'EOF'\nx\nEOF\n)\"").body_dynamic
-        );
+    fn unparsable_gh_post_is_noncanonical() {
+        // ヒアドキュメント本文のアポストロフィでクォートが閉じない形。解釈できない
+        // gh の投稿を素通りにしない。
+        let ps = posts("gh issue create -R a/b --body-file /dev/stdin <<EOF\nit's here\nEOF");
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].noncanonical, Some("unparsable"));
+        // gh の投稿に見えなければ、解釈できなくても何も出さない。
+        assert!(posts("echo it's fine").is_empty());
     }
 
     #[test]
-    fn body_sources_resolve_against_effective_dir() {
-        let r = analyze(
-            "cd sub && gh issue create -R p/r --body-file b.md",
-            "/work",
-            None,
+    fn multiple_posts_are_all_reported_in_order() {
+        let ps = posts(
+            "gh issue create -R pub/one --body-file /tmp/a.md && gh issue comment 2 -R pub/two -F /tmp/c.md",
         );
-        assert_eq!(r.body_sources, ["/work/sub/b.md"]);
-        assert!(!r.body_unresolved);
-        let r = analyze(
-            "gh issue create -R p/r --body-file /abs/b.md",
-            "/work",
-            None,
-        );
-        assert_eq!(r.body_sources, ["/abs/b.md"]);
-        // すべての gh 投稿セグメントから集める。
-        let r = analyze(
-            "gh issue create -R p/r --body-file a.md && gh issue comment 1 -R p/r -F c.md",
-            "/work",
-            None,
-        );
-        assert_eq!(r.body_sources, ["/work/a.md", "/work/c.md"]);
-        // 未展開の変数・cd 側の未解決は body_unresolved。
-        let r = analyze("gh issue create -R p/r --body-file $S/b.md", "/work", None);
-        assert!(r.body_unresolved && r.body_sources.is_empty());
-        let r = analyze(
-            "cd $D && gh issue create -R p/r --body-file b.md",
-            "/work",
-            None,
-        );
-        assert!(r.body_unresolved);
-    }
-
-    #[test]
-    fn dest_unknown_clears_repo_and_dir() {
-        let r = analyze(r#"gh api graphql -f query=x"#, "/work", None);
-        assert!(r.found_gh);
-        assert_eq!(r.gh_repo_override, "");
-        assert_eq!(r.gh_effective_dir, "");
-        assert!(!r.unresolved_var);
-    }
-
-    #[test]
-    fn gh_release_repo_edit_gist_are_publish() {
-        assert!(classify_segment("gh release create v1 --notes x").kind_is_gh_publish);
-        assert!(classify_segment("gh repo edit --description x").kind_is_gh_publish);
-        assert!(classify_segment("gh gist create file.txt").kind_is_gh_publish);
-        assert!(!classify_segment("gh repo view").kind_is_gh_publish);
+        let repos: Vec<_> = ps.iter().map(|p| p.repo.as_deref()).collect();
+        assert_eq!(repos, [Some("pub/one"), Some("pub/two")]);
     }
 
     #[test]
     fn push_bypass_detects_the_forms_that_skip_pre_push() {
         // pre-push を外す形だけを拾う。普通の push は found_push のみ。
         let bypass = |cmd: &str| {
-            let r = analyze(cmd, ".", None);
+            let r = analyze(cmd);
             assert!(r.found_push, "{cmd}");
             r.push_bypass
         };
@@ -1026,33 +566,20 @@ mod tests {
         assert!(bypass("git -c core.hooksPath=/dev/null push origin main"));
         assert!(bypass("git -c core.hookspath=/dev/null push origin main"));
         assert!(bypass("git -c=core.hooksPath=/dev/null push origin main"));
+        // 前置・包みの中でも拾う。
+        assert!(bypass("env X=1 git push --no-verify"));
+        assert!(bypass("sh -c 'git push --no-verify'"));
+        assert!(bypass("echo $(git push --no-verify)"));
         // 無関係な -c は迂回ではない。
         assert!(!bypass("git -c user.name=x push origin main"));
         // push 以外のサブコマンドは found_push にならない。
-        assert!(!analyze("git -c core.hooksPath=/dev/null status", ".", None).found_push);
+        assert!(!analyze("git -c core.hooksPath=/dev/null status").found_push);
     }
 
     #[test]
-    fn push_does_not_set_unresolved_var() {
-        // push の対象は PreToolUse では解決しない(pre-push が判定する)。
-        // 変数を含む cd/-C があっても ask にしない。
-        for cmd in [
-            r#"cd "$D" && git push origin main"#,
-            r#"git -C "$D" push origin main"#,
-        ] {
-            let r = analyze(cmd, ".", None);
-            assert!(r.found_push && !r.unresolved_var, "{cmd}");
-        }
-    }
-
-    #[test]
-    fn unterminated_quote_segment_is_not_classified() {
-        // split_command_segments はクォート閉じ忘れをコマンド全体1セグメント
-        // にする。tokenize_segment(shell-words)は unterminated で Err を
-        // 返すため、安全側で SegKind::Other 扱い(誤って push/gh_publish に
-        // 分類しない)。
-        let c = classify_segment(r#"git push "unterminated"#);
-        assert!(!c.kind_is_push);
-        assert!(!c.kind_is_gh_publish);
+    fn unterminated_quote_segment_is_not_classified_as_push() {
+        let r = analyze(r#"git push "unterminated"#);
+        assert!(!r.found_push);
+        assert!(r.posts.is_empty());
     }
 }

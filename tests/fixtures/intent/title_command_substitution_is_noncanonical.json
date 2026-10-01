@@ -1,0 +1,6 @@
+{
+  "command": "gh issue create -R pub/repo --title \"$(date)\" --body-file /tmp/body.md",
+  "expect": [
+    {"surface": "issue", "action": "create", "repo_source": "flag", "repo": "pub/repo", "body_sources": ["/tmp/body.md"], "canonical": false, "noncanonical_reason": "dynamic-value"}
+  ]
+}

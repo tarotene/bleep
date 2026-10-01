@@ -89,14 +89,36 @@ Inputs" と同じ構造)。コマンドを後から検査する側は、書き�
    一致した commit の短い SHA を出して解く(語は出さない)。判定レッジャーの
    `detail` は閉じた語彙(`[a-z-]`)なので、SHA は理由文だけに置く。
 
-2. **gh の投稿 — 受理する正準形を閉じた文法で定義する(後続の段で実装)。**
-   `-R OWNER/REPO` が必須で、本文は `--body-file`(release は `--notes-file`、
-   gist は位置引数のファイル)の絶対パスのリテラルだけ、値に `$` も `` ` `` も
-   含まない形を、受理する言語とする。`--body`・`-b`・`-F`・コマンド置換・
-   `issue close --comment`・`sh -c '…'` のような、本文を復元しきれない形は文法の
-   外として deny する。読み取り(`view`・`list`・書き込みフィールドの無い
-   `api` GET)は照合せず pass する。`unresolved-var`・`body-source-unresolved` の
-   ask は、文法の外になるので gh 側では発生しなくなる。
+2. **gh の投稿 — 受理する正準形を閉じた文法で定義する。**
+   文法の対象は、自由記述を公開面へ運ぶ既知のコマンド(`pr create|edit|comment|
+   review|close|merge|reopen`、`issue create|edit|comment|close|reopen`、
+   `release create|edit`、`repo edit`、`gist create`、書き込みの `gh api`)。
+   これらのコマンドが正準形なのは、次を満たすとき:
+   - 宛先がリテラルの `-R OWNER/REPO`(`pr|issue` は PR/Issue の URL、`repo edit`
+     は位置引数の OWNER/REPO、`gh api` は `repos/<owner>/<repo>/…` のパスでも可。
+     gist は宛先なし)。cwd の origin からの推測、`cd` の追跡、変数の解決はしない
+   - 本文は絶対パスのリテラルのファイルだけ(`--body-file`・`-F`、release は
+     `--notes-file`、gist は位置引数のファイル、`gh api` は `-F k=@path`・`--input`)。
+     `--body`・`-b`・`--notes`・`-n`・`close|reopen` の `--comment`・stdin(`-`)・
+     相対パス・`~`・変数は文法の外
+   - そのほかの値はリテラルだけ(`$(…)`・バッククォート・`$VAR` を含まない)
+
+   文法の外は deny する(`gh-noncanonical`。理由コードは閉じた語彙
+   `no-repo`/`bad-repo`/`inline-body`/`inline-comment`/`body-stdin`/`body-path`/
+   `dynamic-value`/`unparsable`)。理由文は正準形と書き直し方を案内する。トークン
+   化できない投稿(ヒアドキュメント本文のアポストロフィで引用符が閉じない形)も
+   `unparsable` で deny する。`env`・`sudo`・`timeout` などの前置、
+   `sh -c '…'`・`eval '…'`、`$(…)`・バッククォートの中身も、同じ文法に再帰して
+   通す(深さは 3 まで)。`unresolved-var`・`body-source-unresolved` の ask は、
+   文法の外になるので発生しなくなった。
+
+   **文法の対象外は pass のまま**: 読み取り(`pr view`・`run watch`・`api` の GET)や、
+   自由記述を持たない操作(`pr ready` など)、表に載っていない `gh` のサブコマンドは、
+   従来どおり検査しない。表に載っていないものを一律 deny にすると `gh pr merge` の
+   ような日常の操作まで止まり、偽陽性の多さで迂回が常態化する(README の
+   「偽陽性の高さは、エージェントにも人間にも迂回を常態化させる」)。Dejector も
+   SQL の部分文法を検証するだけで、SQL でないものは対象外である。宛先が PRIVATE/
+   INTERNAL のリテラルな投稿は、文法も含めて検査しない。
 
 3. **分担 — 組み立てる側は bleep の外。** bleep が持つのは認識器(文法の定義と
    所属判定)と照合器(denylist)だけ。弾かれた側が正準形を組み立てるための
@@ -132,7 +154,18 @@ Inputs" と同じ構造)。コマンドを後から検査する側は、書き�
 - `tests/lex_protocol_test.rs` — 版の期待値と、bash 本体の `LEX_PROTOCOL` との一致
 - `tests/host_test.rs` — ペイロードの cwd が `--cwd` に渡ること(本文の入力元で検査)
 
-gh の正準形(決定 2)の執行点は、後続の段(同じ PR チェーン)で追加する。
+gh の正準形(決定 2)の執行点:
+
+- `src/grammar.rs` — 正準形の認識器(`recognize`)と違反コード(新規)
+- `src/lex.rs` — 前置・`sh -c`・`eval`・`$(…)` の再帰的な分類。cd 追跡・
+  `unresolved_var`・`gh_effective_dir` の廃止
+- `src/intent.rs` — `canonical`・`noncanonical_reason` を返す JSON
+- `src/main.rs` — `LEX_PROTOCOL` 4 と lex の出力形式(投稿ごとの違反・宛先・本文)
+- `bleep` — `cmd_scan_bash_command`(投稿ごとの可視性判定、`gh-noncanonical` の deny)、
+  `noncanonical_reason_text`、selftest
+- `tests/fixtures/intent/*.json` — 適合 fixture(正準形と文法外のコマンド →
+  期待される意図。31 件)
+- `tests/intent_test.rs`・`tests/lex_protocol_test.rs`・`tests/host_test.rs`
 
 ## Consequences
 
@@ -144,5 +177,11 @@ gh の正準形(決定 2)の執行点は、後続の段(同じ PR チェーン)�
   一度に覆える。
 - `--no-verify` は PreToolUse で deny される。人間が自分の端末で使うことは
   妨げない(PreToolUse の対象はエージェントの Bash だけ)。
-- 判定レッジャーの `reason_id` に `push-hook-bypass` が増える。消費側の schema
-  (tarotene/dotfiles)の閉語彙の拡張が要る。
+- 判定レッジャーの `reason_id` に `push-hook-bypass`・`gh-noncanonical` が増える。
+  消費側の schema(tarotene/dotfiles)の閉語彙の拡張が要る。
+- gh の投稿の正準形を組み立てる側(skill の例示、`--body` を読む各ガードの
+  `--body-file` 対応)は dotfiles の責務で、切り替えのタイミングは dotfiles が
+  bleep の pin を上げる版で握る。bleep 側は、`bleep-hook intent` の JSON(旧
+  `cwd`・`unresolved` を廃止し、`canonical`・`noncanonical_reason` を追加)と
+  fixture を、適合の正本として提供する。
+- 文法の外は deny なので、書き直しが必要になる。書き直しの方法は理由文に出る。

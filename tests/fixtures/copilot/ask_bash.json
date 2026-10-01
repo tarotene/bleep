@@ -1,1 +1,1 @@
-{"sessionId":"s","timestamp":1,"cwd":"/x","toolName":"bash","toolArgs":{"command":"gh pr create --title t --body \"acme is our employer\""}}
+{"sessionId":"s","timestamp":1,"cwd":"/x","toolName":"bash","toolArgs":{"command":"gh issue create -R pub/repo --title \"acme is our employer\""}}

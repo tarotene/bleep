@@ -1,0 +1,6 @@
+{
+  "command": "cd /work && gh issue create -R pub/repo --body-file body.md",
+  "expect": [
+    {"surface": "issue", "action": "create", "repo_source": "flag", "repo": "pub/repo", "body_sources": [], "canonical": false, "noncanonical_reason": "body-path"}
+  ]
+}
