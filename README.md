@@ -4,6 +4,13 @@
 
 A deny/ask gate that prevents AI coding agents from leaking company/private repository names onto public GitHub surfaces (git push, PR/Issue creation, MCP tool calls).
 
+Where it hooks in: `git push` is checked by git's own **pre-push hook**
+(`hooks/pre-push`), which receives the exact refs and SHAs being pushed; `gh`
+and MCP tool calls are checked by the agent host's **PreToolUse hook**
+(`hooks/bleep.sh`). The design principle — shrink what is accepted to a small
+grammar instead of inspecting arbitrary generated commands — is in
+[docs/adr/0003-constructive-grammar.md](docs/adr/0003-constructive-grammar.md).
+
 Formerly `publish-guard` — see [docs/adr/0001-name-bleep.md](docs/adr/0001-name-bleep.md) for why it was renamed.
 
 ## Background
@@ -171,6 +178,29 @@ the hook-timeout caveat below: a missing binary is something this repository
 *can* detect and fail loud on, unlike a timeout, which is out of its hands
 entirely.
 
+### git pre-push hook (required for push checks)
+
+`git push` is **not** inspected by the PreToolUse hook (see
+[docs/adr/0003-constructive-grammar.md](docs/adr/0003-constructive-grammar.md)):
+guessing the pushed range from the command string failed on new branches, other
+worktrees and shallow clones (#67/#69/#73). The check lives in git's pre-push
+hook instead, which gets the exact `<local-ref> <local-sha> <remote-ref>
+<remote-sha>` lines on stdin whatever the command looked like. Place
+`hooks/pre-push` where git looks for hooks — the directory `core.hooksPath`
+points to, or `.git/hooks/` — as a copy or a symlink:
+
+```
+$ ln -s /path/to/bleep/hooks/pre-push "$(git config core.hooksPath || echo .git/hooks)/pre-push"
+```
+
+If you already have a pre-push hook, call `bleep scan-push --pre-push "$1" "$2"`
+from it before anything else reads stdin (git's stdin is inherited by the
+child), and block the push on any non-zero exit — a pre-push hook has no way to
+ask, so `ask` (exit 1) blocks too.
+**Without this hook, pushes are not checked at all**; `bleep doctor` reports it.
+PreToolUse only denies the forms that switch the hook off: `git push
+--no-verify` and `git -c core.hooksPath=… push`.
+
 ### Claude Code
 
 ```
@@ -299,17 +329,15 @@ removed from the scanned text (#43) — the destination a command explicitly
 names is not itself a leak, the same reasoning `cd` already gets; everything
 the destination doesn't cover (titles, bodies, and any oddly-split fragment)
 still stays in the scanned text, so neither narrowing creates a new blind
-spot. If a `git push` segment is found, its effective target directory is
-resolved from that segment's own `-C` override — an absolute `-C` value wins
-outright, a relative one is joined onto the cumulative effect of every
-preceding bare `cd <dir>` segment (not just the first one), matching how a
-real shell resolves a relative `-C` argument (#41; before this, any relative
-`-C` value was used as-is, ignoring both `cd` history and `--cwd`) — or,
-absent a `-C` override, directly from that same cumulative `cd` effect,
-starting at `--cwd`/the hook's own cwd. This is what makes `cd /other/repo
-&& git push` and `cd /other/repo && gh pr create ...` correctly resolve
-visibility/diffs against `/other/repo` instead of the hook process's own cwd
-(#10, #14). Nested `$(...)` command substitutions and other shell-variable
+spot. A `git push` segment is **not** inspected for its range or target: the range is
+decided by the pre-push hook from git's own input (see "What `scan-push`
+checks" below). The only push forms that are denied here are the ones that
+switch that hook off — `--no-verify`, or a `-c core.hooksPath=…` global option
+(reason id `push-hook-bypass`). For `gh`, the effective directory of a segment
+is the cumulative effect of every preceding bare `cd <dir>` segment starting
+at `--cwd`/the hook's own cwd; this is what makes `cd /other/repo && gh pr
+create ...` resolve visibility against `/other/repo` instead of the hook
+process's own cwd (#10, #14). Nested `$(...)` command substitutions and other shell-variable
 expansions are not tracked — this is an approximation within the "not a
 security boundary" scope already stated below.
 
@@ -322,10 +350,22 @@ code contract (for anyone scripting against this themselves):
 | 1 | ask (a bare org-name match, or a bare repo-name match short enough to be downgraded — could collide with a legitimate use, see `BLEEP_SOFT_MAXLEN` above) | one-line reason |
 | 2 | deny (an explicit org/repo reference or a specific repo-name match — almost certainly an unintended leak) | one-line reason |
 
-**What `scan-push` checks**: `bleep scan-push` (and `git push`
-detection via `scan-bash-command`) inspects the **added lines** (plus
-new/renamed file paths) and the full commit message of each commit in the
-range being pushed. **Removed lines are not scanned** (#7 — this addresses
+**What `scan-push` checks**: `bleep scan-push --pre-push <remote-name>
+<remote-url>` (called by `hooks/pre-push`, with git's stdin) inspects the
+**added lines** (plus new/renamed file paths) and the full commit message of
+each commit in the range being pushed. The range comes from the pre-push input,
+not from guessing: `remote-sha..local-sha` when the remote's current tip exists
+locally (an update of an existing branch); otherwise (a new branch, a shallow
+clone whose remote tip isn't present, a remote that is ahead) `local-sha --not
+--remotes=<remote>`, i.e. everything the remote's tracking refs don't already
+have, or the whole history if there are none. Deleting a branch pushes no
+content and is skipped. Visibility (PRIVATE/INTERNAL skips the check) is read
+from the remote's URL. When a deny/ask comes out, the reason names the short
+SHA of the first commit that matched (never the matched word), so a false
+positive can be told apart from a real one (`git show <sha>`). Plain `bleep
+scan-push` (no arguments) is the older compatibility path — it checks
+`merge-base(HEAD, origin/<default>)..HEAD` of the current directory and asks
+when that can't be computed; switch your hook to `--pre-push`. **Removed lines are not scanned** (#7 — this addresses
 the problem where a fix that removes a line containing a denylisted name
 would itself get denied). Deleted content is either already on the base
 (already public) or was already scanned as an added line in an earlier
@@ -391,9 +431,10 @@ evasion. There are three reasons for this.
    of the ACM* 16(10), 1973, pp. 613–615,
    <https://dl.acm.org/doi/10.1145/362375.362389> (accessed 2026-09-10).
 2. **It does not satisfy complete mediation.** This tool only mediates
-   `PreToolUse` events for the `Bash` tool and `mcp__*` tools; it sees
-   nothing on any other path (an agent hitting an API directly, a user
-   working in a separate terminal, etc.).
+   `PreToolUse` events for the `Bash` tool and `mcp__*` tools, plus git's
+   pre-push hook; it sees nothing on any other path (an agent hitting an API
+   directly, a user working in a separate terminal, a push whose hook was
+   disabled through the environment, etc.).
    — Saltzer, J. H. & Schroeder, M. D., "The Protection of Information in
    Computer Systems", 1975,
    <https://www.cs.virginia.edu/~evans/cs551/saltzer/> (accessed 2026-09-10).
@@ -486,9 +527,11 @@ able to read its own way out of a false positive.
 `bleep doctor` prints `ok:` / `NG:` lines and exits 1 on any `NG`. It checks that
 `bleep-hook` runs, that its lex output version matches the `bleep` script (a
 mismatched pair would otherwise misread each other's output; `scan-bash-command`
-also asks in that case, with reason id `lex-protocol-mismatch`), and that
-`hooks/hooks.json` matches both `Bash` and `mcp__` tools (`BLEEP_HOOKS_JSON`
-points it at another file). Design notes:
+also asks in that case, with reason id `lex-protocol-mismatch`), that the
+effective pre-push hook (`core.hooksPath`, else `.git/hooks/`; `BLEEP_PRE_PUSH_HOOK`
+points it at another file) calls `scan-push --pre-push` — without it, pushes are
+not checked — and that `hooks/hooks.json` matches both `Bash` and `mcp__` tools
+(`BLEEP_HOOKS_JSON` points it at another file). Design notes:
 [docs/adr/0002-gh-intent-and-layers.md](docs/adr/0002-gh-intent-and-layers.md).
 
 ## Development

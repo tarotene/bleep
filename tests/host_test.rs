@@ -58,27 +58,6 @@ impl Env {
     fn ledger_dir(&self) -> PathBuf {
         self.tmp.path().join("agent-verdicts")
     }
-
-    /// tests/fixtures/push-cwd-repo.sh の build_cwd_push_repo を bash 経由で
-    /// 呼び、--cwd 検証用リポジトリを作る(D4 — セットアップ手順は単一正本)。
-    fn build_cwd_push_repo(&self) -> String {
-        let script = fixtures_dir().join("push-cwd-repo.sh");
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(format!(
-                "source {:?} && build_cwd_push_repo {:?} && printf '%s' \"$CWD_PUSH_REPO\"",
-                script,
-                self.tmp.path()
-            ))
-            .output()
-            .expect("failed to spawn bash for push-cwd-repo.sh");
-        assert!(
-            out.status.success(),
-            "build_cwd_push_repo failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap()
-    }
 }
 
 fn read_fixture(rel: &str) -> Vec<u8> {
@@ -164,12 +143,18 @@ fn copilot_fixture_corpus() {
 
 #[test]
 fn cwd_passthrough_claude() {
+    // ペイロードの cwd が bleep の --cwd に渡ること。push の範囲はもう cwd に
+    // 依らない(pre-push が決める、ADR-0003)ので、cwd に依存する本文の入力元
+    // (`--body-file` の相対パス)で確かめる。cwd が渡っていれば body.md を
+    // 読めて deny になり、渡っていなければ読めずに ask になる。
     let env = Env::new();
-    let repo = env.build_cwd_push_repo();
-    let deny_cwd_push = serde_json::json!({
+    let work = env.tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("body.md"), "acme/secret-project が話題\n").unwrap();
+    let deny_cwd_body = serde_json::json!({
         "tool_name": "Bash",
-        "tool_input": {"command": "git push origin main"},
-        "cwd": repo,
+        "tool_input": {"command": "gh issue create -R pub/repo --body-file body.md"},
+        "cwd": work,
     });
     let pass_bad_cwd = serde_json::json!({
         "tool_name": "Bash",
@@ -180,7 +165,7 @@ fn cwd_passthrough_claude() {
     let assert = env
         .pg_command()
         .arg("--host=claude")
-        .write_stdin(deny_cwd_push.to_string())
+        .write_stdin(deny_cwd_body.to_string())
         .assert()
         .success();
     assert_eq!(

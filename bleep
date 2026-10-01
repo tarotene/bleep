@@ -48,14 +48,23 @@
 #   bleep scan [FILE]              stdin(既定)または FILE の内容を
 #                                           そのまま denylist と突き合わせる。
 #                                           MCP tool_input 等、任意のテキスト向け。
-#   bleep scan-push                cwd の git リポジトリで、これから
-#                                           push する各コミットの追加行
-#                                           (+ 新規/rename 先ファイルパス)と
-#                                           commit log を検査する。削除行は
-#                                           対象外(#7 — 既公開内容の除去は
-#                                           新規公開ではない)。対象リポジトリが
+#   bleep scan-push --pre-push REMOTE-NAME REMOTE-URL
+#                                           git の pre-push hook(hooks/pre-push)
+#                                           から呼ぶ。stdin の
+#                                           `<local-ref> <local-sha> <remote-ref>
+#                                           <remote-sha>` から、これから push
+#                                           する各コミットの追加行(+ 新規/rename
+#                                           先ファイルパス)と commit log を検査
+#                                           する。削除行は対象外(#7)。対象
+#                                           リポジトリ(remote の URL)が
 #                                           PRIVATE/INTERNAL と判明していれば
-#                                           検査自体をスキップする。
+#                                           検査自体をスキップする。deny/ask の
+#                                           理由文に、一致した commit の短い
+#                                           SHA を出す(#67)。ADR-0003。
+#   bleep scan-push                引数なし。cwd の default branch との
+#                                           merge-base..HEAD を検査する従来の
+#                                           互換経路(新規ブランチ・shallow clone
+#                                           では範囲を求められず ask になる)。
 #   bleep scan-bash-command CMD     シェルコマンド文字列を検査する。
 #                                           CMD を ; && || | 改行で区切った
 #                                           セグメントごとに、global option
@@ -74,12 +83,11 @@
 #                                           だけを除いたテキストを検査する
 #                                           (#9 — cd のパス引数に private
 #                                           リポ名が含まれるだけでは deny
-#                                           しない)。"git push" セグメントが
-#                                           見つかれば、先行する cd の積み
-#                                           重ね(または同セグメントの -C)
-#                                           から解決した実効ディレクトリで
-#                                           scan-push と同じ diff+log を検査
-#                                           する。どちらの形も無ければ
+#                                           しない)。"git push" は中身を検査
+#                                           せず(pre-push が検査する、
+#                                           ADR-0003)、pre-push を無効にする
+#                                           形(--no-verify、-c core.hooksPath=)
+#                                           だけを deny する。どちらの形も無ければ
 #                                           無検査で pass。
 #   bleep audit [path...] [--remote] [--since REV]
 #                                           指定ファイル(省略時は git ls-files
@@ -105,7 +113,7 @@ BLEEP_VERSION='0.2.0'
 
 # bleep-hook lex の出力形式の版(src/main.rs の LEX_PROTOCOL と揃える)。
 # 出力の先頭行 `#lex <版>` と一致しなければ ask にする(bleep doctor でも検査)。
-LEX_PROTOCOL=2
+LEX_PROTOCOL=3
 
 SELF="$(realpath "$0")"
 TEST_TMP=''
@@ -153,7 +161,7 @@ init_vars
 
 usage() {
   cat <<'EOF'
-usage: bleep [--cwd DIR] <scan [FILE]|scan-push|scan-bash-command CMD|
+usage: bleep [--cwd DIR] <scan [FILE]|scan-push [--pre-push REMOTE URL]|scan-bash-command CMD|
                        audit [path...] [--remote] [--since REV]|
                        explain TERM_HASH|refresh-cache|doctor|selftest>
 
@@ -176,7 +184,12 @@ orgs.txt が存在しなければ scan* は ask を返す(空ファイルは明�
 
 doctor: 導入の健全性を検査する。hooks/hooks.json の matcher が Bash と mcp__
   を覆っているか、bleep-hook を実行できるか、bash 本体と bleep-hook の lex
-  出力形式の版が一致しているかを ok/NG で印字し、NG があれば exit 1。
+  出力形式の版が一致しているか、有効な pre-push hook が `scan-push --pre-push`
+  を呼んでいるか(無いと push は無検査)を ok/NG で印字し、NG があれば exit 1。
+
+scan-push --pre-push REMOTE-NAME REMOTE-URL: git の pre-push hook の入力(stdin の
+  `<local-ref> <local-sha> <remote-ref> <remote-sha>`)で push を検査する。
+  hooks/pre-push から呼ぶ。引数なしの scan-push は互換経路(ADR-0003)。
 
 explain TERM_HASH: 判定レッジャー(agent-verdicts/bleep.jsonl)の term_hash
   1件から、現在の denylist のどの語がそれに一致するかを人間の端末で復元する
@@ -724,87 +737,34 @@ push_diff_fail() {
   return 1
 }
 
-# compute_push_diff_text: これから push する範囲の「追加行」+ 新規/rename 先
-# ファイルパス + コミットメッセージを連結して出力する(#7 — 削除行は既公開
-# 内容の除去であり新規公開ではないため検査対象外)。範囲が解決できない場合は
-# 非 0 を返し、「[コード] 理由文」を stdout に1行書く(fail-loud — 呼び出し側は
-# これを ask にエスカレートする。無言の pass にはしない)。以前は理由文を
-# グローバル変数に積んでいたが、呼び出し側が常に `text="$(compute_push_diff_text)"`
-# の形(コマンド置換 = サブシェル)で呼ぶため、その代入は呼び出し元に伝わら
-# なかった(#39)。コマンド置換は stdout だけを持ち帰るため、理由文も stdout
-# に乗せる。
-#
-# 範囲は2通り(#54):
-#   - PUSH_SPEC(lex が git push の引数から求めた「<remote> <src>…」)があり、
-#     その remote の追跡 ref が1つでもあるとき: `<src>… --not --remotes=<remote>`
-#     — 実際に push される ref を、remote が既に持つ内容を除いて検査する。
-#     default branch や merge-base の解決に依存しない(githooks の pre-push が
-#     stdin で受け取る local ref / remote oid の考え方に相当。PreToolUse の
-#     時点では stdin が無いので、コマンド文字列から求める)。
-#   - それ以外: 従来どおり default branch との merge-base..HEAD。
-compute_push_diff_text() {
-  local dir="${TARGET_CWD:-.}"
-  # dir が存在しなければ、この時点で切り分け可能な理由を出す(#39 —
-  # 以前は merge-base 失敗の理由文に埋もれ、tilde 未展開等による無効な
-  # --cwd/push_dir を利用者が特定できなかった)。
-  if [[ ! -d $dir ]]; then
-    push_diff_fail dir-missing "push 対象ディレクトリが存在しません: ${dir}"
-    return 1
-  fi
-  local git_err
-  if ! git_err="$(git -C "$dir" rev-parse --git-dir 2>&1 >/dev/null)"; then
-    push_diff_fail not-a-repo "push 対象が git リポジトリとして読めません: ${dir} (${git_err%%$'\n'*})"
-    return 1
-  fi
-
-  local -a range=()
-  local spec="${PUSH_SPEC:-}" remote src srcs_str
-  local -a srcs=()
-  if [[ -n $spec ]]; then
-    read -r remote srcs_str <<< "$spec"
-    read -r -a srcs <<< "$srcs_str"
-    if [[ -n $(git -C "$dir" for-each-ref --count=1 "refs/remotes/$remote/" 2>/dev/null) ]]; then
-      for src in "${srcs[@]}"; do
-        if ! git -C "$dir" rev-parse --verify --quiet "${src}^{commit}" > /dev/null 2>&1; then
-          push_diff_fail range "push 元の ref を解決できません: ${src}"
-          return 1
-        fi
-      done
-      range=("${srcs[@]}" --not "--remotes=$remote")
-    fi
-  fi
-  if [[ ${#range[@]} -eq 0 ]]; then
-    local default_branch base
-    default_branch="$(resolve_default_branch)"
-    if [[ -z $default_branch ]]; then
-      push_diff_fail default-branch "default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。"
-      return 1
-    fi
-    base="$(git -C "$dir" merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
-    if [[ -z $base ]]; then
-      push_diff_fail merge-base "origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性)。"
-      return 1
-    fi
-    range=("$base..HEAD")
-  fi
-
+# diff_text_for_range: git log の rev 指定(範囲 `A..B`、`X --not --remotes=R`、
+# 単独 commit の `-1 SHA` など)から、「追加行」+ 新規/rename 先ファイルパス +
+# コミットメッセージを連結して出力する(#7 — 削除行は既公開内容の除去であり
+# 新規公開ではないため検査対象外)。push の検査(scan-push の 2 経路)と
+# audit --since が共有する単一の抽出正本(D7)。$1=対象ディレクトリ。
+# git log が失敗したら「[range] 理由文」を stdout に1行書いて非 0 を返す
+# (fail-loud — 失敗が「追加行なし」= pass にならないよう、終了コードで検出する、
+# #54)。理由文を stdout に乗せるのは、呼び出し側が常に `text="$(fn)"`
+# (コマンド置換 = サブシェル)で呼ぶためで、グローバル変数への代入は親に
+# 伝わらないから(#39)。
+diff_text_for_range() {
+  local dir="$1"
+  shift
   local patches names msgs
   # per-commit patch(--format= でメッセージを混ぜない)。merge コミットは
   # --diff-merges=first-parent で第1親との diff を出す — evil merge(どちらの
   # 親にも無い行を解決結果に足す)の追加行もここに現れる。--no-renames で
   # rename を add+delete に展開し、-U0 で無関係な文脈行を落とす。
-  # git log 自体の失敗は空出力と区別できないので、終了コードで検出する(#54 —
-  # 以前は失敗が「追加行なし」= pass になり得た)。
-  if ! patches="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= "${range[@]}" 2>/dev/null)"; then
-    push_diff_fail range "git log が失敗しました(範囲: ${range[*]})。"
+  if ! patches="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= "$@" 2>/dev/null)"; then
+    push_diff_fail range "git log が失敗しました(範囲: $*)。"
     return 1
   fi
   # 追加/rename 先のファイルパスは patch 本文に依存せず明示的に列挙する
   # (空ファイル・バイナリには +++ ヘッダ自体が出ないため、grep '^+' だけでは
   # パス名検出が漏れる)。
-  if ! names="$(git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "${range[@]}" 2>/dev/null)" ||
-    ! msgs="$(git -C "$dir" log --format=%B "${range[@]}" 2>/dev/null)"; then
-    push_diff_fail range "git log が失敗しました(範囲: ${range[*]})。"
+  if ! names="$(git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "$@" 2>/dev/null)" ||
+    ! msgs="$(git -C "$dir" log --format=%B "$@" 2>/dev/null)"; then
+    push_diff_fail range "git log が失敗しました(範囲: $*)。"
     return 1
   fi
 
@@ -812,6 +772,54 @@ compute_push_diff_text() {
   printf '%s\n' "$names"
   printf '%s\n' "$msgs"
   return 0
+}
+
+# push_dir_check: $1=push 対象ディレクトリが git リポジトリとして読めるか。
+# 読めなければ「[コード] 理由文」を stdout に書いて非 0(#39 — 以前は
+# merge-base 失敗の理由文に埋もれ、tilde 未展開等による無効な --cwd を
+# 利用者が特定できなかった)。
+push_dir_check() {
+  local dir="$1" git_err
+  if [[ ! -d $dir ]]; then
+    push_diff_fail dir-missing "push 対象ディレクトリが存在しません: ${dir}"
+    return 1
+  fi
+  if ! git_err="$(git -C "$dir" rev-parse --git-dir 2>&1 >/dev/null)"; then
+    push_diff_fail not-a-repo "push 対象が git リポジトリとして読めません: ${dir} (${git_err%%$'\n'*})"
+    return 1
+  fi
+  return 0
+}
+
+# compute_push_diff_text: 引数なしの `scan-push`(従来の経路)が検査する範囲 —
+# default branch との merge-base..HEAD — の差分テキストを出力する。範囲が
+# 解決できない場合は非 0 を返し、「[コード] 理由文」を stdout に1行書く
+# (fail-loud — 呼び出し側はこれを ask にエスカレートする。無言の pass には
+# しない、#39)。
+#
+# PreToolUse の `git push` コマンド文字列から push の範囲を推測する経路(#54 の
+# PUSH_SPEC)は廃止した(ADR-0003): コマンドの書き方に依存する推測は、新規
+# ブランチ・別 worktree・shallow clone などで外れ、同じ偽陽性の ask を繰り返し
+# 生んだ(#67/#69/#73)。push の範囲は git の pre-push が stdin で渡す正確な
+# ref と SHA から求める(cmd_scan_pre_push)。この関数は、pre-push の配線が
+# stdin を渡さない旧い呼び出し(`bleep scan-push < /dev/null`)のための互換経路
+# として残している。
+compute_push_diff_text() {
+  local dir="${TARGET_CWD:-.}"
+  push_dir_check "$dir" || return 1
+
+  local default_branch base
+  default_branch="$(resolve_default_branch)"
+  if [[ -z $default_branch ]]; then
+    push_diff_fail default-branch "default branch を解決できませんでした(origin/HEAD 未設定・main/master 不在)。"
+    return 1
+  fi
+  base="$(git -C "$dir" merge-base HEAD "origin/$default_branch" 2>/dev/null)" || base=""
+  if [[ -z $base ]]; then
+    push_diff_fail merge-base "origin/${default_branch} との merge-base を解決できませんでした(未 fetch の可能性)。"
+    return 1
+  fi
+  diff_text_for_range "$dir" "$base..HEAD"
 }
 
 # resolve_repo_nwo: $1(省略可)がシェルコマンド文字列なら --repo/-R 明示
@@ -827,7 +835,14 @@ resolve_repo_nwo() {
   fi
   local url
   url="$(git -C "${TARGET_CWD:-.}" remote get-url origin 2>/dev/null)" || return 1
-  url="${url%.git}"
+  nwo_from_url "$url"
+}
+
+# nwo_from_url: $1=git remote の URL -> github.com の owner/repo(標準出力)。
+# owner/repo の形に読めなければ非 0。可視性の判定に使うだけで、読めない
+# ときは UNKNOWN 扱い(検査続行)になる。
+nwo_from_url() {
+  local url="${1%.git}"
   url="${url#git@github.com:}"
   url="${url#https://github.com/}"
   url="${url#ssh://git@github.com/}"
@@ -938,11 +953,25 @@ cmd_explain() {
   return 0
 }
 
-# cmd_scan_push: cwd の git リポジトリで、これから push する差分を検査する。
-# 対象リポジトリが PRIVATE/INTERNAL と判明していれば検査自体をスキップする
-# (これは「検査しない」という正当な判定であり、fail-loud の対象ではない)。
-# diff/log 自体が計算できない場合は ask にエスカレートする(以前は無言 exit 0)。
+# cmd_scan_push: これから push する差分を検査する。2 つの呼び方がある。
+#   bleep scan-push --pre-push REMOTE-NAME REMOTE-URL < (pre-push の stdin)
+#     git の pre-push hook(hooks/pre-push)から呼ぶ本命の経路。範囲は git が
+#     stdin で渡す `<local-ref> <local-sha> <remote-ref> <remote-sha>` から
+#     求める(cmd_scan_pre_push)。
+#   bleep scan-push
+#     引数なし。cwd の default branch との merge-base..HEAD を検査する従来の
+#     経路。pre-push の配線が stdin を渡さない旧い呼び出し向けの互換経路で、
+#     新規ブランチ・shallow clone などでは範囲を求められず ask になる
+#     (#69/#73)— 配線を `--pre-push` に切り替えれば起きない。
+# どちらも、対象リポジトリが PRIVATE/INTERNAL と判明していれば検査自体を
+# スキップする(これは「検査しない」という正当な判定であり、fail-loud の
+# 対象ではない)。diff/log 自体が計算できない場合は ask にエスカレートする。
 cmd_scan_push() {
+  if [[ ${1-} == --pre-push ]]; then
+    shift
+    cmd_scan_pre_push "$@"
+    return
+  fi
   local nwo vis
   nwo="$(resolve_repo_nwo)" || nwo=""
   if [[ -n $nwo ]]; then
@@ -960,6 +989,104 @@ cmd_scan_push() {
   build_patterns
   if match_verdict "$text"; then
     emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
+  fi
+  exit 0
+}
+
+# push_range_for_ref: pre-push の 1 行(local-sha / remote-sha)から git log の
+# rev 指定を求め、配列 push_range に入れる。範囲は 2 通り:
+#   - remote-sha が全 0 でなく、ローカルにある commit なら `remote..local`
+#     (既存ブランチの更新)。
+#   - それ以外(新規ブランチ、shallow clone でリモートの先端が手元に無い、
+#     リモートが先行している)は `local --not --remotes=<remote>`。追跡 ref が
+#     1 本も無ければ `local` だけ — リモートに何があるか分からない以上、
+#     履歴全体が公開されるので全部が検査対象で正しい。
+# $1=dir $2=remote-name $3=local-sha $4=remote-sha
+push_range=()
+push_range_for_ref() {
+  local dir="$1" remote="$2" lsha="$3" rsha="$4"
+  if [[ ! $rsha =~ ^0+$ ]] && git -C "$dir" cat-file -e "${rsha}^{commit}" 2>/dev/null; then
+    push_range=("${rsha}..${lsha}")
+  else
+    push_range=("$lsha" --not "--remotes=$remote")
+  fi
+}
+
+# attribute_commit: push_range の commit を 1 つずつ照合し直し、最初に一致した
+# commit の短い SHA を出力する(#67 — どの commit が止めたかが分からず、
+# 一致が context 行なのか中間 commit の patch なのかを切り分けられなかった)。
+# 語は出さない。100 commit を超える範囲は属性づけを諦めて空を返す。
+# match_verdict のグローバル(VERDICT 等)を壊すので、呼び出し側は先に退避する。
+# $1=dir、範囲は配列 push_range。
+attribute_commit() {
+  local dir="$1" sha t n=0
+  while IFS= read -r sha; do
+    [[ -n $sha ]] || continue
+    n=$((n + 1))
+    ((n <= 100)) || return 0
+    t="$(diff_text_for_range "$dir" -1 "$sha")" || continue
+    if match_verdict "$t"; then
+      git -C "$dir" rev-parse --short "$sha" 2>/dev/null
+      return 0
+    fi
+  done < <(git -C "$dir" rev-list "${push_range[@]}" 2>/dev/null)
+  return 0
+}
+
+# cmd_scan_pre_push: git の pre-push hook の入力で push を検査する(ADR-0003)。
+# $1=remote の名前 $2=remote の URL(pre-push hook の引数そのまま)。stdin は
+# 1 ref 1 行 `<local-ref> <local-sha> <remote-ref> <remote-sha>`。コマンドの
+# 書き方(`git -C`、`cd`、変数、refspec の省略形)に関係なく、git が正規化した
+# ref と完全な SHA が来るので、範囲を推測しない。
+# pre-push には ask を確かめる手段が無いので、hooks/pre-push は ask(exit 1)も
+# 止める。
+cmd_scan_pre_push() {
+  local remote="${1-}" url="${2-}"
+  [[ -n $remote ]] || { usage >&2; exit 2; }
+  local dir="${TARGET_CWD:-.}"
+
+  local nwo vis
+  nwo="$(nwo_from_url "$url")" || nwo=""
+  if [[ -n $nwo ]]; then
+    vis="$(repo_visibility "$nwo")"
+    [[ $vis == PRIVATE || $vis == INTERNAL ]] && exit 0
+  fi
+
+  local lref lsha rref rsha chunk text='' dir_err
+  if ! dir_err="$(push_dir_check "$dir")"; then
+    local code="${dir_err#\[}"
+    code="${code%%\]*}"
+    emit_verdict ask "push 差分を検査できませんでした: ${dir_err}" push-diff-failed none "" "$code"
+  fi
+  local -a all_ranges=()
+  while read -r lref lsha rref rsha; do
+    [[ -n $lsha ]] || continue
+    # 削除(local が (delete) で sha が全 0)は公開する内容が無い。
+    [[ $lsha =~ ^0+$ ]] && continue
+    push_range_for_ref "$dir" "$remote" "$lsha" "$rsha"
+    if ! chunk="$(diff_text_for_range "$dir" "${push_range[@]}")"; then
+      local code="${chunk#\[}"
+      code="${code%%\]*}"
+      emit_verdict ask "push 差分を検査できませんでした: ${chunk}" push-diff-failed none "" "$code"
+    fi
+    text+="$chunk"$'\n'
+    all_ranges+=("${push_range[*]}")
+  done
+
+  [[ -n $text ]] || exit 0
+  require_orgs_file
+  build_patterns
+  if match_verdict "$text"; then
+    local verdict="$VERDICT" class="$MATCH_CLASS" term="$MATCH_TERM"
+    local reason sha='' r
+    reason="$(verdict_reason "$verdict" "$class")"
+    for r in "${all_ranges[@]}"; do
+      read -r -a push_range <<< "$r"
+      sha="$(attribute_commit "$dir")"
+      [[ -n $sha ]] && break
+    done
+    [[ -n $sha ]] && reason+=" 一致した commit: ${sha}(git show ${sha} で確認できます)。"
+    emit_verdict "$verdict" "$reason" "$(reason_id_for_verdict "$verdict" "$class")" "$class" "$term"
   fi
   exit 0
 }
@@ -994,13 +1121,15 @@ cmd_scan_push() {
 # ディレクトリ解決)は $LEX_BIN(bleep-hook、D1)に委ねる。この
 # バイナリは純粋関数のみで I/O・gh を一切行わないため、判定不能を無言 pass
 # にしない fail-loud の格は落ちない — 起動自体に失敗したら ask にエスカレート
-# する(下記 lex_out の読み取り失敗を参照)。出力は6行の固定ヘッダ
-# (found_push/push_dir/found_gh/gh_repo_override/gh_effective_dir/
-# unresolved_var)+ scan_subject(jq 非依存を保つための独自の単純書式、
-# bleep-hook lex --help 参照)。照合対象(scan subject)は CMD 全文から
-# `cd <単一トークン>` セグメントだけを除いたもの(#9)。push/gh のどちらの
-# 形も見つからなければ無検査で pass(フォールスルー)。Claude/Codex/Copilot
-# の Bash 系 host が共通で呼ぶ、シェルコマンド用の唯一の判定入口。
+# する(下記 lex_out の読み取り失敗を参照)。出力は先頭の `#lex <版>` 行と
+# 固定ヘッダ(found_push/push_bypass/found_gh/gh_repo_override/
+# gh_effective_dir/unresolved_var/body_unresolved + 本文の入力元)+
+# scan_subject(jq 非依存を保つための独自の単純書式、bleep-hook lex --help
+# 参照)。照合対象(scan subject)は CMD 全文から `cd <単一トークン>`
+# セグメントだけを除いたもの(#9)。git push は pre-push hook を無効にする
+# 形だけを deny し、中身は見ない(ADR-0003)。gh の形も見つからなければ
+# 無検査で pass(フォールスルー)。Claude/Codex/Copilot の Bash 系 host が
+# 共通で呼ぶ、シェルコマンド用の唯一の判定入口。
 cmd_scan_bash_command() {
   local cmd="${1-}"
   [[ -n $cmd ]] || { usage >&2; exit 2; }
@@ -1010,8 +1139,8 @@ cmd_scan_bash_command() {
     emit_verdict ask "コマンドの字句解析に失敗しました(bleep-hook が見つからないか実行できません)。" lex-failed
   fi
 
-  local found_push found_gh push_dir gh_repo_override gh_effective_dir unresolved_var scan_subject
-  local lex_header push_spec body_unresolved body_n body_path i
+  local found_push push_bypass found_gh gh_repo_override gh_effective_dir unresolved_var scan_subject
+  local lex_header body_unresolved body_n body_path i
   local -a body_paths=()
   {
     IFS= read -r lex_header
@@ -1019,12 +1148,11 @@ cmd_scan_bash_command() {
       emit_verdict ask "bleep-hook の lex 出力形式(${lex_header:-空})が bleep 本体(#lex ${LEX_PROTOCOL})と一致しません。bleep と bleep-hook を同じ版に揃えてください(bleep doctor で確認できます)。" lex-protocol-mismatch
     fi
     IFS= read -r found_push
-    IFS= read -r push_dir
+    IFS= read -r push_bypass
     IFS= read -r found_gh
     IFS= read -r gh_repo_override
     IFS= read -r gh_effective_dir
     IFS= read -r unresolved_var
-    IFS= read -r push_spec
     IFS= read -r body_unresolved
     IFS= read -r body_n
     for ((i = 0; i < body_n; i++)); do
@@ -1034,11 +1162,21 @@ cmd_scan_bash_command() {
     scan_subject="$(cat)"
   } <<< "$lex_out"
 
-  # #34: cd/-C/--repo/-R の対象に未展開のシェル変数が残り、静的に解決
+  # ADR-0003: push の中身は PreToolUse では見ない。コマンド文字列から push の
+  # 範囲を推測する経路は、新規ブランチ・別 worktree・shallow clone で外れて
+  # 同じ偽陽性の ask を繰り返した(#67/#69/#73)。検査は git の pre-push
+  # (hooks/pre-push → `scan-push --pre-push`)が、git が渡す正確な ref と SHA
+  # で行う。ここで止めるのは、pre-push を無効にする形だけ — それを許すと検査が
+  # 素通りになる。
+  if [[ $found_push == "1" && $push_bypass == "1" ]]; then
+    emit_verdict deny "git push が pre-push hook を無効にする形(--no-verify、または -c core.hooksPath=)になっています。push の検査は pre-push hook で行うため、この形では実行できません。--no-verify と -c core.hooksPath を外して push し直してください。" push-hook-bypass
+  fi
+
+  # #34: cd/--repo/-R の対象に未展開のシェル変数が残り、静的に解決
   # できなかった場合は、denylist 照合にフォールバックせず即座に ask へ
   # エスカレートする(値を推測で使わない — 検出して人間に委ねる設計)。
   if [[ $unresolved_var == "1" ]]; then
-    emit_verdict ask "コマンド中の cd/-C/--repo/-R の対象にシェル変数(未展開の \$...)が含まれ、対象リポジトリを静的に解決できません。パスをリテラルで書き直してください。" unresolved-var
+    emit_verdict ask "コマンド中の cd/--repo/-R の対象にシェル変数(未展開の \$...)が含まれ、対象リポジトリを静的に解決できません。パスをリテラルで書き直してください。" unresolved-var
   fi
 
   if [[ $found_gh == "1" ]]; then
@@ -1052,8 +1190,6 @@ cmd_scan_bash_command() {
       gh_nwo="$(resolve_repo_nwo)" || gh_nwo=""
       TARGET_CWD="$saved_target"
     fi
-    # 優先順位は従来どおり gh > git push(1個のコマンドに両方が含まれる
-    # 稀なケースでは gh 側だけを検査する — 既存実装からの引き継ぎ)。
     if [[ -n $gh_nwo ]]; then
       local vis
       vis="$(repo_visibility "$gh_nwo")"
@@ -1081,32 +1217,19 @@ cmd_scan_bash_command() {
     exit 0
   fi
 
-  if [[ $found_push == "1" ]]; then
-    TARGET_CWD="$push_dir"
-    PUSH_SPEC="$push_spec"
-    cmd_scan_push
-    return
-  fi
-
   exit 0
 }
 
 # compute_since_diff_text: $1=since_rev -> "$1..HEAD" 範囲の追加行 + 新規/
-# rename 先ファイルパス + commit メッセージを出力する。抽出ロジックは
-# compute_push_diff_text(bleep 内の単一正本、D7)と同じ3本の git
-# 呼び出しを流用するが、default branch/merge-base の自動解決はしない —
-# audit --since はユーザが明示的に起点を指定する手動操作であり、push の
-# fail-loud 経路(起点を自動解決できなければ ask)とは前提が異なる。
+# rename 先ファイルパス + commit メッセージを出力する。抽出は push の検査と
+# 同じ diff_text_for_range(bleep 内の単一正本、D7)。default branch/
+# merge-base の自動解決はしない — audit --since はユーザが明示的に起点を指定する
+# 手動操作であり、push の fail-loud 経路(起点を自動解決できなければ ask)とは
+# 前提が異なる。範囲を解決できなければ非 0(「[range] 理由文」を stdout に
+# 書く)。
 compute_since_diff_text() {
   local since="$1" dir="${TARGET_CWD:-.}"
-  local patches
-  patches="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= "$since"..HEAD 2>/dev/null)"
-  grep '^+' <<< "$patches" || true
-
-  git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= "$since"..HEAD 2>/dev/null
-
-  git -C "$dir" log --format=%B "$since"..HEAD 2>/dev/null
-  return 0
+  diff_text_for_range "$dir" "$since"..HEAD
 }
 
 audit() {
@@ -1136,8 +1259,10 @@ audit() {
   # 囲むと判定レッジャー用の付随変数がサブシェルに閉じてしまうため)。
   if [[ -n $since ]]; then
     local since_text
-    since_text="$(compute_since_diff_text "$since")"
-    if match_verdict "$since_text"; then
+    if ! since_text="$(compute_since_diff_text "$since")"; then
+      printf 'ask: history-since=%s を検査できませんでした: %s\n' "$since" "$since_text"
+      hit=1
+    elif match_verdict "$since_text"; then
       printf '%s: history-since=%s\n' "$VERDICT" "$since"
       hit=1
     fi
@@ -1485,6 +1610,25 @@ acme で議論した"
     git -C "$d" config commit.gpgsign false
   }
 
+  # pre_push_run: $1=repo dir $2=remote 名 $3...=ブランチ名。git が pre-push に
+  # 渡す stdin(`<local-ref> <local-sha> <remote-ref> <remote-sha>`)を
+  # 組み立てて `scan-push --pre-push` を実行し、その終了コードを返す(0/1/2 を
+  # 区別したいので、実 git の push を通さずに hook の入力を再現する。実際の
+  # git push と hooks/pre-push を通す検査は、下の e2e 節にある)。
+  # remote-sha は、追跡 ref が既にあればその値、無ければ全 0(新規ブランチ)。
+  pre_push_run() {
+    local d="$1" remote="$2" b lsha rsha url
+    shift 2
+    url="$(git -C "$d" remote get-url "$remote")"
+    {
+      for b in "$@"; do
+        lsha="$(git -C "$d" rev-parse "$b")"
+        rsha="$(git -C "$d" rev-parse -q --verify "refs/remotes/$remote/$b" || printf '%040d' 0)"
+        printf 'refs/heads/%s %s refs/heads/%s %s\n' "$b" "$lsha" "$b" "$rsha"
+      done
+    } | (cd "$d" && "$SELF" scan-push --pre-push "$remote" "$url") > /dev/null 2>&1
+  }
+
   # #7 本体: base に denylist 名を含む行が既にある状態から、それを削除する
   # コミットだけを積んだら pass になること(削除行は検査対象外)。
   local repo3="$tmp/repo3"
@@ -1500,7 +1644,7 @@ acme で議論した"
   git -C "$repo3" add f.txt
   git -C "$repo3" commit -qm "remove secret mention"
   set +e
-  (cd "$repo3" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  pre_push_run "$repo3" origin main
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#7: 削除のみは pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1523,7 +1667,7 @@ acme で議論した"
   git -C "$repo4" add f.txt
   git -C "$repo4" commit -qm "remove it again"
   set +e
-  (cd "$repo4" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  pre_push_run "$repo4" origin main
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(ブランチ内 add→remove は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1543,7 +1687,7 @@ acme で議論した"
   git -C "$repo5" add secret-project
   git -C "$repo5" commit -qm "add empty file"
   set +e
-  (cd "$repo5" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  pre_push_run "$repo5" origin main
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(秘密名の空ファイル追加は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1560,7 +1704,7 @@ acme で議論した"
   git -C "$repo6" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
   git -C "$repo6" commit -q --allow-empty -m "acme/secret-project の件"
   set +e
-  (cd "$repo6" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  pre_push_run "$repo6" origin main
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(メッセージ経由は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1595,17 +1739,48 @@ acme で議論した"
   git -C "$repo7" add f.txt
   git -C "$repo7" commit -qm "remove the evil-merge line"
   set +e
-  (cd "$repo7" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  pre_push_run "$repo7" origin main
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(evil merge の追加は deny): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
 
-  # scan-bash-command: 実際の Bash tool_input 相当の入力で deny/ask/フォールスルー
+  # git push の検査は pre-push(scan-push --pre-push)が担う(ADR-0003)。
+  # 同じ repo(origin/main に対して secret を含む commit が積んである)で、
+  # pre-push は deny し、PreToolUse の scan-bash-command は push の中身を見ずに
+  # pass する(中身の検査を二重に持たない)。
+  set +e
+  pre_push_run "$repo" origin main
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(scan-push --pre-push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+
   set +e
   (cd "$repo" && "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
   rc=$?
   set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(scan-bash-command git push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 0 ]] || { echo "FAIL(scan-bash-command git push は中身を見ずに pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # pre-push を無効にする形だけは PreToolUse が deny する(これを許すと検査が
+  # 素通りになる)。理由文は --no-verify / core.hooksPath の外し方を案内する。
+  local bypass_cmd
+  while IFS= read -r bypass_cmd; do
+    set +e
+    out="$(cd "$repo" && "$SELF" scan-bash-command "$bypass_cmd" 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 2 && $out == *'pre-push'* ]] || { echo "FAIL(pre-push 迂回は deny: $bypass_cmd): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  done <<'BYPASS'
+git push --no-verify origin main
+git push origin main --no-verify
+git -c core.hooksPath=/dev/null push origin main
+cd /tmp && git -c core.hookspath=/dev/null push
+git -C /x push --no-verify
+BYPASS
+  set +e
+  (cd "$repo" && "$SELF" scan-bash-command 'git -c user.name=x push origin main') > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(無関係な -c は迂回ではない): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
 
   set +e
   (cd "$repo" && "$SELF" scan-bash-command 'gh pr create --title t --body "acme is our employer"') > /dev/null 2>&1
@@ -1628,11 +1803,14 @@ acme で議論した"
 
   # --cwd: プロセス自身の cwd を $repo に変えずとも同じ結果になること
   # (#10/#14 の第一段。実効ディレクトリの cd 追跡は段2で検証する)。
+  local main_sha
+  main_sha="$(git -C "$repo" rev-parse main)"
   set +e
-  "$SELF" --cwd "$repo" scan-bash-command 'git push origin main' > /dev/null 2>&1
+  printf 'refs/heads/main %s refs/heads/main %040d\n' "$main_sha" 0 |
+    "$SELF" --cwd "$repo" scan-push --pre-push origin "$tmp/remote.git" > /dev/null 2>&1
   rc=$?
   set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(--cwd git push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 2 ]] || { echo "FAIL(--cwd scan-push --pre-push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   set +e
   "$SELF" --cwd "$repo" scan-bash-command 'gh pr create --title t --body "acme is our employer"' > /dev/null 2>&1
@@ -1644,7 +1822,8 @@ acme で議論した"
   # 通って ask にエスカレートする — 無言 pass にはしない。理由文に解決後の
   # パスが出ること(原因切り分けの回帰)も確認する。
   set +e
-  out="$("$SELF" --cwd "$tmp/does-not-exist" scan-bash-command 'git push origin main' 2>&1)"
+  out="$(printf 'refs/heads/main %s refs/heads/main %040d\n' "$main_sha" 0 |
+    "$SELF" --cwd "$tmp/does-not-exist" scan-push --pre-push origin "$tmp/remote.git" 2>&1)"
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(--cwd 解決不能): 期待=1(ask) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
@@ -1653,36 +1832,11 @@ acme で議論した"
     *) echo "FAIL(--cwd 解決不能 理由文): 解決後パスが出ていない: $out" >&2; fails=$((fails + 1)) ;;
   esac
 
-  # tilde 展開の end-to-end 回帰(#39): $repo と同じ構成のリポジトリを HOME
-  # 配下に置き、`cd ~/repo && git push` 形式で deny(denylist 一致)になる
-  # ことを確認する — bleep-hook lex の HOME 展開が実際に効いている証跡。
-  local home_tmp="$tmp/home-tilde" repo_tilde="$tmp/home-tilde/repo"
-  mkdir -p "$repo_tilde"
-  git -C "$repo_tilde" init -qb main
-  git -C "$repo_tilde" config core.hooksPath /dev/null
-  git -C "$repo_tilde" config user.email test@example.invalid
-  git -C "$repo_tilde" config user.name test
-  git -C "$repo_tilde" config commit.gpgsign false
-  echo "clean content" > "$repo_tilde/a.txt"
-  git -C "$repo_tilde" add a.txt
-  git -C "$repo_tilde" commit -qm initial
-  git init -q --bare "$tmp/remote-tilde.git"
-  git -C "$repo_tilde" remote add origin "$tmp/remote-tilde.git"
-  git -C "$repo_tilde" push -q origin main
-  git -C "$repo_tilde" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
-  echo "acme/secret-project が話題" >> "$repo_tilde/a.txt"
-  git -C "$repo_tilde" add a.txt
-  git -C "$repo_tilde" commit -qm "mentions acme/secret-project"
-  set +e
-  out="$(HOME="$home_tmp" "$SELF" scan-bash-command 'cd ~/repo && git push origin main' 2>&1)"
-  rc=$?
-  set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(tilde 展開 e2e): 期待=2(deny) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
-
   # BLEEP_ALLOW=1 は --cwd を剥がした後の "$1"(サブコマンド名)を見る
   # ため、--cwd 付きでも bypass が効くこと(dispatch 前段の並び順の回帰)。
   set +e
-  BLEEP_ALLOW=1 "$SELF" --cwd "$repo" scan-bash-command 'git push origin main' > /dev/null 2>&1
+  printf 'refs/heads/main %s refs/heads/main %040d\n' "$main_sha" 0 |
+    BLEEP_ALLOW=1 "$SELF" --cwd "$repo" scan-push --pre-push origin "$tmp/remote.git" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(--cwd + ALLOW=1): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1709,17 +1863,31 @@ acme で議論した"
   git -C "$repo_b" add f.txt
   git -C "$repo_b" commit -qm "mentions acme/secret-project"
 
+  # ADR-0003: push の書き方(`git -C <dir>`、`cd <dir> &&`、相対 -C、変数)に
+  # 関係なく、PreToolUse は push の中身を見ない。範囲は pre-push の入力で決まる
+  # ので、書き方を変えても、検査が外れる(#14 型)ことも、解決不能で ask になる
+  # (#69/#70/#73 型)こともない。
   set +e
-  "$SELF" scan-bash-command "git -C $repo_b push origin main" > /dev/null 2>&1
+  pre_push_run "$repo_b" origin main
   rc=$?
   set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(git -C <dir> push): 期待=2(deny) 実際=$rc(以前は無検査 pass だった #14 の回帰)" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 2 ]] || { echo "FAIL(repo_b の pre-push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
 
-  set +e
-  "$SELF" scan-bash-command "cd $repo_b && git push origin main" > /dev/null 2>&1
-  rc=$?
-  set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(cd <dir> && git push): 期待=2(deny) 実際=$rc(以前は無言 pass だった #10 の回帰)" >&2; fails=$((fails + 1)); }
+  local push_form
+  while IFS= read -r push_form; do
+    set +e
+    (cd "$tmp" && "$SELF" scan-bash-command "${push_form//@repo_b@/$repo_b}") > /dev/null 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || { echo "FAIL(PreToolUse は push の書き方に依らず pass: $push_form): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+  done <<'PUSHFORMS'
+git -C @repo_b@ push origin main
+cd @repo_b@ && git push origin main
+cd "$D" && git push origin main
+git -C "$D" push origin main
+git push origin HEAD:refs/heads/x
+git push --force-with-lease --force-if-includes origin feat
+PUSHFORMS
 
   set +e
   "$SELF" scan-bash-command 'gh --repo acme/other pr create --title t --body "acme/secret-project"' > /dev/null 2>&1
@@ -1893,19 +2061,22 @@ CASES55
   git -C "$repo_b2" push -q origin trunk
   echo "acme/secret-project" >> "$repo_b2/f.txt"
   git -C "$repo_b2" commit -qam "mentions secret"
-  local push_dir push_cmd push_want
-  while IFS='|' read -r push_want push_dir push_cmd; do
+  # pre-push の入力から求めた範囲(ADR-0003、#54 の後継)。ブランチ名だけを
+  # 渡す pre_push_run で、新規ブランチ(追跡 ref 無し)・既存ブランチの更新・
+  # 更新なし・別 worktree のブランチを再現する。
+  local push_dir push_br push_want
+  while IFS='|' read -r push_want push_dir push_br; do
     set +e
-    (cd "${push_dir//@tmp@/$tmp}" && "$SELF" scan-bash-command "$push_cmd") > /dev/null 2>&1
+    # shellcheck disable=SC2086 # push_br は空白区切りのブランチ名の並び
+    pre_push_run "${push_dir//@tmp@/$tmp}" origin $push_br
     rc=$?
     set -e
-    [[ $rc -eq $push_want ]] || { echo "FAIL(#54 push 範囲: $push_dir $push_cmd): 期待=$push_want 実際=$rc" >&2; fails=$((fails + 1)); }
+    [[ $rc -eq $push_want ]] || { echo "FAIL(pre-push 範囲: $push_dir $push_br): 期待=$push_want 実際=$rc" >&2; fails=$((fails + 1)); }
   done <<'CASES54'
-2|@tmp@/repo_b1|git push origin other
-0|@tmp@/repo_b1|git push origin main
-2|@tmp@/wt_b1|git push --force-with-lease --force-if-includes origin feat-wt
-2|@tmp@/wt_b1|git push -u origin HEAD
-2|@tmp@/repo_b2|git push origin trunk
+2|@tmp@/repo_b1|other
+0|@tmp@/repo_b1|main
+2|@tmp@/wt_b1|feat-wt
+2|@tmp@/repo_b2|trunk
 CASES54
 
   # #54: 失敗理由は閉じた語彙のコードでレッジャーの detail 欄に残す(パス・
@@ -1913,7 +2084,8 @@ CASES54
   mkdir -p "$tmp/plain-dir"
   rm -rf "$BLEEP_LEDGER_DIR"
   set +e
-  (cd "$tmp/plain-dir" && GIT_CEILING_DIRECTORIES="$tmp" "$SELF" scan-bash-command 'git push origin main') > /dev/null 2>&1
+  (cd "$tmp/plain-dir" && printf 'refs/heads/main %040d refs/heads/main %040d\n' 1 0 |
+    GIT_CEILING_DIRECTORIES="$tmp" "$SELF" scan-push --pre-push origin "$tmp/remote.git") > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(#54 not-a-repo は ask): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1931,17 +2103,6 @@ CASES54
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#9+#14: cd の private 名 + --repo public/other): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
-
-  # #41: git -C <相対パス> push は cd 履歴に連結して解決すること。以前は
-  # cd を無視して呼び出しプロセス自身の cwd 基準の相対パスとして扱われ、
-  # 誤った(存在しない)ディレクトリに解決していた。repo_b は #14 の
-  # テストで denylist 文字列 "acme/secret-project" を含むコミットを push
-  # 済みなので、正しく repo_b を指せれば deny になる。
-  set +e
-  "$SELF" scan-bash-command "cd $(dirname "$repo_b") && git -C $(basename "$repo_b") push origin main" > /dev/null 2>&1
-  rc=$?
-  set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(#41: 相対 -C は cd 履歴に連結): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # #23/#43: gh --repo/-R はサブコマンドの後ろにあっても検出する。対象が
   # PRIVATE なら検査自体をスキップする(以前はここが検出漏れで denylist
@@ -1984,17 +2145,6 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#43 D2: PUBLIC 宛先でも --repo トークン自体は照合対象外): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
-
-  # 変数展開を含む cd は静的には解決できない。無言 pass にはせず、lex が
-  # 検出した unresolved_var フラグにより denylist 照合の前で即座に ask に
-  # エスカレートする(#34。以前は push 差分計算の失敗(default branch/
-  # merge-base がガラクタなパスでは解けない)経由で偶然同じ rc になって
-  # いたが、それとは別の、より早い経路になった)。
-  set +e
-  out="$("$SELF" scan-bash-command 'cd "$D" && git push origin main' 2>&1)"
-  rc=$?
-  set -e
-  [[ $rc -eq 1 && $out == *'シェル変数'* ]] || { echo "FAIL(変数展開を含む cd は ask、unresolved_var 経由): 期待=1(ask) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   # #34 の再現そのもの: --repo が無く、cd "$D" だけに頼る gh セグメント。
   # 以前は無言で denylist 全文照合にフォールバックし、cwd 由来の誤判定
@@ -2179,6 +2329,12 @@ STUB
 
   # bleep doctor / lex protocol(#56 提案3)。正常系は実バイナリ、異常系は
   # 版の違うスタブ bleep-hook と matcher の欠けた hooks.json で確かめる。
+  # pre-push の配線の検査(ADR-0003)は、配線済みのファイルを既定にして、
+  # 他の NG の検査と混ざらないようにする。
+  printf '#!/usr/bin/env bash\nexec bleep scan-push --pre-push "$@"\n' > "$tmp/pre-push-wired"
+  printf '#!/usr/bin/env bash\nexec bleep scan-push < /dev/null\n' > "$tmp/pre-push-unwired"
+  chmod +x "$tmp/pre-push-wired" "$tmp/pre-push-unwired"
+  export BLEEP_PRE_PUSH_HOOK="$tmp/pre-push-wired"
   set +e
   "$SELF" doctor > /dev/null 2>&1
   rc=$?
@@ -2206,6 +2362,19 @@ STUB
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(doctor: matcher 欠落は NG): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
 
+  # pre-push の配線: stdin を --pre-push に渡していない hook(旧い配線)や、
+  # hook 自体が無い状態は NG(push が無検査になる)。
+  set +e
+  BLEEP_PRE_PUSH_HOOK="$tmp/pre-push-unwired" "$SELF" doctor > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(doctor: pre-push が --pre-push を呼ばないのは NG): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
+  set +e
+  BLEEP_PRE_PUSH_HOOK="$tmp/pre-push-absent" "$SELF" doctor > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 1 ]] || { echo "FAIL(doctor: pre-push 不在は NG): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }
+
   # 旧形式(先頭に #lex 行が無い)を出すバイナリと組み合わせたら、行のずれで
   # 黙って誤判定せず ask にする。
   printf '#!/usr/bin/env bash\nprintf "0\\n\\n0\\n\\n\\n0\\nx\\n"\n' > "$tmp/old-lex"
@@ -2215,6 +2384,150 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 1 && $out == *"#lex"* ]] || { echo "FAIL(旧形式の lex 出力は ask): 期待=1(#lex を含む理由) 実際=$rc / $out" >&2; fails=$((fails + 1)); }
+
+  # ---- e2e: 実際の git push を hooks/pre-push 経由で通す(ADR-0003) --------
+  # 上までは pre-push の stdin を再現して rc(0/1/2)を見た。ここでは本物の
+  # git が hooks/pre-push を起動する経路で、#69/#73 の再現条件(新規ブランチ、
+  # shallow clone)が止まらないこと、本物の secret は止まって commit の短い
+  # SHA が理由文に出ること、削除 push は止まらないことを確かめる。
+  local hooks_e2e="$tmp/hooks-e2e"
+  mkdir -p "$hooks_e2e"
+  ln -s "$(dirname "$SELF")/hooks/pre-push" "$hooks_e2e/pre-push"
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view") printf 'PUBLIC' ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+
+  e2e_repo() { # $1=dir $2=bare remote dir -> 初期コミット済み・main を push 済み・pre-push 配線済み
+    local d="$1" r="$2"
+    git init -q --bare "$r"
+    mkdir -p "$d"
+    git -C "$d" init -qb main
+    git -C "$d" config core.hooksPath /dev/null # 実ホストのグローバル hook を呼ばない
+    git -C "$d" config user.email test@example.invalid
+    git -C "$d" config user.name test
+    git -C "$d" config commit.gpgsign false
+    echo base > "$d/f.txt"
+    git -C "$d" add f.txt
+    git -C "$d" commit -qm initial
+    git -C "$d" remote add origin "$r"
+    git -C "$d" push -q origin main
+    git -C "$d" config core.hooksPath "$hooks_e2e"
+  }
+  e2e_push() { # $1=dir, 残り=git push の引数。出力は E2E_OUT、終了コードを返す
+    local d="$1"
+    shift
+    local rc_e2e=0
+    E2E_OUT="$(cd "$d" && BLEEP_BIN="$SELF" git push "$@" 2>&1)" || rc_e2e=$?
+    return "$rc_e2e"
+  }
+  local e2e="$tmp/e2e" e2e_remote="$tmp/e2e-remote.git" e2e_sha
+  e2e_repo "$e2e" "$e2e_remote"
+
+  # 新規ブランチ(リモートに無い)+ クリーンな commit は通る(#69/#73)。
+  git -C "$e2e" switch -qc topic-clean
+  echo clean >> "$e2e/f.txt"
+  git -C "$e2e" commit -qam "clean change"
+  set +e
+  e2e_push "$e2e" -u origin topic-clean
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(e2e: 新規ブランチ + クリーンは push できる): rc=$rc out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  git -C "$e2e_remote" rev-parse -q --verify refs/heads/topic-clean > /dev/null 2>&1 || { echo "FAIL(e2e: 新規ブランチが remote に届いていない)" >&2; fails=$((fails + 1)); }
+
+  # 新規ブランチ + 中間 commit に secret(後の commit で消しても公開される)は
+  # 止まり、一致した commit の短い SHA が理由文に出る(#67)。語は出ない。
+  git -C "$e2e" switch -qc topic-leak
+  echo "acme/secret-project" >> "$e2e/f.txt"
+  git -C "$e2e" commit -qam "add leak"
+  e2e_sha="$(git -C "$e2e" rev-parse --short HEAD)"
+  git -C "$e2e" reset -q --hard HEAD~1
+  echo "acme/secret-project" >> "$e2e/f.txt"
+  git -C "$e2e" commit -qam "add leak"
+  e2e_sha="$(git -C "$e2e" rev-parse --short HEAD)"
+  sed -i '$d' "$e2e/f.txt"
+  git -C "$e2e" commit -qam "remove leak again"
+  set +e
+  e2e_push "$e2e" origin topic-leak
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL(e2e: 中間 commit の secret は止まる): push が通った" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT == *"$e2e_sha"* ]] || { echo "FAIL(e2e: 理由文に一致した commit の SHA が出る): sha=$e2e_sha out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT != *"secret-project"* ]] || { echo "FAIL(e2e: 理由文に語が出ていない): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  git -C "$e2e_remote" rev-parse -q --verify refs/heads/topic-leak > /dev/null 2>&1 && { echo "FAIL(e2e: 止めたはずのブランチが remote にある)" >&2; fails=$((fails + 1)); }
+
+  # 既存ブランチの更新(remote-sha が手元にある)+ クリーンは通る。
+  git -C "$e2e" switch -q topic-clean
+  echo more >> "$e2e/f.txt"
+  git -C "$e2e" commit -qam "more clean"
+  set +e
+  e2e_push "$e2e" origin topic-clean
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(e2e: 既存ブランチの更新 + クリーンは push できる): rc=$rc out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+
+  # 削除 push は公開する内容が無いので止まらない。
+  set +e
+  e2e_push "$e2e" origin --delete topic-clean
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(e2e: 削除 push は止まらない): rc=$rc out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+
+  # shallow clone(--depth 1)からの新規ブランチ push(#73)。merge-base も
+  # 祖先関係も取れないが、pre-push は範囲を `local --not --remotes=origin` で
+  # 求めるので、クリーンなら通り、secret なら止まる。
+  local e2e_shallow="$tmp/e2e-shallow"
+  git clone -q --depth 1 "file://$e2e_remote" "$e2e_shallow" 2> /dev/null
+  git -C "$e2e_shallow" config user.email test@example.invalid
+  git -C "$e2e_shallow" config user.name test
+  git -C "$e2e_shallow" config commit.gpgsign false
+  git -C "$e2e_shallow" config core.hooksPath "$hooks_e2e"
+  git -C "$e2e_shallow" switch -qc shallow-clean
+  echo shallow >> "$e2e_shallow/f.txt"
+  git -C "$e2e_shallow" commit -qam "shallow clean"
+  set +e
+  e2e_push "$e2e_shallow" origin shallow-clean
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(e2e: shallow clone の新規ブランチ + クリーンは push できる、#73): rc=$rc out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  git -C "$e2e_shallow" switch -qc shallow-leak
+  echo "acme/secret-project" >> "$e2e_shallow/f.txt"
+  git -C "$e2e_shallow" commit -qam "shallow leak"
+  set +e
+  e2e_push "$e2e_shallow" origin shallow-leak
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL(e2e: shallow clone でも secret は止まる): push が通った" >&2; fails=$((fails + 1)); }
+
+  # context 行(#67): 既に公開済みの行が diff の前後に載るだけでは止まらない
+  # (-U0 で context を落としている)。remote に既にある secret 行の隣を変える。
+  local e2e_ctx="$tmp/e2e-ctx" e2e_ctx_remote="$tmp/e2e-ctx-remote.git"
+  e2e_repo "$e2e_ctx" "$e2e_ctx_remote"
+  printf 'a\nacme/secret-project\nb\n' > "$e2e_ctx/f.txt"
+  git -C "$e2e_ctx" commit -qam "pre-existing mention"
+  git -C "$e2e_ctx" config core.hooksPath /dev/null
+  git -C "$e2e_ctx" push -q origin main
+  git -C "$e2e_ctx" config core.hooksPath "$hooks_e2e"
+  printf 'a\nacme/secret-project\nc\n' > "$e2e_ctx/f.txt"
+  git -C "$e2e_ctx" commit -qam "change the line next to it"
+  set +e
+  e2e_push "$e2e_ctx" origin main
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(e2e: 既存の secret 行の隣を変えるだけなら止まらない、#67): rc=$rc out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+
+  # audit --since: 解決できない rev は無言 pass にせず検査不能を報告する。
+  set +e
+  out="$(cd "$e2e" && "$SELF" audit --since does-not-exist-rev 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 && $out == *'検査できませんでした'* ]] || { echo "FAIL(audit --since: 不正な rev は検査不能): rc=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   if [[ $fails -gt 0 ]]; then
     echo "selftest: ${fails} 件失敗" >&2
@@ -2239,6 +2552,26 @@ cmd_doctor() {
     fi
   else
     doctor_ng "bleep-hook を実行できない (${LEX_BIN})。PATH か BLEEP_LEX_BIN を確認してください"
+  fi
+
+  # push の検査は git の pre-push が担う(ADR-0003)。PreToolUse は push の中身を
+  # 見ないので、pre-push が配線されていなければ push は無検査になる。
+  local hp ph
+  hp="$(git config --get core.hooksPath 2>/dev/null || true)"
+  if [[ -n $hp ]]; then
+    hp="${hp/#\~/$HOME}"
+  else
+    hp="$(git rev-parse --git-path hooks 2>/dev/null || true)"
+  fi
+  ph="${BLEEP_PRE_PUSH_HOOK:-$hp/pre-push}"
+  if [[ -x $ph ]]; then
+    if grep -q -- 'scan-push --pre-push' "$ph" 2>/dev/null; then
+      doctor_ok "pre-push hook が scan-push --pre-push を呼んでいる (${ph})"
+    else
+      doctor_ng "pre-push hook が scan-push --pre-push を呼んでいない (${ph})。git が渡す stdin を --pre-push に引き継ぐ配線にしてください(hooks/pre-push 参照)"
+    fi
+  else
+    doctor_ng "pre-push hook が見つからない (${ph})。core.hooksPath か .git/hooks/ に hooks/pre-push を置いてください(置かないと push は無検査です)"
   fi
 
   hj="${BLEEP_HOOKS_JSON:-$(dirname "$SELF")/hooks/hooks.json}"
