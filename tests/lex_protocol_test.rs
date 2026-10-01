@@ -3,7 +3,7 @@
 
 use assert_cmd::Command;
 
-const PROTOCOL: &str = "2";
+const PROTOCOL: &str = "3";
 
 #[test]
 fn protocol_flag_prints_the_version() {

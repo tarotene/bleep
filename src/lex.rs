@@ -174,7 +174,6 @@ pub fn resolve_effective_dir(
 pub struct SegClassification {
     pub kind_is_push: bool,
     pub kind_is_gh_publish: bool,
-    pub dir_override: Option<String>,
     pub repo_override: Option<String>,
     /// gh の宛先を静的に決められない(gh api の API パスが repos/<owner>/<repo>
     /// で始まらない、等)。宛先の可視性による pass をせず、公開宛てとみなして
@@ -188,11 +187,11 @@ pub struct SegClassification {
     /// 静的に内容を解決できない(#55)。ヒアドキュメント(`<<`)を含む場合は
     /// 本文がコマンド文字列に含まれるので対象外。
     pub body_dynamic: bool,
-    /// `git push` の実際の push 範囲を求めるための「<remote> <src>…」
-    /// (空白区切り、ref 名に空白は使えない)。--all/--mirror/--delete・
-    /// URL の remote・未展開の変数を含む refspec など静的に決められない
-    /// ものは空(呼び出し側は default branch 基準の従来経路に戻る、#54)。
-    pub push_spec: String,
+    /// `git push` が pre-push hook を無効にする形(`--no-verify`、または
+    /// `-c core.hooksPath=…`)。push の中身は PreToolUse では見ず、git の
+    /// pre-push が渡す正確な ref と SHA で判定する(ADR-0003)ので、PreToolUse
+    /// が止めるのはこの迂回の形だけ。
+    pub push_bypass: bool,
     /// gh の投稿の面(pr/issue/release/repo/gist/api)と操作(create/edit/
     /// comment、gh api は小文字のメソッド)。`bleep-hook intent` が使う(#56)。
     pub gh_surface: String,
@@ -201,51 +200,11 @@ pub struct SegClassification {
     pub repo_from_api_path: bool,
 }
 
-/// `git push [opts] [<remote> [<refspec>…]]` の引数(`push` の後ろ)から
-/// push_spec を作る(#54)。refspec 省略時は HEAD(push.default の現在の
-/// ブランチ)。
-fn parse_push_spec(args: &[String]) -> String {
-    let mut positional: Vec<&str> = Vec::new();
-    let mut j = 0usize;
-    while j < args.len() {
-        let a = args[j].as_str();
-        match a {
-            "--all" | "--mirror" | "--delete" | "-d" => return String::new(),
-            "-o" | "--push-option" | "--receive-pack" | "--exec" | "--repo" => j += 2,
-            s if s.starts_with('-') => j += 1,
-            s => {
-                positional.push(s);
-                j += 1;
-            }
-        }
-    }
-    let remote = positional.first().copied().unwrap_or("origin");
-    if remote.is_empty()
-        || !remote
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-    {
-        return String::new();
-    }
-    let mut srcs: Vec<&str> = Vec::new();
-    for spec in positional.iter().skip(1) {
-        let spec = spec.strip_prefix('+').unwrap_or(spec);
-        let src = spec.split(':').next().unwrap_or("");
-        if src.is_empty() {
-            continue; // `:dst` は削除。push する内容は無い。
-        }
-        if src.starts_with('-') || src.contains(['$', '`', '*', '\\']) {
-            return String::new();
-        }
-        srcs.push(src);
-    }
-    if positional.len() <= 1 {
-        srcs.push("HEAD");
-    }
-    if srcs.is_empty() {
-        return String::new();
-    }
-    format!("{remote} {}", srcs.join(" "))
+/// `git push` の引数に、pre-push hook を無効にする `--no-verify` があるか。
+/// git-push(1) の "With `--no-verify`, the hook is bypassed completely"。
+/// `-c core.hooksPath=…` は git の global option 側で見る(classify_segment)。
+fn push_args_skip_hook(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--no-verify")
 }
 
 /// 値がコマンド置換で作られ、コマンド文字列だけでは内容が定まらないか。
@@ -362,6 +321,14 @@ fn api_path_repo(path: &str) -> Option<ApiDest> {
     Some(ApiDest::Repo(format!("{owner}/{repo}")))
 }
 
+/// `git -c <key>=<value>` が hook の置き場を差し替える(= pre-push を外す)
+/// 設定か。git-config(1) の `core.hooksPath`。キーは大文字小文字を区別
+/// しない(`core.hookspath` も同じ設定)。
+fn config_disables_hooks(kv: &str) -> bool {
+    let key = kv.split('=').next().unwrap_or("");
+    key.eq_ignore_ascii_case("core.hooksPath")
+}
+
 /// tokenize_segment の代替。POSIX のクォート/エスケープ規則で単語分割する
 /// (shell-words クレート、#22 の Bash 実装と同一の規則を検証済み)。
 /// 閉じていないクォートは shell-words が Err を返す — Bash 版は不正な
@@ -388,21 +355,34 @@ pub fn classify_segment(seg: &str) -> SegClassification {
     match t[0].as_str() {
         "git" => {
             let mut idx = 1usize;
+            let mut hooks_path_overridden = false;
             while idx < n {
                 match t[idx].as_str() {
                     "-C" => {
-                        result.dir_override = t.get(idx + 1).cloned();
-                        idx += 2;
+                        idx += 2; // 値を1個消費
                         continue;
                     }
-                    "-c" | "--git-dir" | "--work-tree" | "--namespace" => {
+                    "-c" => {
+                        if t.get(idx + 1).is_some_and(|v| config_disables_hooks(v)) {
+                            hooks_path_overridden = true;
+                        }
                         idx += 2; // 値を1個消費
+                        continue;
+                    }
+                    "--git-dir" | "--work-tree" | "--namespace" => {
+                        idx += 2; // 値を1個消費
+                        continue;
+                    }
+                    s if s.starts_with("-c=") => {
+                        if config_disables_hooks(&s[3..]) {
+                            hooks_path_overridden = true;
+                        }
+                        idx += 1;
                         continue;
                     }
                     s if s.starts_with("--git-dir=")
                         || s.starts_with("--work-tree=")
-                        || s.starts_with("--namespace=")
-                        || s.starts_with("-c=") =>
+                        || s.starts_with("--namespace=") =>
                     {
                         idx += 1;
                         continue;
@@ -425,7 +405,7 @@ pub fn classify_segment(seg: &str) -> SegClassification {
             }
             if idx < n && t[idx] == "push" {
                 result.kind_is_push = true;
-                result.push_spec = parse_push_spec(&t[idx + 1..]);
+                result.push_bypass = hooks_path_overridden || push_args_skip_hook(&t[idx + 1..]);
             }
         }
         "gh" => {
@@ -593,18 +573,21 @@ pub fn classify_segment(seg: &str) -> SegClassification {
 pub struct AnalyzeResult {
     pub scan_subject: String,
     pub found_push: bool,
-    pub push_dir: String,
+    /// found_push のセグメントが pre-push hook を無効にする形か
+    /// (SegClassification::push_bypass 参照)。
+    pub push_bypass: bool,
     pub found_gh: bool,
     pub gh_repo_override: String,
     /// found_gh かつ gh_repo_override が空のときだけ意味を持つ — 呼び出し側
     /// (Bash)がこのディレクトリを基準に resolve_repo_nwo(git remote 参照、
     /// I/O)を実行する。
     pub gh_effective_dir: String,
-    /// found_push/found_gh の対象を実際に解決するのに使った値(cd 追跡、
-    /// `-C`/`--repo`/`-R` の override)が、未展開の `$` 参照(閉集合外の
-    /// 変数)を含むために静的に解決できなかったかどうか(#34)。呼び出し側
-    /// はこの場合、値を無理に使わず ask にエスカレートする。found_push も
-    /// found_gh も立っていない(push/gh セグメントが無い)ときは常に false。
+    /// found_gh の対象を実際に解決するのに使った値(cd 追跡、`--repo`/`-R`
+    /// の override)が、未展開の `$` 参照(閉集合外の変数)を含むために静的に
+    /// 解決できなかったかどうか(#34)。呼び出し側はこの場合、値を無理に使わず
+    /// ask にエスカレートする。found_gh が立っていないときは常に false。
+    /// push は PreToolUse では対象を解決しない(pre-push が判定する、ADR-0003)
+    /// ので、ここには入らない。
     pub unresolved_var: bool,
     /// gh の投稿セグメントが本文をファイルから読む入力元の絶対パス
     /// (相対パスはそのセグメントの実効ディレクトリ基準で解決済み、#55)。
@@ -614,8 +597,6 @@ pub struct AnalyzeResult {
     /// 本文がコマンド置換)。unresolved_var と分けるのは、宛先が PRIVATE と
     /// 判明していれば検査自体が不要なので、その判定の後で ask にするため。
     pub body_unresolved: bool,
-    /// found_push のセグメントの push_spec(SegClassification 参照、#54)。
-    pub push_spec: String,
 }
 
 /// gh セグメントの生テキストから `--repo`/`-R`(値を伴う2トークン形)と
@@ -708,10 +689,8 @@ pub(crate) fn resolve_body_sources(
 pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult {
     let segments = split_command_segments(cmd);
     let mut result = AnalyzeResult::default();
-    // found_push/found_gh の対象を実際に解決するのに使った値が未展開の `$`
-    // 参照を含むかどうか(#34)。gh > push の優先順位(下記ループ後の
-    // 確定処理)は cmd_scan_bash_command(Bash 本体)の分岐順序と揃える。
-    let mut push_unresolved_var = false;
+    // found_gh の対象を実際に解決するのに使った値が未展開の `$` 参照を含む
+    // かどうか(#34)。
     let mut gh_unresolved_var = false;
 
     for (i, seg) in segments.iter().enumerate() {
@@ -738,40 +717,9 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
             }
         }
 
-        if c.kind_is_push && !result.found_push {
+        if c.kind_is_push {
             result.found_push = true;
-            result.push_spec = c.push_spec.clone();
-            result.push_dir = match c.dir_override {
-                // git -C <dir> の <dir> にも同じ展開を適用する(#39) —
-                // resolve_effective_dir を経由しない唯一の経路なので、
-                // ここで expand_home を直接通す。展開後も絶対パスでなく
-                // (先頭 `/` 無し)、かつ未展開の `$` 参照(`$HOMEBREW/x` の
-                // ような閉集合外の変数)を含まないときだけ、cd 追跡結果に
-                // 連結する(#41 — 相対パスは直前の実効ディレクトリからの
-                // 相対、という git -C 自体の意味論に合わせる)。`$` が残る
-                // ケースは静的に解決できないため、以前と同じく無加工で返す
-                // (#34 の対象— 検出して ask にエスカレートするかどうかは
-                // 別の継ぎ目で判断する)。
-                Some(d) => {
-                    let expanded = expand_home(&d, home);
-                    if expanded.contains('$') {
-                        push_unresolved_var = true;
-                        expanded
-                    } else if expanded.starts_with('/') {
-                        expanded
-                    } else {
-                        format!(
-                            "{}/{}",
-                            resolve_effective_dir(start_dir, &segments, i, home),
-                            expanded
-                        )
-                    }
-                }
-                None => {
-                    push_unresolved_var = cd_chain_has_unresolved_var(&segments, i, home);
-                    resolve_effective_dir(start_dir, &segments, i, home)
-                }
-            };
+            result.push_bypass |= c.push_bypass;
         }
         if c.kind_is_gh_publish && !result.found_gh {
             result.found_gh = true;
@@ -795,16 +743,7 @@ pub fn analyze(cmd: &str, start_dir: &str, home: Option<&str>) -> AnalyzeResult 
         }
     }
 
-    // gh > push の優先順位(cmd_scan_bash_command は found_gh を先に見て、
-    // 見つかれば push 側を一切参照しない)に合わせて、実際に使われる方の
-    // 未解決フラグだけを採用する。
-    result.unresolved_var = if result.found_gh {
-        gh_unresolved_var
-    } else if result.found_push {
-        push_unresolved_var
-    } else {
-        false
-    };
+    result.unresolved_var = result.found_gh && gh_unresolved_var;
 
     result
 }
@@ -890,115 +829,6 @@ mod tests {
         assert_eq!(r.gh_effective_dir, "/a/b");
     }
 
-    #[test]
-    fn git_dash_c_overrides_cd_history() {
-        let r = analyze(r#"cd /a && git -C /b push origin main"#, ".", None);
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/b");
-    }
-
-    #[test]
-    fn git_dash_c_relative_path_joins_cd_history() {
-        // #41: 相対 -C は resolve_effective_dir と同じ規則(直前の実効
-        // ディレクトリに連結)で解決する。以前は cd 履歴を無視して
-        // 素通しの "b" になっていた。
-        let r = analyze(r#"cd /a && git -C b push origin main"#, ".", None);
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/a/b");
-    }
-
-    #[test]
-    fn git_dash_c_relative_path_without_cd_joins_start_dir() {
-        // #41: cd が無い場合も、相対 -C は呼び出しプロセスの --cwd(ここでは
-        // start_dir)からの相対として解決する(以前は "b" のまま素通しだった)。
-        let r = analyze(r#"git -C b push origin main"#, "/x", None);
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/x/b");
-    }
-
-    // ---- HOME 展開(#39) ----------------------------------------------
-
-    #[test]
-    fn cd_tilde_slash_expands_to_home() {
-        let r = analyze("cd ~/repo && git push origin main", ".", Some("/home/x"));
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/home/x/repo");
-    }
-
-    #[test]
-    fn cd_bare_tilde_expands_to_home() {
-        let r = analyze("cd ~ && git push origin main", ".", Some("/home/x"));
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/home/x");
-    }
-
-    #[test]
-    fn cd_dollar_home_expands() {
-        let r = analyze(
-            "cd $HOME/repo && git push origin main",
-            ".",
-            Some("/home/x"),
-        );
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/home/x/repo");
-    }
-
-    #[test]
-    fn git_dash_c_tilde_expands() {
-        let r = analyze("git -C ~/repo push origin main", ".", Some("/home/x"));
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/home/x/repo");
-    }
-
-    #[test]
-    fn git_dash_c_quoted_dollar_home_brace_expands() {
-        // -C の値は shell_words 経由(classify_segment)なのでクォートが
-        // 外れた後の "${HOME}/repo" に対して expand_home が働く。
-        let r = analyze(
-            r#"git -C "${HOME}/repo" push origin main"#,
-            ".",
-            Some("/home/x"),
-        );
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "/home/x/repo");
-    }
-
-    #[test]
-    fn tilde_user_form_is_not_expanded() {
-        // ~user は passwd 引きが要る形で、閉集合の対象外(還元性、#39 とは
-        // 切り分ける)。展開されず素通しのまま resolve_effective_dir に渡る。
-        let r = analyze("cd ~someone && git push origin main", ".", Some("/home/x"));
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "./~someone");
-    }
-
-    #[test]
-    fn dollar_home_prefixed_other_var_is_not_expanded() {
-        // $HOMEBREW は $HOME の前方一致だけでは弾けない罠 — 次の文字が '/'
-        // でも文字列末でもないので展開しない。
-        let r = analyze("git -C $HOMEBREW/x push origin main", ".", Some("/home/x"));
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "$HOMEBREW/x");
-    }
-
-    #[test]
-    fn braced_home_with_suffix_is_not_expanded() {
-        let r = analyze(
-            "cd ${HOME_X}/y && git push origin main",
-            ".",
-            Some("/home/x"),
-        );
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "./${HOME_X}/y");
-    }
-
-    #[test]
-    fn home_none_leaves_tilde_unexpanded() {
-        let r = analyze("cd ~/repo && git push origin main", ".", None);
-        assert!(r.found_push);
-        assert_eq!(r.push_dir, "./~/repo");
-    }
-
     // ---- 未展開のシェル変数参照の検出(#34) -----------------------------
 
     #[test]
@@ -1011,20 +841,6 @@ mod tests {
     }
 
     #[test]
-    fn cd_with_shell_variable_sets_unresolved_var_for_push() {
-        let r = analyze(r#"cd "$D" && git push origin main"#, ".", None);
-        assert!(r.found_push);
-        assert!(r.unresolved_var);
-    }
-
-    #[test]
-    fn git_dash_c_with_shell_variable_sets_unresolved_var() {
-        let r = analyze(r#"git -C "$D" push origin main"#, ".", None);
-        assert!(r.found_push);
-        assert!(r.unresolved_var);
-    }
-
-    #[test]
     fn gh_repo_with_shell_variable_sets_unresolved_var() {
         let r = analyze(r#"gh --repo "$X" pr create --title t"#, ".", None);
         assert!(r.found_gh);
@@ -1033,10 +849,6 @@ mod tests {
 
     #[test]
     fn literal_only_commands_do_not_set_unresolved_var() {
-        let r = analyze(r#"cd /a && git -C b push origin main"#, ".", None);
-        assert!(r.found_push);
-        assert!(!r.unresolved_var);
-
         let r = analyze(r#"gh pr create --repo acme/other --title t"#, ".", None);
         assert!(r.found_gh);
         assert!(!r.unresolved_var);
@@ -1183,30 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn push_spec_from_refspecs() {
-        let spec = |cmd: &str| classify_segment(cmd).push_spec;
-        assert_eq!(spec("git push"), "origin HEAD");
-        assert_eq!(spec("git push origin"), "origin HEAD");
-        assert_eq!(spec("git push origin main"), "origin main");
-        assert_eq!(
-            spec("git push --force-with-lease --force-if-includes origin feat"),
-            "origin feat"
-        );
-        assert_eq!(
-            spec("git push -u upstream HEAD:refs/heads/x"),
-            "upstream HEAD"
-        );
-        assert_eq!(spec("git push origin +a:b c"), "origin a c");
-        assert_eq!(spec("git -C /x push -o ci.skip origin main"), "origin main");
-        // 静的に決められないものは空(従来の default branch 経路に戻る)。
-        assert_eq!(spec("git push --all origin"), "");
-        assert_eq!(spec("git push --mirror"), "");
-        assert_eq!(spec("git push origin :gone"), "");
-        assert_eq!(spec("git push https://example.invalid/r.git main"), "");
-        assert_eq!(spec("git push origin $BR"), "");
-    }
-
-    #[test]
     fn dest_unknown_clears_repo_and_dir() {
         let r = analyze(r#"gh api graphql -f query=x"#, "/work", None);
         assert!(r.found_gh);
@@ -1221,6 +1009,40 @@ mod tests {
         assert!(classify_segment("gh repo edit --description x").kind_is_gh_publish);
         assert!(classify_segment("gh gist create file.txt").kind_is_gh_publish);
         assert!(!classify_segment("gh repo view").kind_is_gh_publish);
+    }
+
+    #[test]
+    fn push_bypass_detects_the_forms_that_skip_pre_push() {
+        // pre-push を外す形だけを拾う。普通の push は found_push のみ。
+        let bypass = |cmd: &str| {
+            let r = analyze(cmd, ".", None);
+            assert!(r.found_push, "{cmd}");
+            r.push_bypass
+        };
+        assert!(!bypass("git push origin main"));
+        assert!(!bypass("git -C /x push -u origin HEAD"));
+        assert!(bypass("git push --no-verify origin main"));
+        assert!(bypass("git push origin main --no-verify"));
+        assert!(bypass("git -c core.hooksPath=/dev/null push origin main"));
+        assert!(bypass("git -c core.hookspath=/dev/null push origin main"));
+        assert!(bypass("git -c=core.hooksPath=/dev/null push origin main"));
+        // 無関係な -c は迂回ではない。
+        assert!(!bypass("git -c user.name=x push origin main"));
+        // push 以外のサブコマンドは found_push にならない。
+        assert!(!analyze("git -c core.hooksPath=/dev/null status", ".", None).found_push);
+    }
+
+    #[test]
+    fn push_does_not_set_unresolved_var() {
+        // push の対象は PreToolUse では解決しない(pre-push が判定する)。
+        // 変数を含む cd/-C があっても ask にしない。
+        for cmd in [
+            r#"cd "$D" && git push origin main"#,
+            r#"git -C "$D" push origin main"#,
+        ] {
+            let r = analyze(cmd, ".", None);
+            assert!(r.found_push && !r.unresolved_var, "{cmd}");
+        }
     }
 
     #[test]

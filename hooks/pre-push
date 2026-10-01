@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# pre-push — git の pre-push hook。git が stdin に渡す
+# `<local-ref> <local-sha> <remote-ref> <remote-sha>` の行を、そのまま
+# `bleep scan-push --pre-push <remote-name> <remote-url>` に渡す(ADR-0003)。
+#
+# push の検査はこの hook が担う。PreToolUse(hooks/bleep.sh)は `git push` の
+# コマンド文字列から範囲を推測せず、この hook を無効にする形(--no-verify、
+# -c core.hooksPath=)だけを deny する。コマンドの書き方に依存しない、git が
+# 正規化した ref と完全な SHA で範囲が決まるので、新規ブランチ・別 worktree・
+# shallow clone でも範囲を求め損ねない。
+#
+# 導入: core.hooksPath の指すディレクトリ(または .git/hooks/)にこのファイルを
+# 置く(コピーでもシンボリックリンクでもよい)。既に pre-push があるときは、
+# その中から `exec` せずに呼び、終了コードを引き継ぐ。`bleep doctor` が配線を
+# 検査する。
+#
+# 終了コード: bleep の判定が pass 以外(ask=1、deny=2)なら 1 で push を止める
+# — pre-push には ask を確かめる対話の手段が無い。bleep を見つけられないときも
+# 無言で通さず止める(fail-loud)。
+set -uo pipefail
+
+SELF="$(realpath "$0")"
+ROOT="$(dirname "$(dirname "$SELF")")"
+
+find_bleep() {
+  if [[ -n "${BLEEP_BIN:-}" && -x "${BLEEP_BIN:-}" ]]; then
+    printf '%s' "$BLEEP_BIN"
+    return 0
+  fi
+  if [[ -x "$ROOT/bleep" ]]; then
+    printf '%s' "$ROOT/bleep"
+    return 0
+  fi
+  command -v bleep 2> /dev/null
+}
+
+if ! bleep="$(find_bleep)"; then
+  echo "error: Push blocked: bleep が見つかりません(BLEEP_BIN か PATH を確認してください)。" >&2
+  exit 1
+fi
+
+# stdin(push する ref の行)はそのまま bleep に引き継ぐ。
+reason="$(BLEEP_HOST="${BLEEP_HOST:-git-pre-push}" "$bleep" scan-push --pre-push "${1-}" "${2-}")"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  echo "error: Push blocked by bleep" >&2
+  [[ -n $reason ]] && echo "  ${reason}" >&2
+  exit 1
+fi
+exit 0

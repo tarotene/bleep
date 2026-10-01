@@ -10,8 +10,10 @@ use std::process::ExitCode;
 /// `LEX_PROTOCOL` と一致しなければ、本体は ask にする(古いバイナリと新しい
 /// 本体、またはその逆の組み合わせが、行のずれで黙って誤判定するのを防ぐ、
 /// docs/adr/0002-gh-intent-and-layers.md)。版 1 = 6 行ヘッダのみ、
-/// 版 2 = 先頭に `#lex <版>` 行、push_spec・本文の入力元(#54/#55)を追加。
-const LEX_PROTOCOL: u32 = 2;
+/// 版 2 = 先頭に `#lex <版>` 行、push_spec・本文の入力元(#54/#55)を追加、
+/// 版 3 = push の対象解決(push_dir・push_spec)を外し、pre-push を迂回する形
+/// (push_bypass)に置き換え(docs/adr/0003-constructive-grammar.md)。
+const LEX_PROTOCOL: u32 = 3;
 
 fn usage() -> String {
     "\
@@ -28,15 +30,15 @@ usage: bleep-hook --host=<claude|codex|copilot>
                 bash 本体との整合の検査に使う。
 lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
                 純粋な字句解析モード。I/O・gh は一切行わない。出力は
-                先頭の `#lex <版>` 行(--protocol と同じ版)に続けて、6行の
-                ヘッダ(found_push/push_dir/found_gh/gh_repo_override/
-                gh_effective_dir/unresolved_var)、push_spec(`git push` の
-                「<remote> <src>…」。静的に決められなければ空、#54)、
+                先頭の `#lex <版>` 行(--protocol と同じ版)に続けて、
+                found_push、push_bypass(`git push` が pre-push を無効にする
+                `--no-verify` / `-c core.hooksPath=` の形か)、found_gh、
+                gh_repo_override、gh_effective_dir、unresolved_var、
                 body_unresolved、
                 本文の入力元パスの件数 N と N 行のパス、に続けて
                 scan_subject を書く固定書式(jq 非依存 — 呼び出し側の
                 bleep 本体を jq フリーに保つ)。unresolved_var=1 は、
-                found_push/found_gh の対象解決に使った値が未展開の $ 参照を
+                found_gh の対象解決に使った値が未展開の $ 参照を
                 含み静的に解決できなかったことを示す(#34)。body_unresolved=1
                 は gh の本文の入力元をコマンド行から静的に解決できなかった
                 ことを示し、パスは gh の --body-file 等をコマンド実行
@@ -95,12 +97,11 @@ fn cmd_lex(cwd: &str, cmd: &str) {
     let r = lex::analyze(cmd, cwd, home.as_deref());
     println!("#lex {LEX_PROTOCOL}");
     println!("{}", if r.found_push { "1" } else { "0" });
-    println!("{}", escape_line(&r.push_dir));
+    println!("{}", if r.push_bypass { "1" } else { "0" });
     println!("{}", if r.found_gh { "1" } else { "0" });
     println!("{}", escape_line(&r.gh_repo_override));
     println!("{}", escape_line(&r.gh_effective_dir));
     println!("{}", if r.unresolved_var { "1" } else { "0" });
-    println!("{}", escape_line(&r.push_spec));
     println!("{}", if r.body_unresolved { "1" } else { "0" });
     println!("{}", r.body_sources.len());
     for p in &r.body_sources {

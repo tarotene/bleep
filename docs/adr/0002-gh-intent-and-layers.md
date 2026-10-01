@@ -1,6 +1,6 @@
 # ADR-0002 — gh の「投稿の意図」抽出を共通化し、実行時の層は今は足さない
 
-- Status: Accepted
+- Status: Accepted(提案 2 の push に関する部分は ADR-0003 で置き換え)
 - Date: 2026-09-30
 - Context: tarotene/bleep#56(design Issue)。`/wrapup-chores` での裁定
   (提案1 は bleep 内のサブコマンド + fixture、提案2 は今は不採用、提案3 は
@@ -62,6 +62,10 @@
    人間の `gh` を壊さない配線、再帰、遅延が要り、`gh` に pre-request の差し
    込み点が無いため shim の内側でも argv までしか見えない。ask で担えない
    仕事が観測されるまで足さない(還元性)。
+   - **見直された(2026-10-01、ADR-0003)**: push については、`unresolved-var` /
+     `push-diff-failed` の ask が正当な push を妨げるほど多発した(#67/#69/#70/#73)
+     ので、見直す条件に当たった。第一候補の sandbox ではなく、git 自身の
+     差し込み点(pre-push)に判定を移した。gh については ADR-0003 の正準形で扱う。
    - **見直す条件**: 判定レッジャー(`~/.local/state/agent-verdicts/bleep.jsonl`)
      で `unresolved-var` / `body-source-unresolved` / `body-source-unreadable` の
      ask が、正当な投稿を妨げるほど多発したとき。または、コマンド文字列の
