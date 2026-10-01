@@ -1,0 +1,5 @@
+{
+  "command": "gh pr view 5 -R pub/repo && gh pr checks 5 && gh run watch 1 && gh issue list",
+  "expect": [
+  ]
+}

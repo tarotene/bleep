@@ -1,0 +1,6 @@
+{
+  "command": "gh pr comment https://github.com/pub/repo/pull/5 --body-file /tmp/body.md",
+  "expect": [
+    {"surface": "pr", "action": "comment", "repo_source": "url", "repo": "pub/repo", "body_sources": ["/tmp/body.md"], "canonical": true, "noncanonical_reason": null}
+  ]
+}

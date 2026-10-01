@@ -290,56 +290,77 @@ inside `bleep-hook` itself (checking whether `toolName == "bash"`).
 ## Usage
 
 **`--cwd DIR`**: a global option, placed before the subcommand name, that
-tells `resolve_repo_nwo`/`compute_push_diff_text`/`resolve_default_branch` to
-treat `DIR` as the target repository's location instead of the hook
-process's own cwd. `bleep-hook` passes this automatically for all
+tells `scan-push` (both forms) to treat `DIR` as the target repository's
+location instead of the process's own cwd. `bleep-hook` still passes it for all
 three hosts from the PreToolUse payload's `cwd` field (Claude, Codex, and
-Copilot all expose one — Copilot's has been verified against a real
-instance; see `src/host.rs` for the field paths). This exists because a
-PreToolUse hook runs as a separate process **before** the actual shell
-command executes, so a command like `cd /other/repo && gh pr create ...`
-can't be resolved by looking at the hook process's own cwd — it's still
-sitting wherever the agent's session started (#10, #14).
+Copilot all expose one; see `src/host.rs` for the field paths), but
+`scan-bash-command` no longer uses it: a PreToolUse hook runs as a separate
+process **before** the shell command executes, so a `cd /other/repo && …` can't
+be resolved from the hook's own cwd (#10, #14) — and bleep now doesn't try. A
+`gh` post must name its destination (`-R`) and its body file by absolute path,
+so no directory is needed; a `git push` is judged by the pre-push hook, which
+runs in the right place by construction.
 
 **How `scan-bash-command` classifies a compound command**: `CMD` is split
 into segments on `;`, `&&`, `||`, `|`, and newlines (quote-aware — `&&`
 inside a quoted string is not treated as a separator). Each segment is
-tokenized and walked by **position**, skipping recognized global options
-(`git`'s `-C`/`-c`/`--git-dir`/etc.), before checking whether the next token
-is the actual subcommand. This means `git -C <dir> push` is correctly
-recognized as a push action — a plain adjacency regex (the previous
-implementation) missed it (#9, #14). `gh`'s `--repo`/`-R` (`--repo=value`
-form included) is detected **independently of position** — it's a flag `gh`
-itself inherits into every subcommand, so `gh --repo owner/repo pr create`
-and `gh pr create --repo owner/repo` are both recognized (the latter was a
-known gap, #23; a plain adjacency/position scan missed it whenever `--repo`
-came after the subcommand). The recognized `gh` publish surface is
-`pr|issue create|edit|comment`, `release create|edit`, `repo edit`,
-`gist create`, and `api` with a write method (`-X`/`--method` set to `POST`,
-`PUT`, or `PATCH` — a plain `gh api <endpoint>` read defaults to GET and is
-not scanned). `gh api` doesn't take `--repo`, so its target-repo resolution
-falls back to the same `cd`-tracking/`git remote` lookup as everything else.
-If any of these segments is found, the denylist match runs against `CMD`
-with any segment that is
-**exactly** `cd <single token>` removed — not against the whole command
-string — so a `cd`'s path argument merely containing a private repo name no
-longer triggers a false-positive hard-deny (#9). Within a `gh` segment that
-has an explicit `--repo`/`-R` override, that flag and its value are also
-removed from the scanned text (#43) — the destination a command explicitly
-names is not itself a leak, the same reasoning `cd` already gets; everything
-the destination doesn't cover (titles, bodies, and any oddly-split fragment)
-still stays in the scanned text, so neither narrowing creates a new blind
-spot. A `git push` segment is **not** inspected for its range or target: the range is
-decided by the pre-push hook from git's own input (see "What `scan-push`
-checks" below). The only push forms that are denied here are the ones that
-switch that hook off — `--no-verify`, or a `-c core.hooksPath=…` global option
-(reason id `push-hook-bypass`). For `gh`, the effective directory of a segment
-is the cumulative effect of every preceding bare `cd <dir>` segment starting
-at `--cwd`/the hook's own cwd; this is what makes `cd /other/repo && gh pr
-create ...` resolve visibility against `/other/repo` instead of the hook
-process's own cwd (#10, #14). Nested `$(...)` command substitutions and other shell-variable
-expansions are not tracked — this is an approximation within the "not a
-security boundary" scope already stated below.
+tokenized and the command word is found **by position** — assignments
+(`X=1 gh …`), prefixes (`env`, `sudo`, `timeout`, `nohup`, …), the subshell
+opener, and an absolute path (`/usr/bin/gh`) are skipped — and the contents of
+`sh|bash|zsh -c '…'`, `eval '…'`, `$(…)` and backticks are classified the same
+way, recursively (depth-limited). A segment that cannot be tokenized (an
+unclosed quote — typically a heredoc body with an apostrophe) but looks like a
+`gh` post is denied as `unparsable` instead of passed through.
+
+Instead of reconstructing what an arbitrary `gh` command will publish, bleep
+accepts a **small grammar** and denies everything outside it
+([docs/adr/0003-constructive-grammar.md](docs/adr/0003-constructive-grammar.md)).
+The commands in the grammar are the ones that carry free text to a public
+surface: `pr create|edit|comment|review|close|merge|reopen`,
+`issue create|edit|comment|close|reopen`, `release create|edit`, `repo edit`,
+`gist create`, and `api` with a write method (`-X`/`--method` `POST`, `PUT` or
+`PATCH`, or `-f`/`-F`/`--input` without a method). A `gh` command that is not in
+that table — a read (`pr view`, `run watch`, a `gh api` GET), or an operation
+with no free text (`pr ready`) — is not scanned, as before. A post is
+**canonical** when:
+
+- the destination is a literal `-R|--repo OWNER/REPO` (position-independent,
+  last one wins); a PR/Issue URL positional also works for `pr|issue`, a
+  positional `OWNER/REPO` for `repo edit`; `gist` has none; for `gh api` it is
+  the literal `repos/<owner>/<repo>/…` path (`{owner}` placeholders resolve
+  through the cwd's origin, so they are outside the grammar)
+- the body comes only from a file given as an **absolute, literal path**
+  (`--body-file`, `-F`; `--notes-file` for `release`; the positional files of
+  `gist create`; `-F key=@path` / `--input` for `gh api`) — never from
+  `--body`/`-b`/`--notes`/`-n`, a `close|reopen --comment`, or stdin (`-`)
+- every other value is literal: no `$(…)`, backticks, or `$VAR`
+
+Anything else is **denied** (reason id `gh-noncanonical`, with one of the
+closed codes `no-repo`, `bad-repo`, `inline-body`, `inline-comment`,
+`body-stdin`, `body-path`, `dynamic-value`, `unparsable` in the ledger's
+`detail`), and the reason text shows the canonical form: write the body to a
+file first, then `gh issue comment 5 -R OWNER/REPO --body-file /abs/path.md`
+(to close with a comment, comment first and then `gh issue close`). bleep does
+not guess a destination from the cwd, track `cd`, or resolve variables any more
+— a form that would need that is simply outside the grammar. A post whose
+destination is a literal PRIVATE/INTERNAL repo is not checked at all (the
+grammar included); with several posts in one command, every post is looked at
+and the denylist match runs on the whole command text plus the body files of the
+posts that go to a public (or unresolvable, e.g. `gh api graphql`) destination.
+The scanned text is `CMD` with any segment that is **exactly** `cd <single
+token>` removed — so a `cd`'s path argument merely containing a private repo
+name no longer triggers a false-positive hard-deny (#9) — and, within a `gh`
+segment with an explicit `--repo`/`-R`, that flag and its value removed too
+(#43: the destination a command names is not itself a leak). Everything the
+destination doesn't cover (titles, other values, and any oddly-split fragment)
+stays in the scanned text. A `git push` segment is **not** inspected for its
+range or target: the range is decided by the pre-push hook from git's own input
+(see "What `scan-push` checks" below). The only push forms that are denied here
+are the ones that switch that hook off — `--no-verify`, or a `-c
+core.hooksPath=…` global option (reason id `push-hook-bypass`). The forms the
+recursion does not reach (a deeper nesting, `python -c 'subprocess.run(["gh", …])'`,
+a binary other than `gh`) remain an approximation, within the scope this
+tool already states below: a guardrail against accidents, not a boundary.
 
 `bleep scan`/`scan-push`/`scan-bash-command` all share the same exit
 code contract (for anyone scripting against this themselves):

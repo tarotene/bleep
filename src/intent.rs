@@ -5,18 +5,26 @@
 //! 責務のままにする。`lex` と同じく純粋関数で、I/O・gh は一切行わない —
 //! 本文の入力元はパスまでを返し、中身を読むのは呼び出し側。
 //!
-//! 出力は投稿セグメントごとの JSON オブジェクトの配列(投稿セグメントが
-//! 無ければ `[]`)。各要素:
+//! 抽出の正本は `grammar.rs`(gh の投稿の正準形、
+//! docs/adr/0003-constructive-grammar.md)。投稿(自由記述を公開面へ運ぶ
+//! 既知のコマンド)は、正準形に入っていれば `canonical: true`、外れていれば
+//! 最初の違反の閉じたコードを `noncanonical_reason` に持つ。読み取りや
+//! 本文を持たない操作は、投稿ではないので出さない。
+//!
+//! 出力は投稿ごとの JSON オブジェクトの配列(投稿が無ければ `[]`)。各要素:
 //!
 //! - `surface`: `pr` / `issue` / `release` / `repo` / `gist` / `api`
-//! - `action`: `create` / `edit` / `comment`、`gh api` は小文字のメソッド
-//! - `repo_source`: `flag`(-R/--repo)/ `api-path`(gh api の API パス)/
-//!   `cwd`(cwd の origin。`cwd` に解決済みの実効ディレクトリ)/
-//!   `unknown`(静的に決められない)
-//! - `repo`: `flag` / `api-path` のときの `owner/repo`、それ以外は null
-//! - `cwd`: `repo_source == "cwd"` のときの実効ディレクトリ、それ以外は null
+//!   (解釈できないセグメントは `unknown`)
+//! - `action`: `create` / `edit` / `comment` / `review` / `close` / `merge` /
+//!   `reopen`、`gh api` は小文字のメソッド
+//! - `repo_source`: `flag`(-R/--repo)/ `url`(PR・Issue の URL)/
+//!   `positional`(`gh repo edit` の位置引数)/ `api-path`(gh api の API
+//!   パス)/ `none`(静的に決められない)
+//! - `repo`: リテラルで取れた `owner/repo`、取れなければ null
 //! - `body_sources`: 本文を読む入力元の絶対パス(stdin は含めない)
-//! - `unresolved`: 宛先または本文の入力元を静的に解決できなかった
+//! - `canonical`: 正準形か
+//! - `noncanonical_reason`: 違反コード(`src/grammar.rs` の `NONCANONICAL_CODES`)、
+//!   正準形なら null
 //!
 //! 適合 fixture は tests/fixtures/intent/*.json(コマンド → 期待される
 //! 意図)。dotfiles 側の Rust 移植(tarotene/dotfiles#415)は、これを共有して
@@ -25,47 +33,21 @@
 use crate::lex;
 use serde_json::{json, Value};
 
-pub fn intents(cmd: &str, start_dir: &str, home: Option<&str>) -> Value {
-    let segments = lex::split_command_segments(cmd);
-    let mut out: Vec<Value> = Vec::new();
-    for (i, seg) in segments.iter().enumerate() {
-        if lex::as_single_cd_target(seg).is_some() {
-            continue;
-        }
-        let c = lex::classify_segment(seg);
-        if !c.kind_is_gh_publish {
-            continue;
-        }
-        let (body_sources, body_unresolved) =
-            lex::resolve_body_sources(&c, &segments, i, start_dir, home);
-        let (repo_source, repo, cwd, dest_unresolved) = match (&c.repo_override, c.dest_unknown) {
-            (Some(r), _) => (
-                if c.repo_from_api_path {
-                    "api-path"
-                } else {
-                    "flag"
-                },
-                Some(r.clone()),
-                None,
-                r.contains('$'),
-            ),
-            (None, true) => ("unknown", None, None, true),
-            (None, false) => (
-                "cwd",
-                None,
-                Some(lex::resolve_effective_dir(start_dir, &segments, i, home)),
-                lex::cd_chain_has_unresolved_var(&segments, i, home),
-            ),
-        };
-        out.push(json!({
-            "surface": c.gh_surface,
-            "action": c.gh_action,
-            "repo_source": repo_source,
-            "repo": repo,
-            "cwd": cwd,
-            "body_sources": body_sources,
-            "unresolved": dest_unresolved || body_unresolved,
-        }));
-    }
+pub fn intents(cmd: &str) -> Value {
+    let out: Vec<Value> = lex::analyze(cmd)
+        .posts
+        .into_iter()
+        .map(|p| {
+            json!({
+                "surface": p.surface,
+                "action": p.action,
+                "repo_source": p.repo_source.as_str(),
+                "repo": p.repo,
+                "body_sources": p.body_sources,
+                "canonical": p.noncanonical.is_none(),
+                "noncanonical_reason": p.noncanonical,
+            })
+        })
+        .collect();
     Value::Array(out)
 }

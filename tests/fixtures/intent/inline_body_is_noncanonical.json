@@ -1,0 +1,6 @@
+{
+  "command": "gh issue create -R pub/repo --title t --body 'text'",
+  "expect": [
+    {"surface": "issue", "action": "create", "repo_source": "flag", "repo": "pub/repo", "body_sources": [], "canonical": false, "noncanonical_reason": "inline-body"}
+  ]
+}

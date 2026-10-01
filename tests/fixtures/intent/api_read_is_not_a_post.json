@@ -1,5 +1,5 @@
 {
-  "command": "gh api repos/pub/repo/issues",
-  "cwd": "/work",
-  "expect": []
+  "command": "gh api repos/pub/repo/issues --jq .",
+  "expect": [
+  ]
 }

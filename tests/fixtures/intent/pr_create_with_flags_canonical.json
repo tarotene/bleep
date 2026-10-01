@@ -1,0 +1,6 @@
+{
+  "command": "gh pr create --repo=pub/repo --base main --head topic --title 'a b' --draft --body-file=/tmp/body.md",
+  "expect": [
+    {"surface": "pr", "action": "create", "repo_source": "flag", "repo": "pub/repo", "body_sources": ["/tmp/body.md"], "canonical": true, "noncanonical_reason": null}
+  ]
+}

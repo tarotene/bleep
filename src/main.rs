@@ -1,3 +1,4 @@
+mod grammar;
 mod hash;
 mod host;
 mod intent;
@@ -12,8 +13,11 @@ use std::process::ExitCode;
 /// docs/adr/0002-gh-intent-and-layers.md)。版 1 = 6 行ヘッダのみ、
 /// 版 2 = 先頭に `#lex <版>` 行、push_spec・本文の入力元(#54/#55)を追加、
 /// 版 3 = push の対象解決(push_dir・push_spec)を外し、pre-push を迂回する形
-/// (push_bypass)に置き換え(docs/adr/0003-constructive-grammar.md)。
-const LEX_PROTOCOL: u32 = 3;
+/// (push_bypass)に置き換え(docs/adr/0003-constructive-grammar.md)、
+/// 版 4 = gh の投稿を正準形の認識器(grammar.rs)の結果に置き換え。投稿ごとに
+/// 宛先・違反コード・本文の入力元を返し、cd 追跡・unresolved_var・
+/// gh_effective_dir を廃止。
+const LEX_PROTOCOL: u32 = 4;
 
 fn usage() -> String {
     "\
@@ -32,20 +36,16 @@ lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
                 純粋な字句解析モード。I/O・gh は一切行わない。出力は
                 先頭の `#lex <版>` 行(--protocol と同じ版)に続けて、
                 found_push、push_bypass(`git push` が pre-push を無効にする
-                `--no-verify` / `-c core.hooksPath=` の形か)、found_gh、
-                gh_repo_override、gh_effective_dir、unresolved_var、
-                body_unresolved、
-                本文の入力元パスの件数 N と N 行のパス、に続けて
-                scan_subject を書く固定書式(jq 非依存 — 呼び出し側の
-                bleep 本体を jq フリーに保つ)。unresolved_var=1 は、
-                found_gh の対象解決に使った値が未展開の $ 参照を
-                含み静的に解決できなかったことを示す(#34)。body_unresolved=1
-                は gh の本文の入力元をコマンド行から静的に解決できなかった
-                ことを示し、パスは gh の --body-file 等をコマンド実行
-                ディレクトリ基準で解決済みの絶対パス(#55)。
+                `--no-verify` / `-c core.hooksPath=` の形か)、gh の投稿の件数
+                N、投稿ごとに(違反コード・宛先の owner/repo・本文の入力元の
+                件数 M・M 行の絶対パス)、に続けて scan_subject を書く固定書式
+                (jq 非依存 — 呼び出し側の bleep 本体を jq フリーに保つ)。
+                違反コードは正準形を外れた最初の理由(空なら正準形)、宛先は
+                リテラルで取れたときだけ(空なら静的に決められない)。
+                `--cwd` は受け取るが使わない(cd の追跡をしないため)。
 intent          gh の投稿コマンドから「投稿の意図」(面・操作・宛先・本文の
-                入力元パス・解決不能フラグ)を取り出し、投稿セグメントごとの
-                JSON 配列を stdout に書く(#56)。lex と同じく I/O・gh は
+                入力元パス・正準形かどうかと違反コード)を取り出し、投稿
+                ごとの JSON 配列を stdout に書く(#56)。lex と同じく I/O・gh は
                 一切行わない。書式と適合 fixture は src/intent.rs と
                 tests/fixtures/intent/。
 hash            bleep(Bash)本体の判定レッジャー(ledger_write)から呼ばれる。
@@ -61,22 +61,21 @@ fn escape_line(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
-fn cmd_intent(cwd: &str, cmd: &str) {
-    let home = env::var("HOME").ok();
-    println!("{}", intent::intents(cmd, cwd, home.as_deref()));
+fn cmd_intent(cmd: &str) {
+    println!("{}", intent::intents(cmd));
 }
 
-/// `lex` / `intent` 共通の引数解析: `[--cwd DIR] [--] CMD`。
-fn parse_cwd_and_cmd(name: &str, args: &[String]) -> Result<(String, String), ExitCode> {
-    let mut cwd = ".".to_string();
+/// `lex` / `intent` 共通の引数解析: `[--cwd DIR] [--] CMD`。`--cwd` は読み飛ばす
+/// だけ(cd の追跡をやめたので、実効ディレクトリを使わない。bleep 本体が付けて
+/// 呼ぶ形を変えないために受け取る)。
+fn parse_cwd_and_cmd(name: &str, args: &[String]) -> Result<String, ExitCode> {
     let mut rest = args;
     if let Some(v) = rest.first() {
         if v == "--cwd" {
-            let Some(dir) = rest.get(1) else {
+            if rest.get(1).is_none() {
                 eprintln!("--cwd requires a value\n\n{}", usage());
                 return Err(ExitCode::from(2));
-            };
-            cwd = dir.clone();
+            }
             rest = &rest[2..];
         }
     }
@@ -89,23 +88,22 @@ fn parse_cwd_and_cmd(name: &str, args: &[String]) -> Result<(String, String), Ex
         eprintln!("{name}: missing CMD\n\n{}", usage());
         return Err(ExitCode::from(2));
     };
-    Ok((cwd, cmd.clone()))
+    Ok(cmd.clone())
 }
 
-fn cmd_lex(cwd: &str, cmd: &str) {
-    let home = env::var("HOME").ok();
-    let r = lex::analyze(cmd, cwd, home.as_deref());
+fn cmd_lex(cmd: &str) {
+    let r = lex::analyze(cmd);
     println!("#lex {LEX_PROTOCOL}");
     println!("{}", if r.found_push { "1" } else { "0" });
     println!("{}", if r.push_bypass { "1" } else { "0" });
-    println!("{}", if r.found_gh { "1" } else { "0" });
-    println!("{}", escape_line(&r.gh_repo_override));
-    println!("{}", escape_line(&r.gh_effective_dir));
-    println!("{}", if r.unresolved_var { "1" } else { "0" });
-    println!("{}", if r.body_unresolved { "1" } else { "0" });
-    println!("{}", r.body_sources.len());
-    for p in &r.body_sources {
-        println!("{}", escape_line(p));
+    println!("{}", r.posts.len());
+    for p in &r.posts {
+        println!("{}", p.noncanonical.unwrap_or(""));
+        println!("{}", escape_line(p.repo.as_deref().unwrap_or("")));
+        println!("{}", p.body_sources.len());
+        for path in &p.body_sources {
+            println!("{}", escape_line(path));
+        }
     }
     print!("{}", r.scan_subject); // 既に各セグメント末尾に \n が付いている
 }
@@ -145,14 +143,14 @@ fn main() -> ExitCode {
             };
         }
         if first == "lex" || first == "intent" {
-            let (cwd, cmd) = match parse_cwd_and_cmd(first, &args[1..]) {
+            let cmd = match parse_cwd_and_cmd(first, &args[1..]) {
                 Ok(v) => v,
                 Err(code) => return code,
             };
             if first == "lex" {
-                cmd_lex(&cwd, &cmd);
+                cmd_lex(&cmd);
             } else {
-                cmd_intent(&cwd, &cmd);
+                cmd_intent(&cmd);
             }
             return ExitCode::SUCCESS;
         }

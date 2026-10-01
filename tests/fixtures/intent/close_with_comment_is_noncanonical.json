@@ -1,0 +1,6 @@
+{
+  "command": "gh issue close 5 -R pub/repo --comment 'done'",
+  "expect": [
+    {"surface": "issue", "action": "close", "repo_source": "flag", "repo": "pub/repo", "body_sources": [], "canonical": false, "noncanonical_reason": "inline-comment"}
+  ]
+}

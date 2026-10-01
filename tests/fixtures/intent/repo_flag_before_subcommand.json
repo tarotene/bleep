@@ -1,0 +1,6 @@
+{
+  "command": "gh -R pub/repo pr comment 5 --body-file /tmp/body.md",
+  "expect": [
+    {"surface": "pr", "action": "comment", "repo_source": "flag", "repo": "pub/repo", "body_sources": ["/tmp/body.md"], "canonical": true, "noncanonical_reason": null}
+  ]
+}

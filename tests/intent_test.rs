@@ -1,5 +1,5 @@
 //! `bleep-hook intent` の適合テスト。tests/fixtures/intent/*.json の各ファイル
-//! (`command` / `cwd` / `expect`)を実バイナリに通し、出力の JSON が
+//! (`command` / `expect`)を実バイナリに通し、出力の JSON が
 //! `expect` と一致することを確かめる。dotfiles 側の Rust 移植
 //! (tarotene/dotfiles#415)も同じ fixture を共有して緑にする想定
 //! (docs/adr/0002-gh-intent-and-layers.md)。fixture には架空の名前
@@ -26,7 +26,7 @@ fn intent_fixture_corpus() {
     for path in names {
         let fx: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let command = fx["command"].as_str().expect("command");
-        let cwd = fx["cwd"].as_str().unwrap_or("/work");
+        let cwd = "/work"; // cwd は結果に影響しない(cd を追跡しない)
         let out = Command::cargo_bin("bleep-hook")
             .unwrap()
             .env("HOME", "/home/test")

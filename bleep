@@ -73,20 +73,26 @@
 #                                           (#9/#14 — 正規表現の隣接一致では
 #                                           "git -C dir push"/"gh --repo x pr
 #                                           create" を取りこぼしていた)。
-#                                           "gh pr|issue create/edit/comment"
-#                                           "gh release create/edit"
+#                                           gh の投稿("gh pr|issue create/
+#                                           edit/comment/review/close/merge/
+#                                           reopen" "gh release create/edit"
 #                                           "gh repo edit" "gh gist create"
-#                                           "gh api -X POST/PUT/PATCH" の
-#                                           いずれかのセグメントが見つかれば、
-#                                           CMD 全文
-#                                           から "cd <単一トークン>" セグメント
-#                                           だけを除いたテキストを検査する
-#                                           (#9 — cd のパス引数に private
-#                                           リポ名が含まれるだけでは deny
-#                                           しない)。"git push" は中身を検査
-#                                           せず(pre-push が検査する、
-#                                           ADR-0003)、pre-push を無効にする
-#                                           形(--no-verify、-c core.hooksPath=)
+#                                           "gh api -X POST/PUT/PATCH" など、
+#                                           自由記述を公開面へ運ぶ既知のコマンド)
+#                                           は、正準形(-R OWNER/REPO + 絶対
+#                                           パスの --body-file)だけを受理し、
+#                                           外れた形は deny する(ADR-0003)。
+#                                           正準形なら、CMD 全文から
+#                                           "cd <単一トークン>" セグメント
+#                                           だけを除いたテキストと本文ファイルを
+#                                           検査する(#9 — cd のパス引数に
+#                                           private リポ名が含まれるだけでは
+#                                           deny しない)。宛先がリテラルの
+#                                           PRIVATE/INTERNAL なら検査しない。
+#                                           "git push" は中身を検査せず
+#                                           (pre-push が検査する、ADR-0003)、
+#                                           pre-push を無効にする形
+#                                           (--no-verify、-c core.hooksPath=)
 #                                           だけを deny する。どちらの形も無ければ
 #                                           無検査で pass。
 #   bleep audit [path...] [--remote] [--since REV]
@@ -113,7 +119,7 @@ BLEEP_VERSION='0.2.0'
 
 # bleep-hook lex の出力形式の版(src/main.rs の LEX_PROTOCOL と揃える)。
 # 出力の先頭行 `#lex <版>` と一致しなければ ask にする(bleep doctor でも検査)。
-LEX_PROTOCOL=3
+LEX_PROTOCOL=4
 
 SELF="$(realpath "$0")"
 TEST_TMP=''
@@ -1116,18 +1122,37 @@ cmd_scan_pre_push() {
 # fail-open の退行 — 自前実装がシェルの引用規則を不完全に近似していた)
 # を参照。
 
-# cmd_scan_bash_command: CMD の字句解析(セグメント分割・"git push" 形/
-# "gh pr|issue create/edit/comment" 形の検出・cd 積み重ねによる実効
-# ディレクトリ解決)は $LEX_BIN(bleep-hook、D1)に委ねる。この
+# noncanonical_reason_text: $1=gh の投稿が正準形を外れた理由コード(src/grammar.rs の
+# NONCANONICAL_CODES)-> 理由文。正準形の定義と、書き直し方を案内する。bypass 手段は
+# ここに書かない(README 参照)。
+noncanonical_reason_text() {
+  local base='gh の投稿は、次の正準形だけを受け付けます: gh <pr|issue> <create|edit|comment> -R OWNER/REPO … --body-file /絶対/パス(本文は先にファイルへ書き、絶対パスのリテラルで渡す。release は --notes-file)。'
+  local why
+  case "$1" in
+    no-repo) why='宛先 -R OWNER/REPO がありません(cwd の origin からは推測しません)。' ;;
+    bad-repo) why='-R の値、または gh api の宛先が、リテラルの OWNER/REPO ではありません(変数や {owner} プレースホルダは使えません)。' ;;
+    inline-body) why='本文を --body/-b/--notes/-n で直接渡す形は使えません。' ;;
+    inline-comment) why='close/reopen の --comment は使えません。gh <pr|issue> comment --body-file で本文を投稿してから close してください。' ;;
+    body-stdin) why='本文を標準入力(-)で渡す形は使えません。' ;;
+    body-path) why='本文ファイルのパスが絶対パスのリテラルではありません(相対パス・~・変数は使えません)。' ;;
+    dynamic-value) why='コマンド置換や変数展開($(…)、バッククォート、$VAR)を含む値は使えません。リテラルで書いてください。' ;;
+    unparsable) why='コマンドを解釈できません(クォートが閉じていない、ヒアドキュメントなど)。本文はファイルに書いて --body-file で渡してください。' ;;
+    *) why='正準形を外れています。' ;;
+  esac
+  printf '%s %s' "$why" "$base"
+}
+
+# cmd_scan_bash_command: CMD の字句解析(セグメント分割・"git push" 形/gh の投稿の
+# 認識・正準形かどうかの判定)は $LEX_BIN(bleep-hook、D1)に委ねる。この
 # バイナリは純粋関数のみで I/O・gh を一切行わないため、判定不能を無言 pass
 # にしない fail-loud の格は落ちない — 起動自体に失敗したら ask にエスカレート
-# する(下記 lex_out の読み取り失敗を参照)。出力は先頭の `#lex <版>` 行と
-# 固定ヘッダ(found_push/push_bypass/found_gh/gh_repo_override/
-# gh_effective_dir/unresolved_var/body_unresolved + 本文の入力元)+
-# scan_subject(jq 非依存を保つための独自の単純書式、bleep-hook lex --help
+# する(下記 lex_out の読み取り失敗を参照)。出力は先頭の `#lex <版>` 行と、
+# found_push/push_bypass/投稿の件数と投稿ごとの(違反コード・宛先・本文の入力元)
+# + scan_subject(jq 非依存を保つための独自の単純書式、bleep-hook lex --help
 # 参照)。照合対象(scan subject)は CMD 全文から `cd <単一トークン>`
 # セグメントだけを除いたもの(#9)。git push は pre-push hook を無効にする
-# 形だけを deny し、中身は見ない(ADR-0003)。gh の形も見つからなければ
+# 形だけを deny し、中身は見ない(pre-push が検査する、ADR-0003)。gh の投稿は
+# 正準形だけを受理し、外れた形は deny する(ADR-0003)。どちらの形も無ければ
 # 無検査で pass(フォールスルー)。Claude/Codex/Copilot の Bash 系 host が
 # 共通で呼ぶ、シェルコマンド用の唯一の判定入口。
 cmd_scan_bash_command() {
@@ -1139,9 +1164,8 @@ cmd_scan_bash_command() {
     emit_verdict ask "コマンドの字句解析に失敗しました(bleep-hook が見つからないか実行できません)。" lex-failed
   fi
 
-  local found_push push_bypass found_gh gh_repo_override gh_effective_dir unresolved_var scan_subject
-  local lex_header body_unresolved body_n body_path i
-  local -a body_paths=()
+  local found_push push_bypass n_posts scan_subject lex_header i n k body_path
+  local -a post_code=() post_repo=() post_body_n=() all_bodies=()
   {
     IFS= read -r lex_header
     if [[ $lex_header != "#lex ${LEX_PROTOCOL}" ]]; then
@@ -1149,15 +1173,18 @@ cmd_scan_bash_command() {
     fi
     IFS= read -r found_push
     IFS= read -r push_bypass
-    IFS= read -r found_gh
-    IFS= read -r gh_repo_override
-    IFS= read -r gh_effective_dir
-    IFS= read -r unresolved_var
-    IFS= read -r body_unresolved
-    IFS= read -r body_n
-    for ((i = 0; i < body_n; i++)); do
-      IFS= read -r body_path
-      body_paths+=("$body_path")
+    IFS= read -r n_posts
+    for ((i = 0; i < n_posts; i++)); do
+      IFS= read -r k
+      post_code+=("$k")
+      IFS= read -r k
+      post_repo+=("$k")
+      IFS= read -r n
+      post_body_n+=("$n")
+      for ((k = 0; k < n; k++)); do
+        IFS= read -r body_path
+        all_bodies+=("$body_path")
+      done
     done
     scan_subject="$(cat)"
   } <<< "$lex_out"
@@ -1172,37 +1199,35 @@ cmd_scan_bash_command() {
     emit_verdict deny "git push が pre-push hook を無効にする形(--no-verify、または -c core.hooksPath=)になっています。push の検査は pre-push hook で行うため、この形では実行できません。--no-verify と -c core.hooksPath を外して push し直してください。" push-hook-bypass
   fi
 
-  # #34: cd/--repo/-R の対象に未展開のシェル変数が残り、静的に解決
-  # できなかった場合は、denylist 照合にフォールバックせず即座に ask へ
-  # エスカレートする(値を推測で使わない — 検出して人間に委ねる設計)。
-  if [[ $unresolved_var == "1" ]]; then
-    emit_verdict ask "コマンド中の cd/--repo/-R の対象にシェル変数(未展開の \$...)が含まれ、対象リポジトリを静的に解決できません。パスをリテラルで書き直してください。" unresolved-var
-  fi
-
-  if [[ $found_gh == "1" ]]; then
-    local gh_nwo="$gh_repo_override"
-    # gh_effective_dir も空なら宛先を静的に決められなかった(#58: gh api
-    # graphql 等)。cwd の origin に解決して PRIVATE と誤認しないよう、宛先
-    # 解決自体を飛ばして公開宛てとして検査する。
-    if [[ -z $gh_nwo && -n $gh_effective_dir ]]; then
-      local saved_target="$TARGET_CWD"
-      TARGET_CWD="$gh_effective_dir"
-      gh_nwo="$(resolve_repo_nwo)" || gh_nwo=""
-      TARGET_CWD="$saved_target"
+  # gh の投稿(ADR-0003): 受理するのは正準形だけ。宛先が PRIVATE/INTERNAL と
+  # 分かっている投稿は検査しない(これは「検査しない」という正当な判定)。それ
+  # 以外(公開、または宛先を静的に決められない)の投稿が正準形を外れていれば
+  # deny。正準形なら、コマンド文字列と本文ファイルを denylist と照合する。
+  # 本文ファイルを読めないときは、読めた範囲だけで pass せず ask にする
+  # (fail-loud、#55)。
+  local repo vis offset=0 scan_public=0
+  local -a scan_bodies=()
+  for ((i = 0; i < n_posts; i++)); do
+    repo="${post_repo[i]}"
+    n="${post_body_n[i]}"
+    if [[ -n $repo ]]; then
+      vis="$(repo_visibility "$repo")"
+      if [[ $vis == PRIVATE || $vis == INTERNAL ]]; then
+        offset=$((offset + n))
+        continue
+      fi
     fi
-    if [[ -n $gh_nwo ]]; then
-      local vis
-      vis="$(repo_visibility "$gh_nwo")"
-      [[ $vis == PRIVATE || $vis == INTERNAL ]] && exit 0
+    if [[ -n ${post_code[i]} ]]; then
+      emit_verdict deny "$(noncanonical_reason_text "${post_code[i]}")" gh-noncanonical none "" "${post_code[i]}"
     fi
-    # #55: 本文をファイル・API 入力から渡す形は、本文がコマンド文字列に
-    # 現れない。宛先が PRIVATE/INTERNAL なら上で pass 済みなので、ここに来る
-    # のは公開宛て(または判定不能)だけ。入力元が静的に解決できない、または
-    # 読めないときは、読めた範囲だけで pass せず ask にする(fail-loud)。
-    if [[ $body_unresolved == "1" ]]; then
-      emit_verdict ask "gh の本文の入力元(--body-file / -F k=@path / --input のパス、または \$(...) で作った本文)を静的に解決できません。本文をコマンド行に直接書くか、パスをリテラルで書き直してください。" body-source-unresolved
-    fi
-    for body_path in "${body_paths[@]+"${body_paths[@]}"}"; do
+    scan_public=1
+    for ((k = 0; k < n; k++)); do
+      scan_bodies+=("${all_bodies[offset + k]}")
+    done
+    offset=$((offset + n))
+  done
+  if [[ $scan_public == 1 ]]; then
+    for body_path in "${scan_bodies[@]+"${scan_bodies[@]}"}"; do
       if [[ -f $body_path && -r $body_path ]]; then
         scan_subject+=$'\n'"$(cat -- "$body_path" 2>/dev/null)" || true
       else
@@ -1214,7 +1239,6 @@ cmd_scan_bash_command() {
     if match_verdict "$scan_subject"; then
       emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
     fi
-    exit 0
   fi
 
   exit 0
@@ -1782,11 +1806,33 @@ BYPASS
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(無関係な -c は迂回ではない): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
 
+  # gh の投稿は正準形(-R OWNER/REPO + 絶対パスの --body-file)だけを受理し、
+  # 本文ファイルの中身を denylist と照合する(ADR-0003)。本文の用意:
+  local gb="$tmp/gh-bodies"
+  mkdir -p "$gb"
+  printf 'acme/secret-project の件\n' > "$gb/leak.md"
+  printf 'acme is our employer\n' > "$gb/org.md"
+  printf 'unrelated body\n' > "$gb/clean.md"
+  printf '{"body":"acme/secret-project"}\n' > "$gb/leak.json"
+
   set +e
-  (cd "$repo" && "$SELF" scan-bash-command 'gh pr create --title t --body "acme is our employer"') > /dev/null 2>&1
+  (cd "$repo" && "$SELF" scan-bash-command "gh pr create -R pub/repo --title t --body-file $gb/org.md") > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(scan-bash-command gh pr create ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # 文法の外(本文の直書き)は、本文の中身に依らず deny する。理由文は正準形と
+  # 書き直し方を案内し、レッジャーの reason_id/detail に残る。
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  out="$(cd "$repo" && "$SELF" scan-bash-command 'gh pr create -R pub/repo --title t --body "acme is our employer"' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'--body-file'* && $out == *'--body/-b'* ]] || { echo "FAIL(gh --body の直書きは deny): 期待=2(--body-file の案内つき) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  if ! tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl" 2>/dev/null | grep -q '"reason_id":"gh-noncanonical".*"detail":"inline-body"'; then
+    echo "FAIL(ledger: gh-noncanonical / inline-body が残らない): $(tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl" 2>/dev/null)" >&2
+    fails=$((fails + 1))
+  fi
 
   set +e
   (cd "$repo" && "$SELF" scan-bash-command 'git status') > /dev/null 2>&1
@@ -1813,7 +1859,7 @@ BYPASS
   [[ $rc -eq 2 ]] || { echo "FAIL(--cwd scan-push --pre-push): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   set +e
-  "$SELF" --cwd "$repo" scan-bash-command 'gh pr create --title t --body "acme is our employer"' > /dev/null 2>&1
+  "$SELF" --cwd "$repo" scan-bash-command "gh pr create -R pub/repo --title t --body-file $gb/org.md" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(--cwd gh pr create ask): 期待=1(ask) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1890,15 +1936,15 @@ git push --force-with-lease --force-if-includes origin feat
 PUSHFORMS
 
   set +e
-  "$SELF" scan-bash-command 'gh --repo acme/other pr create --title t --body "acme/secret-project"' > /dev/null 2>&1
+  "$SELF" scan-bash-command "gh --repo acme/other pr create --title t --body-file $gb/leak.md" > /dev/null 2>&1
   rc=$?
   set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(gh --repo x pr create): 期待=2(deny) 実際=$rc(以前は無検査 pass だった #14 の回帰)" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 2 ]] || { echo "FAIL(gh --repo x pr create): 期待=2(deny) 実際=$rc(サブコマンドの前の global option で外れる #14 の回帰)" >&2; fails=$((fails + 1)); }
 
   # #9 の直接回帰: cd のパスに private リポ名が含まれるだけでは hard-deny
   # しない(gh セグメント自体に denylist 文字列が無ければ pass)。
   set +e
-  "$SELF" scan-bash-command 'cd /x/my-private-tool-work && gh pr create --title t --body "unrelated body"' > /dev/null 2>&1
+  "$SELF" scan-bash-command "cd /x/my-private-tool-work && gh pr create -R pub/repo --title t --body-file $gb/clean.md" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#9: cd パスの private リポ名だけでは deny しない): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1906,7 +1952,7 @@ PUSHFORMS
   # 引用符の中の && は分割対象にならないこと(素朴な分割が引用文字列を
   # 切って deny を取りこぼす回帰の固定)。
   set +e
-  "$SELF" scan-bash-command 'gh pr create --title t --body "before && my-private-tool after"' > /dev/null 2>&1
+  "$SELF" scan-bash-command "gh pr create -R pub/repo --title 'before && my-private-tool after' --body-file $gb/clean.md" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(引用符内の && で分割しない): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1915,7 +1961,7 @@ PUSHFORMS
   # 区切りとして認識されず gh pr create セグメントごと無検査 pass していた
   # (split_command_segments のバックスラッシュエスケープ未対応)。
   set +e
-  "$SELF" scan-bash-command 'echo \" && gh pr create --title t --body "acme/secret-project"' > /dev/null 2>&1
+  "$SELF" scan-bash-command "echo \\\" && gh pr create -R pub/repo --title t --body-file $gb/leak.md" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(#22: \\\" で && の区切りが壊れない): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1924,60 +1970,22 @@ PUSHFORMS
   # 閉じ、gh_publish への分類自体に失敗して無検査 pass していた
   # (tokenize_segment のバックスラッシュエスケープ未対応)。
   set +e
-  "$SELF" scan-bash-command 'gh --repo "x\"y" pr create --title t --body "acme/secret-project leak"' > /dev/null 2>&1
+  out="$("$SELF" scan-bash-command "gh --repo \"x\\\"y\" pr create --title t --body-file $gb/leak.md" 2>&1)"
   rc=$?
   set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(#22: --repo 値の \\\" で分類が壊れない): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 2 && $out == *'OWNER/REPO'* ]] || { echo "FAIL(#22: --repo 値の \\\" で分類が壊れない): 期待=2(宛先が OWNER/REPO でない) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
-  # 複数 cd(#14 の裁定): 先頭の cd だけでなく、直前までの全 cd を反映する
-  # こと。先頭だけ見ると PRIVATE な repo_priv に誤解決して検査全体を
-  # スキップしてしまう(rc=0)。正しくは最後の cd(PUBLIC な repo_pub)を
-  # 反映し、body の denylist 文字列を検査して deny する。
-  local repo_priv="$tmp/repo_priv" repo_pub="$tmp/repo_pub" d
-  for d in "$repo_priv" "$repo_pub"; do
-    mkdir -p "$d"
-    git -C "$d" init -qb main
-    git -C "$d" config core.hooksPath /dev/null
-    git -C "$d" config user.email test@example.invalid
-    git -C "$d" config user.name test
-    git -C "$d" config commit.gpgsign false
-    echo x > "$d/f.txt"
-    git -C "$d" add f.txt
-    git -C "$d" commit -qm initial
-  done
-  git -C "$repo_priv" remote add origin "$tmp/remote-priv.git"
-  git -C "$repo_pub" remote add origin "$tmp/remote-pub.git"
+  # 複数の投稿を 1 コマンドに含むとき(#14 の裁定の後継 — cd の積み重ねで宛先を
+  # 求めるのをやめ、宛先は -R の明示だけにした)は、全件を見る。PRIVATE な宛先の
+  # 投稿は検査しない(本文が漏れていても pass)が、公開宛ての投稿が 1 件でも
+  # あれば、そちらを検査する。以前は最初の 1 件の宛先だけを見ていた。
   cat > "$tmp/bin-gh" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "repo list") printf 'my-private-tool\n' ;;
   "repo view")
     case "$3" in
-      *remote-priv.git) printf 'PRIVATE' ;;
-      *) printf 'PUBLIC' ;;
-    esac
-    ;;
-  "api user") printf 'test-owner' ;;
-  *) exit 1 ;;
-esac
-STUB
-  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
-  set +e
-  "$SELF" scan-bash-command "cd $repo_priv && cd $repo_pub && gh pr create --title t --body \"acme/secret-project\"" > /dev/null 2>&1
-  rc=$?
-  set -e
-  [[ $rc -eq 2 ]] || { echo "FAIL(複数 cd: 最後の cd を反映すること): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
-
-  # #57/#58: gh api の宛先は API パス(repos/<owner>/<repo>/…)から解決し、
-  # -X の無い -f/-F は暗黙の POST として書き込みに分類する。cwd は PRIVATE
-  # な repo_priv(remote-priv)で、宛先だけが違う。
-  cat > "$tmp/bin-gh" <<'STUB'
-#!/usr/bin/env bash
-case "$1 $2" in
-  "repo list") printf 'my-private-tool\n' ;;
-  "repo view")
-    case "$3" in
-      *remote-priv*) printf 'PRIVATE' ;;
+      priv/*) printf 'PRIVATE' ;;
       *) printf 'PUBLIC' ;;
     esac
     ;;
@@ -1989,7 +1997,27 @@ STUB
   local api_cmd api_want
   while IFS='|' read -r api_want api_cmd; do
     set +e
-    (cd "$repo_priv" && "$SELF" scan-bash-command "$api_cmd") > /dev/null 2>&1
+    (cd "$tmp" && "$SELF" scan-bash-command "${api_cmd//@gb@/$gb}") > /dev/null 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq $api_want ]] || { echo "FAIL(複数の投稿 / PRIVATE 宛て: $api_cmd): 期待=$api_want 実際=$rc" >&2; fails=$((fails + 1)); }
+  done <<'CASESMULTI'
+0|gh issue comment 1 -R priv/repo --body-file @gb@/leak.md
+2|gh issue comment 1 -R priv/repo --body-file @gb@/clean.md && gh issue comment 1 -R pub/repo --body-file @gb@/leak.md
+2|gh issue comment 1 -R pub/repo --body-file @gb@/leak.md && gh issue comment 1 -R priv/repo --body-file @gb@/clean.md
+0|gh issue comment 1 -R priv/repo --body-file @gb@/clean.md && gh issue comment 2 -R priv/two --body-file @gb@/leak.md
+0|gh issue comment 1 -R priv/repo --body hello
+2|gh issue comment 1 -R pub/repo --body hello
+2|gh issue comment 1 -R priv/repo --body-file @gb@/clean.md && gh issue comment 1 -R pub/repo --body hello
+CASESMULTI
+
+  # #57/#58: gh api の宛先は API パス(repos/<owner>/<repo>/…)だけから求め、
+  # -X の無い -f/-F は暗黙の POST として書き込みに分類する。{owner}/{repo}
+  # プレースホルダは cwd の origin に依存するので文法の外(deny)。宛先を静的に
+  # 決められない graphql などは、PRIVATE と誤認せず公開宛てとして検査する。
+  while IFS='|' read -r api_want api_cmd; do
+    set +e
+    (cd "$tmp" && "$SELF" scan-bash-command "$api_cmd") > /dev/null 2>&1
     rc=$?
     set -e
     [[ $rc -eq $api_want ]] || { echo "FAIL(gh api 宛先/暗黙 POST: $api_cmd): 期待=$api_want 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -1997,36 +2025,72 @@ STUB
 2|gh api -X POST repos/pub/repo/issues -f body="acme/secret-project"
 2|gh api repos/pub/repo/issues -f body="acme/secret-project"
 2|gh api graphql -f query="acme/secret-project"
-0|gh api repos/{owner}/{repo}/issues -f body="acme/secret-project"
+0|gh api -X POST repos/priv/repo/issues -f body="acme/secret-project"
+2|gh api repos/{owner}/{repo}/issues -f body="acme/secret-project"
 0|gh api -X GET repos/pub/repo/issues -f q="acme/secret-project"
 CASES
 
   # #55: 本文をファイル・API 入力から渡す形は、内容を読んで照合する。
-  # 読めない/解決できない入力元は ask(fail-loud)。宛先は -R / API パスで
-  # PUBLIC(スタブ)に固定している。
+  # 読めない入力元は ask(fail-loud)。相対パス・変数・標準入力・コマンド置換で
+  # 作る本文は、解決を試みず文法の外として deny する(ADR-0003)。宛先は -R /
+  # API パスで PUBLIC(スタブ)に固定している。
   mkdir -p "$tmp/bodies"
-  printf 'acme/secret-project の件\n' > "$tmp/bodies/leak.md"
-  printf '{"body":"acme/secret-project"}\n' > "$tmp/bodies/leak.json"
+  cp "$gb/leak.md" "$tmp/bodies/leak.md"
+  cp "$gb/leak.json" "$tmp/bodies/leak.json"
   printf 'hello\n' > "$tmp/bodies/clean.md"
   while IFS='|' read -r api_want api_cmd; do
     set +e
-    (cd "$repo_priv" && "$SELF" scan-bash-command "$api_cmd") > /dev/null 2>&1
+    (cd "$tmp" && "$SELF" scan-bash-command "$api_cmd") > /dev/null 2>&1
     rc=$?
     set -e
     [[ $rc -eq $api_want ]] || { echo "FAIL(#55 本文の入力元: $api_cmd): 期待=$api_want 実際=$rc" >&2; fails=$((fails + 1)); }
   done <<CASES55
 2|gh issue create -R pub/repo --body-file $tmp/bodies/leak.md
-2|cd $tmp/bodies && gh issue create -R pub/repo --body-file leak.md
 2|gh issue create -R pub/repo -F $tmp/bodies/leak.md
 2|gh api -X PATCH repos/pub/repo/issues/1 -F body=@$tmp/bodies/leak.md
 2|gh api repos/pub/repo/issues --input $tmp/bodies/leak.json
+2|gh release create v1 -R pub/repo --notes-file $tmp/bodies/leak.md
+2|gh gist create $tmp/bodies/leak.md
 0|gh issue create -R pub/repo --body-file $tmp/bodies/clean.md
-0|gh issue create -R pub/repo --body-file -
+0|gh release create v1 -R pub/repo --notes-file $tmp/bodies/clean.md
+0|gh gist create $tmp/bodies/clean.md
 1|gh issue create -R pub/repo --body-file $tmp/bodies/missing.md
-1|S=$tmp/bodies; gh issue create -R pub/repo --body-file \$S/leak.md
-1|gh issue create -R pub/repo --body "\$(cat $tmp/bodies/leak.md)"
-1|gh api -X POST repos/pub/repo/issues -f body="\$(cat $tmp/bodies/leak.md)"
+2|cd $tmp/bodies && gh issue create -R pub/repo --body-file leak.md
+2|gh issue create -R pub/repo --body-file -
+2|S=$tmp/bodies; gh issue create -R pub/repo --body-file \$S/leak.md
+2|gh issue create -R pub/repo --body "\$(cat $tmp/bodies/leak.md)"
+2|gh api -X POST repos/pub/repo/issues -f body="\$(cat $tmp/bodies/leak.md)"
+2|gh release create v1 -R pub/repo --notes hello
+2|gh issue close 5 -R pub/repo --comment hello
+2|gh gist create relative.txt
 CASES55
+
+  # 前置・包みの中の gh も同じ文法で見る(env、sudo、sh -c、eval、$(…))。
+  while IFS='|' read -r api_want api_cmd; do
+    set +e
+    (cd "$tmp" && "$SELF" scan-bash-command "${api_cmd//@gb@/$gb}") > /dev/null 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq $api_want ]] || { echo "FAIL(包みの中の gh: $api_cmd): 期待=$api_want 実際=$rc" >&2; fails=$((fails + 1)); }
+  done <<'CASESWRAP'
+2|env X=1 gh issue comment 1 -R pub/repo --body hello
+2|sudo -u me gh issue comment 1 -R pub/repo --body hello
+2|sh -c 'gh issue comment 1 -R pub/repo --body hello'
+2|eval gh issue comment 1 -R pub/repo --body hello
+2|echo $(gh issue comment 1 -R pub/repo --body hello)
+2|sh -c 'gh issue comment 1 -R pub/repo --body-file @gb@/leak.md'
+0|sh -c 'gh issue comment 1 -R pub/repo --body-file @gb@/clean.md'
+0|gh pr view 5 -R pub/repo && gh pr checks 5 && gh run watch 1
+0|gh pr merge 5 -R pub/repo --squash
+CASESWRAP
+
+  # ヒアドキュメントで本文を渡す形(本文の中のアポストロフィでクォートが閉じず、
+  # コマンドを解釈できない)は、素通りにせず deny する。
+  set +e
+  out="$(cd "$tmp" && "$SELF" scan-bash-command "$(printf 'gh issue create -R pub/repo --body-file /dev/stdin <<EOF\nit'"'"'s a heredoc\nEOF')" 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'解釈できません'* ]] || { echo "FAIL(ヒアドキュメントの gh 投稿は deny): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   # #54: push の範囲は「実際に push される ref」から、remote が既に持つ内容を
   # 除いて求める(default branch / merge-base に依存しない)。
@@ -2099,7 +2163,7 @@ CASES54
   # 解決され(cd パスの private リポ名は無関係)、scan subject からも cd
   # セグメントが除かれるので pass する。
   set +e
-  "$SELF" scan-bash-command 'cd /x/my-private-tool-work && gh pr create --repo public/other --title t --body b' > /dev/null 2>&1
+  "$SELF" scan-bash-command "cd /x/my-private-tool-work && gh pr create --repo public/other --title t --body-file $gb/clean.md" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#9+#14: cd の private 名 + --repo public/other): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -2120,7 +2184,7 @@ STUB
   mkdir -p "$tmp/not-a-repo2"
   rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
   set +e
-  (cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command 'gh pr create --repo acme/secret-project --title t --body "unrelated"') > /dev/null 2>&1
+  (cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh pr create --repo acme/secret-project --title t --body-file $gb/clean.md") > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#23/#43: サブコマンド後の --repo で PRIVATE 宛先を検出): 期待=0(pass、visibility skip) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -2141,45 +2205,43 @@ esac
 STUB
   rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
   set +e
-  (cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command 'gh pr create --repo acme/secret-project --title t --body "unrelated"') > /dev/null 2>&1
+  (cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh pr create --repo acme/secret-project --title t --body-file $gb/clean.md") > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#43 D2: PUBLIC 宛先でも --repo トークン自体は照合対象外): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
 
-  # #34 の再現そのもの: --repo が無く、cd "$D" だけに頼る gh セグメント。
-  # 以前は無言で denylist 全文照合にフォールバックし、cwd 由来の誤判定
-  # (fail-wrong)を起こし得た。
+  # #34 の後継: --repo が無い投稿は、cwd の origin から宛先を推測せず(cd の
+  # 追跡も変数の解決もしない)、文法の外として deny する。cd の対象に変数が
+  # あっても、-R が明示されていれば無関係。
   set +e
-  out="$("$SELF" scan-bash-command 'cd "$D" && gh pr create --title t --body b' 2>&1)"
+  out="$("$SELF" scan-bash-command 'cd "$D" && gh pr create --title t --body-file '"$gb"'/clean.md' 2>&1)"
   rc=$?
   set -e
-  [[ $rc -eq 1 && $out == *'シェル変数'* ]] || { echo "FAIL(#34: --repo 無しの cd \"\$D\" は ask): 期待=1(ask) 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 2 && $out == *'-R OWNER/REPO'* ]] || { echo "FAIL(#34: -R 無しの投稿は deny): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
-  # #23 の修正後、--repo が明示されていれば cd 側の未解決変数は無関係
-  # (実際に使われるのは --repo のリテラル値)。pass する既存ケースの回帰。
   set +e
-  "$SELF" scan-bash-command 'cd "$D" && gh pr create --repo public/other --title t --body b' > /dev/null 2>&1
+  "$SELF" scan-bash-command 'cd "$D" && gh pr create --repo public/other --title t --body-file '"$gb"'/clean.md' > /dev/null 2>&1
   rc=$?
   set -e
-  [[ $rc -eq 0 ]] || { echo "FAIL(#34+#23: --repo 明示があれば cd の未解決変数は無関係): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 0 ]] || { echo "FAIL(#34+#23: -R 明示があれば cd の変数は無関係): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # gh の公開面網羅(段3): pr|issue create/edit/comment 以外にも
   # release create/edit・repo edit・gist create・api の書き込みメソッドが
   # 以前はすべてフォールスルーしていた(triage で発見)。
   set +e
-  "$SELF" scan-bash-command 'gh release create v1 --notes "acme/secret-project"' > /dev/null 2>&1
+  "$SELF" scan-bash-command "gh release create v1 -R pub/repo --title 'acme/secret-project' --notes-file $gb/clean.md" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(gh release create): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   set +e
-  "$SELF" scan-bash-command 'gh repo edit --description "acme/secret-project"' > /dev/null 2>&1
+  "$SELF" scan-bash-command 'gh repo edit pub/repo --description "acme/secret-project"' > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(gh repo edit): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
 
   set +e
-  "$SELF" scan-bash-command 'gh gist create --desc "acme/secret-project" file.txt' > /dev/null 2>&1
+  "$SELF" scan-bash-command "gh gist create --desc 'acme/secret-project' $gb/clean.md" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(gh gist create): 期待=2(deny) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -2210,7 +2272,7 @@ esac
 STUB
   rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
   set +e
-  (cd "$repo" && "$SELF" scan-bash-command 'gh pr create --repo acme/other --title t --body "acme/secret-project"') > /dev/null 2>&1
+  (cd "$repo" && "$SELF" scan-bash-command "gh pr create --repo acme/other --title t --body-file $gb/leak.md") > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL: PRIVATE な対象なのに検査された(rc=$rc)" >&2; fails=$((fails + 1)); }
@@ -2319,10 +2381,21 @@ STUB
   [[ $rc -eq 0 ]] || { echo "FAIL(orgs.txt 不在でも無関係なコマンドは pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # $repo は上の PRIVATE ケースで可視性が差し替わっている可能性があるため、
-  # nwo が解決できない(= 可視性スキップに入らない)非 git ディレクトリで見る。
+  # 宛先が PUBLIC(= 可視性スキップに入らない)の投稿で見る。上の PRIVATE ケースで
+  # スタブが差し替わっているので、PUBLIC に戻してキャッシュを捨てる。
+  cat > "$tmp/bin-gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list") printf 'my-private-tool\n' ;;
+  "repo view") printf 'PUBLIC' ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
   mkdir -p "$tmp/not-a-repo"
   set +e
-  (cd "$tmp/not-a-repo" && BLEEP_ORGS_FILE="$missing_orgs" "$SELF" scan-bash-command 'gh issue create --title t --body hello') > /dev/null 2>&1
+  (cd "$tmp/not-a-repo" && BLEEP_ORGS_FILE="$missing_orgs" "$SELF" scan-bash-command "gh issue create -R pub/repo --title t --body-file $gb/clean.md") > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || { echo "FAIL(orgs.txt 不在の gh issue create は ask): 期待=1 実際=$rc" >&2; fails=$((fails + 1)); }

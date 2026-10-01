@@ -142,44 +142,36 @@ fn copilot_fixture_corpus() {
 }
 
 #[test]
-fn cwd_passthrough_claude() {
-    // ペイロードの cwd が bleep の --cwd に渡ること。push の範囲はもう cwd に
-    // 依らない(pre-push が決める、ADR-0003)ので、cwd に依存する本文の入力元
-    // (`--body-file` の相対パス)で確かめる。cwd が渡っていれば body.md を
-    // 読めて deny になり、渡っていなければ読めずに ask になる。
+fn noncanonical_gh_post_is_denied_whatever_the_cwd() {
+    // gh の投稿は、cwd に依らず正準形だけを受理する(ADR-0003)。本文は絶対
+    // パスのファイルで渡し、cd や相対パスの解決は要らない。ペイロードの cwd が
+    // 存在しないパスでも、判定は変わらない。
     let env = Env::new();
-    let work = env.tmp.path().join("work");
-    std::fs::create_dir_all(&work).unwrap();
-    std::fs::write(work.join("body.md"), "acme/secret-project が話題\n").unwrap();
-    let deny_cwd_body = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": {"command": "gh issue create -R pub/repo --body-file body.md"},
-        "cwd": work,
-    });
-    let pass_bad_cwd = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": {"command": "echo hello"},
-        "cwd": "/does-not-exist",
-    });
+    let body = env.tmp.path().join("body.md");
+    std::fs::write(&body, "acme/secret-project が話題\n").unwrap();
+    let run = |command: String, cwd: &str| {
+        let input = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": cwd,
+        });
+        let assert = env
+            .pg_command()
+            .arg("--host=claude")
+            .write_stdin(input.to_string())
+            .assert()
+            .success();
+        decision_wrapped(&assert.get_output().stdout)
+    };
 
-    let assert = env
-        .pg_command()
-        .arg("--host=claude")
-        .write_stdin(deny_cwd_body.to_string())
-        .assert()
-        .success();
-    assert_eq!(
-        decision_wrapped(&assert.get_output().stdout),
-        Some("deny".to_string())
-    );
-
-    let assert = env
-        .pg_command()
-        .arg("--host=claude")
-        .write_stdin(pass_bad_cwd.to_string())
-        .assert()
-        .success();
-    assert_eq!(decision_wrapped(&assert.get_output().stdout), None);
+    // 正準形 + 本文ファイルに denylist 語 → 照合されて deny。
+    let canonical = format!("gh issue create -R pub/repo --body-file {}", body.display());
+    assert_eq!(run(canonical, "/does-not-exist"), Some("deny".to_string()));
+    // 文法の外(--body の直書き)→ 理由は違うが deny。
+    let inline = "gh issue create -R pub/repo --body hello".to_string();
+    assert_eq!(run(inline, "/does-not-exist"), Some("deny".to_string()));
+    // gh の投稿ではないコマンドは、cwd が無効でも pass。
+    assert_eq!(run("echo hello".to_string(), "/does-not-exist"), None);
 }
 
 #[test]

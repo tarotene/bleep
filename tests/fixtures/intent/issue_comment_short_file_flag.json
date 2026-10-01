@@ -1,0 +1,6 @@
+{
+  "command": "gh issue comment 5 -R pub/repo -F /tmp/body.md",
+  "expect": [
+    {"surface": "issue", "action": "comment", "repo_source": "flag", "repo": "pub/repo", "body_sources": ["/tmp/body.md"], "canonical": true, "noncanonical_reason": null}
+  ]
+}
