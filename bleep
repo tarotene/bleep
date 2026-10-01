@@ -2406,7 +2406,7 @@ STUB
 
   e2e_repo() { # $1=dir $2=bare remote dir -> 初期コミット済み・main を push 済み・pre-push 配線済み
     local d="$1" r="$2"
-    git init -q --bare "$r"
+    git init -q --bare -b main "$r" # clone の既定ブランチが main になるように(CI の init.defaultBranch は master)
     mkdir -p "$d"
     git -C "$d" init -qb main
     git -C "$d" config core.hooksPath /dev/null # 実ホストのグローバル hook を呼ばない
@@ -2483,7 +2483,7 @@ STUB
   # 祖先関係も取れないが、pre-push は範囲を `local --not --remotes=origin` で
   # 求めるので、クリーンなら通り、secret なら止まる。
   local e2e_shallow="$tmp/e2e-shallow"
-  git clone -q --depth 1 "file://$e2e_remote" "$e2e_shallow" 2> /dev/null
+  git clone -q --depth 1 --branch main "file://$e2e_remote" "$e2e_shallow" 2> /dev/null
   git -C "$e2e_shallow" config user.email test@example.invalid
   git -C "$e2e_shallow" config user.name test
   git -C "$e2e_shallow" config commit.gpgsign false
