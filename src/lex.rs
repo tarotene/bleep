@@ -11,21 +11,139 @@
 
 use crate::grammar::{self, GhPost};
 
-/// split_command_segments の移植。演算子(`;` `&&` `||` `|&` 単独の `&`/`|`
-/// および改行)でコマンドをセグメントに分割する。クォート境界の判定は
-/// POSIX のエスケープ規則(#22 で Bash 側に実装した規則と同一)に従う —
-/// これはシェル演算子の文法そのものであり、標準的な word-splitting クレート
-/// (shell-words 等)の担当範囲外なので自前で持つ。
+/// コマンドの 1 区切り(セグメント)と、そこに書かれたヒアドキュメント。
+#[derive(Debug, Clone, Default)]
+pub struct Segment {
+    /// セグメントの字面。ヒアドキュメントの本文は含まない(`<<'EOF'` の
+    /// 区切りの記法までは含む)。コメントは除く。
+    pub text: String,
+    pub heredocs: Vec<Heredoc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Heredoc {
+    /// 区切りの語に引用符(`'…'`・`"…"`・`\`)が 1 つでもあるか。POSIX 2.7.4:
+    /// あれば本文は展開されないデータ、なければ本文のパラメータ展開・コマンド
+    /// 置換・算術展開が行われる(`$(…)` とバッククォートはコード)。
+    pub quoted: bool,
+    pub body: String,
+}
+
+struct PendingHeredoc {
+    /// 本文が属するセグメントの添字(`<<` を読んだ時点の `segments.len()`)。
+    seg: usize,
+    word: String,
+    strip_tabs: bool,
+    quoted: bool,
+}
+
+fn flush(segments: &mut Vec<Segment>, buf: &mut String) {
+    segments.push(Segment {
+        text: std::mem::take(buf),
+        heredocs: Vec::new(),
+    });
+}
+
+/// `<<` の直後(`start`)から区切りの語を読む。`(語, 引用符あり, <<- か, 終端)`。
+/// 語が空、または引用符が閉じなければ `None`(ヒアドキュメントと見なさない)。
+fn parse_heredoc_delimiter(chars: &[char], start: usize) -> Option<(String, bool, bool, usize)> {
+    let n = chars.len();
+    let mut j = start;
+    let strip = chars.get(j) == Some(&'-');
+    if strip {
+        j += 1;
+    }
+    while j < n && (chars[j] == ' ' || chars[j] == '\t') {
+        j += 1;
+    }
+    let mut word = String::new();
+    let mut quoted = false;
+    while j < n {
+        let c = chars[j];
+        match c {
+            '\'' | '"' => {
+                quoted = true;
+                let s = j + 1;
+                let close = chars[s..].iter().position(|&x| x == c)?;
+                word.extend(&chars[s..s + close]);
+                j = s + close + 1;
+            }
+            '\\' => {
+                quoted = true;
+                if let Some(&nc) = chars.get(j + 1) {
+                    word.push(nc);
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            c if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>') => break,
+            _ => {
+                word.push(c);
+                j += 1;
+            }
+        }
+    }
+    if word.is_empty() {
+        None
+    } else {
+        Some((word, quoted, strip, j))
+    }
+}
+
+/// `start`(改行の次)から本文を読む。終端の行が見つからなければ `None`。
+/// 返すのは `(本文, 終端の行の次の位置)`。
+fn read_heredoc_body(chars: &[char], start: usize, p: &PendingHeredoc) -> Option<(String, usize)> {
+    let n = chars.len();
+    let mut pos = start;
+    let mut body = String::new();
+    while pos < n {
+        let eol = chars[pos..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|k| pos + k);
+        let line: String = chars[pos..eol.unwrap_or(n)].iter().collect();
+        let cmp = if p.strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        if cmp == p.word {
+            return Some((body, eol.map_or(n, |e| e + 1)));
+        }
+        body.push_str(&line);
+        body.push('\n');
+        pos = eol? + 1;
+    }
+    None
+}
+
+/// コマンドを演算子(`;` `&&` `||` `|&` 単独の `&`/`|` および改行)でセグメントに
+/// 分割する。クォート境界の判定は POSIX のエスケープ規則(#22 で Bash 側に実装した
+/// 規則と同一)に従う — これはシェル演算子の文法そのものであり、標準的な
+/// word-splitting クレート(shell-words 等)の担当範囲外なので自前で持つ。
+///
+/// ヒアドキュメント(`<<WORD`・`<<-WORD`)は、本文を、書かれたセグメントの
+/// 付属物にする(本文の各行を別のコマンドとして分割しない、docs/adr/
+/// 0005-code-position-closure.md)。本文は、`<<` を含む行の終わりから、WORD
+/// だけの行までである。次の場合は、ヒアドキュメントと見なさず従来どおりに
+/// 分割する(コードをデータに取り違える向きの誤りを避けるため): `$((…))`・
+/// `((…))` の中、here-string(`<<<`)、区切りの語が空・引用符が閉じない、
+/// 終端の行が無い。`#` から行末まではコメントとして捨てる。
 ///
 /// クォートが閉じないまま終わった場合は分割せず、コマンド全体を1セグメント
 /// にする(Bash 版と同じ、パーサの失敗を緩和側の分割として使わない設計)。
-pub fn split_command_segments(cmd: &str) -> Vec<String> {
+pub fn split_command_segments(cmd: &str) -> Vec<Segment> {
     let chars: Vec<char> = cmd.chars().collect();
     let n = chars.len();
-    let mut segments = Vec::new();
+    let mut segments: Vec<Segment> = Vec::new();
     let mut buf = String::new();
     let mut i = 0usize;
+    // `'` 単一引用符、`"` 二重引用符、`$` は ANSI-C 引用符(`$'…'`)。
     let mut quote: Option<char> = None;
+    let mut pending: Vec<PendingHeredoc> = Vec::new();
+    // `((` の中の、閉じていない括弧の数。0 でなければ算術式の中。
+    let mut arith = 0usize;
 
     while i < n {
         let c = chars[i];
@@ -59,8 +177,43 @@ pub fn split_command_segments(cmd: &str) -> Vec<String> {
                 i += 1;
                 continue;
             }
+            Some('$') => {
+                // ANSI-C 引用符: \ が直後の 1 文字をエスケープし、\' では閉じない。
+                buf.push(c);
+                if c == '\\' {
+                    if let Some(&nc) = chars.get(i + 1) {
+                        buf.push(nc);
+                        i += 2;
+                        continue;
+                    }
+                } else if c == '\'' {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
             None => {}
-            Some(_) => unreachable!("quote is only ever set to ' or \""),
+            Some(_) => unreachable!("quote is only ever set to ', \" or $"),
+        }
+
+        // here-string(`<<<`)は三文字ごと読み飛ばす(ヒアドキュメントではない)。
+        if c == '<' && chars.get(i + 1) == Some(&'<') && chars.get(i + 2) == Some(&'<') {
+            buf.push_str("<<<");
+            i += 3;
+            continue;
+        }
+        if c == '<' && chars.get(i + 1) == Some(&'<') && arith == 0 {
+            if let Some((word, quoted, strip_tabs, end)) = parse_heredoc_delimiter(&chars, i + 2) {
+                buf.extend(&chars[i..end]);
+                pending.push(PendingHeredoc {
+                    seg: segments.len(),
+                    word,
+                    strip_tabs,
+                    quoted,
+                });
+                i = end;
+                continue;
+            }
         }
 
         match c {
@@ -84,20 +237,69 @@ pub fn split_command_segments(cmd: &str) -> Vec<String> {
                 i += 1;
                 continue;
             }
+            '$' if chars.get(i + 1) == Some(&'\'') => {
+                quote = Some('$');
+                buf.push_str("$'");
+                i += 2;
+                continue;
+            }
+            '#' if buf
+                .chars()
+                .last()
+                .is_none_or(|p| p.is_whitespace() || matches!(p, ';' | '&' | '|' | '(')) =>
+            {
+                // 語の先頭の # は、行末までコメント(実行も公開もされない)。
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '(' => {
+                if arith > 0 {
+                    arith += 1;
+                } else if chars.get(i + 1) == Some(&'(') {
+                    arith = 2;
+                    buf.push('(');
+                    i += 1;
+                }
+                buf.push('(');
+                i += 1;
+                continue;
+            }
+            ')' => {
+                arith = arith.saturating_sub(1);
+                buf.push(')');
+                i += 1;
+                continue;
+            }
+            '\n' if !pending.is_empty() => {
+                flush(&mut segments, &mut buf);
+                i += 1;
+                for p in pending.drain(..) {
+                    if let Some((body, next)) = read_heredoc_body(&chars, i, &p) {
+                        segments[p.seg].heredocs.push(Heredoc {
+                            quoted: p.quoted,
+                            body,
+                        });
+                        i = next;
+                    }
+                }
+                continue;
+            }
             ';' | '\n' => {
-                segments.push(std::mem::take(&mut buf));
+                flush(&mut segments, &mut buf);
                 i += 1;
                 continue;
             }
             '&' | '|' => {
                 let two: String = chars[i..(i + 2).min(n)].iter().collect();
                 if two == "&&" || two == "||" || two == "|&" {
-                    segments.push(std::mem::take(&mut buf));
+                    flush(&mut segments, &mut buf);
                     i += 2;
                     continue;
                 }
                 // 単独の & (background) / | (pipe) も区切りとして扱う。
-                segments.push(std::mem::take(&mut buf));
+                flush(&mut segments, &mut buf);
                 i += 1;
                 continue;
             }
@@ -108,9 +310,13 @@ pub fn split_command_segments(cmd: &str) -> Vec<String> {
     }
 
     if quote.is_some() {
-        return vec![cmd.to_string()]; // クォート閉じ忘れ = パース不能。分割しない。
+        // クォート閉じ忘れ = パース不能。分割しない。
+        return vec![Segment {
+            text: cmd.to_string(),
+            heredocs: Vec::new(),
+        }];
     }
-    segments.push(buf);
+    flush(&mut segments, &mut buf);
     segments
 }
 
@@ -240,39 +446,97 @@ fn config_disables_hooks(kv: &str) -> bool {
     key.eq_ignore_ascii_case("core.hooksPath")
 }
 
-/// `$(…)` とバッククォートの中身を取り出す(対応する閉じ括弧まで。引用符は
-/// 見ない — 過剰に取るだけで、取りこぼしはしない)。
-fn substitutions(seg: &str) -> Vec<String> {
-    let chars: Vec<char> = seg.chars().collect();
+/// `$(…)` とバッククォートの中身を取り出す(入れ子も含む。外側が先)。
+///
+/// `quote_aware` が真なら、シェルの引用規則に従って、展開されない場所を飛ばす:
+/// 単一引用符 `'…'`、ANSI-C 引用符 `$'…'`、`\` で打ち消された `$`・バッククォート。
+/// 二重引用符の中は展開されるので飛ばさない。偽なら、引用符付きでない
+/// ヒアドキュメントの本文(`'` や `"` はただの文字で、`\` だけが効く)として読む。
+/// 取りこぼしの向きの誤り(展開されるものを飛ばす)を避けるため、判断に迷う
+/// 引用の形(閉じない引用符など)は、飛ばさない側に倒す。
+fn substitutions(text: &str, quote_aware: bool) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
-            let mut depth = 1usize;
-            let mut j = i + 2;
-            while j < chars.len() && depth > 0 {
-                match chars[j] {
-                    '(' => depth += 1,
-                    ')' => depth -= 1,
-                    _ => {}
-                }
-                j += 1;
-            }
-            let end = if depth == 0 { j - 1 } else { chars.len() };
-            out.push(chars[i + 2..end].iter().collect());
+    scan_substitutions(&chars, 0, false, quote_aware, &mut out);
+    out
+}
+
+/// `i` から読み、`nested`(`$(` の中)なら対応する `)` の次の位置と閉じたか、
+/// そうでなければ末尾を返す。
+fn scan_substitutions(
+    chars: &[char],
+    mut i: usize,
+    nested: bool,
+    quote_aware: bool,
+    out: &mut Vec<String>,
+) -> (usize, bool) {
+    let n = chars.len();
+    let mut dq = false;
+    let mut paren = 0usize;
+    while i < n {
+        let c = chars[i];
+        if c == '\\' {
             i += 2;
-        } else if chars[i] == '`' {
-            if let Some(off) = chars[i + 1..].iter().position(|&c| c == '`') {
-                out.push(chars[i + 1..i + 1 + off].iter().collect());
-                i += off + 2;
+            continue;
+        }
+        if quote_aware && !dq {
+            if c == '\'' {
+                // 閉じない単一引用符は飛ばさない(取りこぼしを避ける)。
+                match chars[i + 1..].iter().position(|&x| x == '\'') {
+                    Some(k) => i += k + 2,
+                    None => i += 1,
+                }
+                continue;
+            }
+            if c == '$' && chars.get(i + 1) == Some(&'\'') {
+                let mut j = i + 2;
+                while j < n && chars[j] != '\'' {
+                    j += if chars[j] == '\\' { 2 } else { 1 };
+                }
+                i = if j < n { j + 1 } else { i + 2 };
+                continue;
+            }
+        }
+        if quote_aware && c == '"' {
+            dq = !dq;
+            i += 1;
+            continue;
+        }
+        if c == '$' && chars.get(i + 1) == Some(&'(') {
+            let slot = out.len();
+            out.push(String::new());
+            let (end, closed) = scan_substitutions(chars, i + 2, true, quote_aware, out);
+            let close = if closed { end - 1 } else { end };
+            out[slot] = chars[i + 2..close].iter().collect();
+            i = end;
+            continue;
+        }
+        if c == '`' {
+            let mut j = i + 1;
+            while j < n && chars[j] != '`' {
+                j += if chars[j] == '\\' { 2 } else { 1 };
+            }
+            if j < n {
+                out.push(chars[i + 1..j].iter().collect());
+                i = j + 1;
             } else {
                 i += 1;
             }
-        } else {
-            i += 1;
+            continue;
         }
+        if nested {
+            if c == '(' {
+                paren += 1;
+            } else if c == ')' {
+                if paren == 0 {
+                    return (i + 1, true);
+                }
+                paren -= 1;
+            }
+        }
+        i += 1;
     }
-    out
+    (n, false)
 }
 
 /// トークン化に失敗した(クォートが閉じていない — ヒアドキュメントの本文の
@@ -362,9 +626,77 @@ fn classify_tokens(t: &[String], depth: usize) -> Vec<Item> {
     out
 }
 
+/// ANSI-C 引用符 `$'…'`(`\\` が直後の 1 文字をエスケープし、`\\'` では閉じない)を、
+/// 同じ字面の単一引用符の語に直す。shell-words は `$'…'` を知らず、`\\'` で
+/// 引用符の対応がずれて、後ろの語を引用符の中と取り違える(取りこぼしの向き)。
+/// 中身のエスケープは解釈しない(`\\n` は `n`)— 語の境界が正しければ足りる。
+fn normalize_ansi_c(seg: &str) -> String {
+    let chars: Vec<char> = seg.chars().collect();
+    let mut out = String::with_capacity(seg.len());
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if q == '"' && c == '\\' {
+                    if let Some(&nc) = chars.get(i + 1) {
+                        out.push(nc);
+                        i += 2;
+                        continue;
+                    }
+                }
+                if c == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if c == '\\' {
+                    out.push(c);
+                    if let Some(&nc) = chars.get(i + 1) {
+                        out.push(nc);
+                    }
+                    i += 2;
+                } else if c == '$' && chars.get(i + 1) == Some(&'\'') {
+                    let mut j = i + 2;
+                    let mut lit = String::new();
+                    while j < chars.len() && chars[j] != '\'' {
+                        if chars[j] == '\\' && j + 1 < chars.len() {
+                            j += 1;
+                        }
+                        lit.push(chars[j]);
+                        j += 1;
+                    }
+                    if j < chars.len() {
+                        out.push_str(&shell_words::quote(&lit));
+                        i = j + 1;
+                    } else {
+                        out.push(c); // 閉じない: そのまま(後段が解釈できないと判断する)
+                        i += 1;
+                    }
+                } else {
+                    if c == '\'' || c == '"' {
+                        quote = Some(c);
+                    }
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// セグメントを語に分ける(shell-words、ANSI-C 引用符は先に直す)。
+fn split_words(seg: &str) -> Result<Vec<String>, shell_words::ParseError> {
+    shell_words::split(&normalize_ansi_c(seg))
+}
+
 fn classify_segment_depth(seg: &str, depth: usize) -> Vec<Item> {
     let mut out = Vec::new();
-    match shell_words::split(seg) {
+    match split_words(seg) {
         Ok(t) => out.extend(classify_tokens(&t, depth)),
         Err(_) => {
             if looks_like_gh_post(seg) {
@@ -373,23 +705,92 @@ fn classify_segment_depth(seg: &str, depth: usize) -> Vec<Item> {
         }
     }
     if depth < MAX_DEPTH {
-        for inner in substitutions(seg) {
-            out.extend(nested(classify_command_depth(&inner, depth + 1)));
+        // 置換の出力が実行される文脈(`eval "$(cat <<'EOF' …)"`)なら、置換の中の
+        // ヒアドキュメントは、引用符付きでもコードになる。
+        let output_is_run = reads_code_from_stdin(seg);
+        for inner in substitutions(seg, true) {
+            out.extend(nested(classify_command_ctx(
+                &inner,
+                depth + 1,
+                output_is_run,
+            )));
         }
     }
     out
 }
 
 fn classify_command_depth(cmd: &str, depth: usize) -> Vec<Item> {
-    split_command_segments(cmd)
-        .iter()
-        .flat_map(|seg| classify_segment_depth(seg, depth))
+    classify_command_ctx(cmd, depth, false)
+}
+
+/// `heredocs_are_code` は、呼び出し側の文脈から、このコマンドのヒアドキュメントを
+/// コードとして扱うと決まっているとき真。
+fn classify_command_ctx(cmd: &str, depth: usize, heredocs_are_code: bool) -> Vec<Item> {
+    let segs = split_command_segments(cmd);
+    let stdin_shell = heredocs_are_code || any_reads_code_from_stdin(&segs);
+    segs.iter()
+        .flat_map(|seg| classify_segment_full(seg, stdin_shell, depth))
         .collect()
 }
 
-/// セグメント 1 つを分類する(`sh -c` や `$(…)` の中身も含む)。
-pub fn classify_segment(seg: &str) -> Vec<Item> {
-    classify_segment_depth(seg, 0)
+/// セグメントの標準入力を、シェルがコマンドとして読むか(`bash`・`sh -s`・
+/// `. /dev/stdin`)。`-c` があれば標準入力はコードではない。取りこぼしの向きの
+/// 誤りを避けるため、`-c` の有無だけを見て、スクリプトの引数は見ない
+/// (`bash script.sh <<EOF` もコードとして扱う — 過剰側)。
+fn reads_code_from_stdin(seg: &str) -> bool {
+    let Ok(t) = split_words(seg) else {
+        return false;
+    };
+    let i = command_start(&t);
+    if i >= t.len() {
+        return false;
+    }
+    let cmd = basename(word(&t[i]));
+    let args = &t[i + 1..];
+    if SHELLS.contains(&cmd) {
+        let has_c = args
+            .iter()
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
+        return !has_c;
+    }
+    // `eval "$(cat <<'EOF' … EOF)"` は、ヒアドキュメントの本文を `cat` が読んで
+    // 出力し、`eval` がそれを実行する。置換を含む `eval` は、同じコマンドの
+    // ヒアドキュメントがコードになりうる形として扱う。
+    if cmd == "eval" {
+        return args.iter().any(|a| a.contains("$(") || a.contains('`'));
+    }
+    matches!(cmd, "." | "source")
+        && args
+            .iter()
+            .any(|a| matches!(a.as_str(), "/dev/stdin" | "/dev/fd/0" | "-"))
+}
+
+/// 同じコマンドの中に、標準入力をコードとして読むシェルがあるか。あれば、
+/// `cat <<'EOF' | bash` のようにヒアドキュメントの本文がそこへ流れうるので、
+/// 同じコマンドのヒアドキュメントはすべてコードとして扱う。
+fn any_reads_code_from_stdin(segs: &[Segment]) -> bool {
+    segs.iter().any(|s| reads_code_from_stdin(&s.text))
+}
+
+/// セグメントの字面と、そのヒアドキュメントの本文のうちコードであるもの
+/// (標準入力をシェルが読むなら全体、引用符なしの区切りなら本文中の
+/// `$(…)`・バッククォート)を分類する。引用符付きの本文でシェルに流れないものは
+/// データで、見ない。
+fn classify_segment_full(seg: &Segment, stdin_shell: bool, depth: usize) -> Vec<Item> {
+    let mut out = classify_segment_depth(&seg.text, depth);
+    if depth < MAX_DEPTH {
+        for h in &seg.heredocs {
+            if stdin_shell {
+                out.extend(nested(classify_command_depth(&h.body, depth + 1)));
+            } else if !h.quoted {
+                for inner in substitutions(&h.body, false) {
+                    out.extend(nested(classify_command_depth(&inner, depth + 1)));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 解析結果。
@@ -411,7 +812,7 @@ pub struct AnalyzeResult {
 /// `shell_words::join`(`split` の逆演算、必要最小限の再クォート)で
 /// 再結合したテキストを返す(#43、D2)。
 fn strip_repo_override_tokens(seg: &str) -> String {
-    let t = shell_words::split(seg).unwrap_or_default();
+    let t = split_words(seg).unwrap_or_default();
     let mut kept: Vec<String> = Vec::with_capacity(t.len());
     let mut j = 0usize;
     while j < t.len() {
@@ -432,25 +833,37 @@ fn strip_repo_override_tokens(seg: &str) -> String {
 pub fn analyze(cmd: &str) -> AnalyzeResult {
     let mut result = AnalyzeResult::default();
     let segments = split_command_segments(cmd);
-    let alone = segments.iter().filter(|s| !s.trim().is_empty()).count() <= 1;
-    for seg in segments {
-        let mut items = classify_segment(&seg);
+    let alone = segments
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .count()
+        <= 1;
+    let stdin_shell = any_reads_code_from_stdin(&segments);
+    for seg in &segments {
+        let mut items = classify_segment_full(seg, stdin_shell, 0);
         if !alone {
             items.iter_mut().for_each(require_alone);
         }
 
-        if as_single_cd_target(&seg).is_none() {
+        if as_single_cd_target(&seg.text).is_none() {
             let strips = items
                 .iter()
                 .any(|it| matches!(it, Item::Gh(p) if p.repo_source == grammar::RepoSource::Flag));
             if strips {
                 result
                     .scan_subject
-                    .push_str(&strip_repo_override_tokens(&seg));
+                    .push_str(&strip_repo_override_tokens(&seg.text));
             } else {
-                result.scan_subject.push_str(&seg);
+                result.scan_subject.push_str(&seg.text);
             }
             result.scan_subject.push('\n');
+        }
+        // コードとして実行されうる本文は照合の対象に含める。引用符付きでシェルに
+        // 流れない本文はデータで、ここでは公開されない(公開する地点で照合する)。
+        for h in &seg.heredocs {
+            if stdin_shell || !h.quoted {
+                result.scan_subject.push_str(&h.body);
+            }
         }
 
         for it in items {
@@ -479,7 +892,7 @@ mod tests {
         // #22 の回帰1と同型: \" が && の区切りを壊さないこと。
         let segs = split_command_segments(r#"echo \" && gh pr create --title t"#);
         assert_eq!(segs.len(), 2);
-        assert!(segs[1].trim_start().starts_with("gh pr create"));
+        assert!(segs[1].text.trim_start().starts_with("gh pr create"));
     }
 
     #[test]
@@ -557,13 +970,17 @@ mod tests {
 
     #[test]
     fn unparsable_gh_post_is_noncanonical() {
-        // ヒアドキュメント本文のアポストロフィでクォートが閉じない形。解釈できない
-        // gh の投稿を素通りにしない。
-        let ps = posts("gh issue create -R a/b --body-file /dev/stdin <<EOF\nit's here\nEOF");
+        // クォートが閉じない gh の投稿は、解釈できないものを素通りにしない。
+        let ps = posts("gh issue create -R a/b --title 'unclosed --body-file /tmp/b.md");
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].noncanonical, Some("unparsable"));
         // gh の投稿に見えなければ、解釈できなくても何も出さない。
         assert!(posts("echo it's fine").is_empty());
+        // ヒアドキュメントで本文を流し込む形は、構文として解釈できる。本文の
+        // アポストロフィでクォートは崩れず、標準入力の本文は文法の外。
+        let ps = posts("gh issue create -R a/b --body-file /dev/stdin <<EOF\nit's here\nEOF");
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].noncanonical, Some("body-stdin"));
     }
 
     #[test]
@@ -617,6 +1034,106 @@ mod tests {
         // 複数の投稿は、並べた時点でどれも単独ではない。
         let ps = posts("gh issue create -R a/b --body-file /tmp/a.md && gh issue comment 2 -R c/d -F /tmp/c.md");
         assert!(ps.iter().all(|p| p.noncanonical == Some("not-alone")));
+    }
+
+    /// 末尾の空のセグメント(最後の改行や、本文を読み終えた後)を除く。
+    fn split_nonempty(cmd: &str) -> Vec<Segment> {
+        split_command_segments(cmd)
+            .into_iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .collect()
+    }
+
+    fn close_repos(cmd: &str) -> Vec<String> {
+        posts(cmd).into_iter().filter_map(|p| p.repo).collect()
+    }
+
+    #[test]
+    fn heredoc_body_is_attached_to_its_segment_not_split() {
+        let segs = split_nonempty("cat > f <<'EOF'\nline1\nline2\nEOF\necho x");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text.trim(), "cat > f <<'EOF'");
+        assert_eq!(segs[0].heredocs.len(), 1);
+        assert!(segs[0].heredocs[0].quoted);
+        assert_eq!(segs[0].heredocs[0].body, "line1\nline2\n");
+        assert_eq!(segs[1].text, "echo x");
+
+        // 引用符なし、`<<-`(先頭のタブを無視)、複数、パイプの手前。
+        let segs = split_nonempty("cat <<EOF | tee f\nbody\nEOF");
+        assert_eq!(segs.len(), 2);
+        assert!(!segs[0].heredocs[0].quoted);
+        assert!(segs[1].heredocs.is_empty());
+        let segs = split_nonempty("cat <<-X\n\tbody\n\tX\n");
+        assert_eq!(segs[0].heredocs[0].body, "\tbody\n");
+        let segs = split_nonempty("cat <<A; cat <<\"B\"\na\nA\nb\nB");
+        assert_eq!(segs.len(), 2);
+        assert!(!segs[0].heredocs[0].quoted && segs[1].heredocs[0].quoted);
+        assert_eq!(segs[1].heredocs[0].body, "b\n");
+        // バックスラッシュも引用符。
+        assert!(split_nonempty("cat <<\\EOF\nx\nEOF")[0].heredocs[0].quoted);
+    }
+
+    #[test]
+    fn data_heredoc_bodies_are_not_scanned_for_posts() {
+        // 引用符付きでシェルに流れない本文は、何を書いてあってもデータ。
+        assert!(
+            posts("cat > f <<'EOF'\n`gh issue close 5 -R a/b`\nit's: gh pr create\nEOF").is_empty()
+        );
+        // `bash -c` があれば標準入力はコードではない。
+        assert!(posts("bash -c true <<'EOF'\ngh issue close 5 -R a/b\nEOF").is_empty());
+        // 単一引用符の中の置換、エスケープされた置換、コメントはデータ。
+        assert!(posts("echo '$(gh issue close 5 -R a/b)'").is_empty());
+        assert!(posts("echo \\$(gh issue close 5 -R a/b)").is_empty());
+        assert!(posts("echo hi # gh issue close 5 -R a/b").is_empty());
+    }
+
+    #[test]
+    fn code_heredoc_bodies_are_scanned_for_posts() {
+        let want = vec!["a/b".to_string()];
+        // 標準入力をシェルが読む形(直接、パイプ越し、`-s`、`. /dev/stdin`)。
+        for cmd in [
+            "bash <<'EOF'\ngh issue close 5 -R a/b\nEOF",
+            "sh -s <<EOF\ngh issue close 5 -R a/b\nEOF",
+            "env X=1 bash -o pipefail <<'EOF'\ngh issue close 5 -R a/b\nEOF",
+            "cat <<'EOF' | bash\ngh issue close 5 -R a/b\nEOF",
+            ". /dev/stdin <<'EOF'\ngh issue close 5 -R a/b\nEOF",
+            // 引用符なしの区切りは、本文の置換がコード(本文の `'` は文字)。
+            "cat <<EOF\nit's $(gh issue close 5 -R a/b)\nEOF",
+            "cat <<EOF\n`gh issue close 5 -R a/b`\nEOF",
+        ] {
+            assert_eq!(close_repos(cmd), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn heredoc_misreadings_never_hide_a_command() {
+        // 本物のヒアドキュメントでないものを本文と取り違えると、続く行のコマンドを
+        // データとして見落とす。曖昧なときはヒアドキュメントと見なさない。
+        let want = vec!["a/b".to_string()];
+        for cmd in [
+            // 算術式の中の `<<`、here-string、コメントの中の `<<`、終端の行が無い
+            "echo $((1<<2))\ngh issue close 5 -R a/b\n2))",
+            "(( x = 1 << 2 ))\ngh issue close 5 -R a/b\n2",
+            "cat <<<x\ngh issue close 5 -R a/b\nx",
+            "echo hi # <<X\ngh issue close 5 -R a/b\nX",
+            "cat <<EOF\ngh issue close 5 -R a/b",
+            // 引用符の取り違え: `$'…\\''` は 1 語で、後ろの置換は展開される
+            "echo $'\\'' $(gh issue close 5 -R a/b)",
+            "echo 'a' $(gh issue close 5 -R a/b)",
+            "echo \"it's\" $(gh issue close 5 -R a/b)",
+        ] {
+            assert_eq!(close_repos(cmd), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn scan_subject_includes_code_bodies_only() {
+        let r = analyze("cat > f <<'EOF'\nsecret-data-body\nEOF\ngh issue close 5 -R a/b");
+        assert!(!r.scan_subject.contains("secret-data-body"));
+        let r = analyze("bash <<'EOF'\nsecret-code-body\nEOF");
+        assert!(r.scan_subject.contains("secret-code-body"));
+        let r = analyze("cat > f <<EOF\nsecret-expanding-body\nEOF");
+        assert!(r.scan_subject.contains("secret-expanding-body"));
     }
 
     #[test]
