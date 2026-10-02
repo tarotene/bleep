@@ -119,7 +119,7 @@ BLEEP_VERSION='0.2.0'
 
 # bleep-hook lex の出力形式の版(src/main.rs の LEX_PROTOCOL と揃える)。
 # 出力の先頭行 `#lex <版>` と一致しなければ ask にする(bleep doctor でも検査)。
-LEX_PROTOCOL=4
+LEX_PROTOCOL=5
 
 SELF="$(realpath "$0")"
 TEST_TMP=''
@@ -1136,6 +1136,7 @@ noncanonical_reason_text() {
     body-stdin) why='本文を標準入力(-)で渡す形は使えません。' ;;
     body-path) why='本文ファイルのパスが絶対パスのリテラルではありません(相対パス・~・変数は使えません)。' ;;
     dynamic-value) why='コマンド置換や変数展開($(…)、バッククォート、$VAR)を含む値は使えません。リテラルで書いてください。' ;;
+    not-alone) why='本文ファイルを持つ投稿は、その投稿だけを 1 回のコマンドとして実行してください(&&・;・|・改行で他のコマンドと並べる形、sh -c・eval・$(…) の中は使えません。同じコマンドの前段が本文ファイルを書き換えると、照合した中身と投稿される中身がずれるため)。前段の処理は別の Bash 呼び出しに分けてください。' ;;
     unparsable) why='コマンドを解釈できません(クォートが閉じていない、ヒアドキュメントなど)。本文はファイルに書いて --body-file で渡してください。' ;;
     *) why='正準形を外れています。' ;;
   esac
@@ -1944,7 +1945,7 @@ PUSHFORMS
   # #9 の直接回帰: cd のパスに private リポ名が含まれるだけでは hard-deny
   # しない(gh セグメント自体に denylist 文字列が無ければ pass)。
   set +e
-  "$SELF" scan-bash-command "cd /x/my-private-tool-work && gh pr create -R pub/repo --title t --body-file $gb/clean.md" > /dev/null 2>&1
+  "$SELF" scan-bash-command "cd /x/my-private-tool-work && gh issue close 5 -R pub/repo" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#9: cd パスの private リポ名だけでは deny しない): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -2079,10 +2080,31 @@ CASES55
 2|eval gh issue comment 1 -R pub/repo --body hello
 2|echo $(gh issue comment 1 -R pub/repo --body hello)
 2|sh -c 'gh issue comment 1 -R pub/repo --body-file @gb@/leak.md'
-0|sh -c 'gh issue comment 1 -R pub/repo --body-file @gb@/clean.md'
+2|sh -c 'gh issue comment 1 -R pub/repo --body-file @gb@/clean.md'
 0|gh pr view 5 -R pub/repo && gh pr checks 5 && gh run watch 1
 0|gh pr merge 5 -R pub/repo --squash
 CASESWRAP
+
+  # #78 の F2(TOCTOU): 前段が本文ファイルを書き換える形は、照合した中身と
+  # 投稿される中身がずれるので、本文ファイルを持つ投稿は単独のコマンドに限る。
+  # 本文がクリーンでも deny(not-alone)で、前段の処理は別の呼び出しに分ける。
+  local f2_cmd
+  for f2_cmd in \
+    "cp $gb/leak.md $gb/x.md && gh issue create -R pub/repo --body-file $gb/x.md" \
+    "printf x > $gb/x.md; gh issue create -R pub/repo --body-file $gb/x.md" \
+    "git push origin main && gh pr create -R pub/repo --title t --body-file $gb/clean.md"; do
+    set +e
+    out="$(cd "$tmp" && "$SELF" scan-bash-command "$f2_cmd" 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 2 && $out == *'1 回のコマンド'* ]] || { echo "FAIL(#78 F2: 本文ファイル付きの投稿は単独のコマンドだけ): 期待=2 実際=$rc cmd=$f2_cmd out=$out" >&2; fails=$((fails + 1)); }
+  done
+  # 前置(env)は単独のコマンドのまま通る(照合は本文ファイルまで届く)。
+  set +e
+  (cd "$tmp" && "$SELF" scan-bash-command "env X=1 gh issue create -R pub/repo --body-file $gb/clean.md") > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#78: 前置つきの単独の投稿は pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
 
   # ヒアドキュメントで本文を渡す形(本文の中のアポストロフィでクォートが閉じず、
   # コマンドを解釈できない)は、素通りにせず deny する。
@@ -2163,7 +2185,7 @@ CASES54
   # 解決され(cd パスの private リポ名は無関係)、scan subject からも cd
   # セグメントが除かれるので pass する。
   set +e
-  "$SELF" scan-bash-command "cd /x/my-private-tool-work && gh pr create --repo public/other --title t --body-file $gb/clean.md" > /dev/null 2>&1
+  "$SELF" scan-bash-command "cd /x/my-private-tool-work && gh issue close 5 --repo public/other" > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#9+#14: cd の private 名 + --repo public/other): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
@@ -2220,7 +2242,7 @@ STUB
   [[ $rc -eq 2 && $out == *'-R OWNER/REPO'* ]] || { echo "FAIL(#34: -R 無しの投稿は deny): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   set +e
-  "$SELF" scan-bash-command 'cd "$D" && gh pr create --repo public/other --title t --body-file '"$gb"'/clean.md' > /dev/null 2>&1
+  "$SELF" scan-bash-command 'cd "$D" && gh issue close 5 --repo public/other' > /dev/null 2>&1
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#34+#23: -R 明示があれば cd の変数は無関係): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }

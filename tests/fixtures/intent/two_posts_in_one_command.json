@@ -1,7 +1,7 @@
 {
   "command": "gh issue create -R pub/one --body-file /tmp/a.md && gh issue comment 2 -R pub/two -F /tmp/c.md",
   "expect": [
-    {"surface": "issue", "action": "create", "repo_source": "flag", "repo": "pub/one", "body_sources": ["/tmp/a.md"], "canonical": true, "noncanonical_reason": null},
-    {"surface": "issue", "action": "comment", "repo_source": "flag", "repo": "pub/two", "body_sources": ["/tmp/c.md"], "canonical": true, "noncanonical_reason": null}
+    {"surface": "issue", "action": "create", "repo_source": "flag", "repo": "pub/one", "body_sources": ["/tmp/a.md"], "canonical": false, "noncanonical_reason": "not-alone"},
+    {"surface": "issue", "action": "comment", "repo_source": "flag", "repo": "pub/two", "body_sources": ["/tmp/c.md"], "canonical": false, "noncanonical_reason": "not-alone"}
   ]
 }

@@ -297,6 +297,25 @@ fn unparsable_post() -> Item {
     })
 }
 
+/// 本文ファイルを持つ投稿が、単独のコマンドでない位置にあるとき文法の外にする
+/// (`not-alone`、docs/adr/0004-body-file-post-stands-alone.md)。照合は
+/// PreToolUse の時点のファイルを読むが、投稿されるのは同じコマンドの前段が
+/// 書き換えた後の中身になりうる(TOCTOU)。既に別の違反があればそれを残す。
+fn require_alone(item: &mut Item) {
+    if let Item::Gh(p) = item {
+        if p.noncanonical.is_none() && !p.body_sources.is_empty() {
+            p.noncanonical = Some("not-alone");
+        }
+    }
+}
+
+/// `sh -c`・`eval`・`$(…)` の中で見つけた項目。トップレベルの単独のコマンドでは
+/// ないので、`require_alone` を通す。
+fn nested(mut items: Vec<Item>) -> Vec<Item> {
+    items.iter_mut().for_each(require_alone);
+    items
+}
+
 fn classify_tokens(t: &[String], depth: usize) -> Vec<Item> {
     let mut out = Vec::new();
     let i = command_start(t);
@@ -324,7 +343,7 @@ fn classify_tokens(t: &[String], depth: usize) -> Vec<Item> {
                 let a = t[j].as_str();
                 if a.starts_with('-') && !a.starts_with("--") && a.contains('c') {
                     if let Some(script) = t.get(j + 1) {
-                        out.extend(classify_command_depth(script, depth + 1));
+                        out.extend(nested(classify_command_depth(script, depth + 1)));
                     }
                     break;
                 } else if a.starts_with('-') {
@@ -336,7 +355,7 @@ fn classify_tokens(t: &[String], depth: usize) -> Vec<Item> {
         }
         "eval" if depth < MAX_DEPTH => {
             let script = t[i + 1..].join(" ");
-            out.extend(classify_command_depth(&script, depth + 1));
+            out.extend(nested(classify_command_depth(&script, depth + 1)));
         }
         _ => {}
     }
@@ -355,7 +374,7 @@ fn classify_segment_depth(seg: &str, depth: usize) -> Vec<Item> {
     }
     if depth < MAX_DEPTH {
         for inner in substitutions(seg) {
-            out.extend(classify_command_depth(&inner, depth + 1));
+            out.extend(nested(classify_command_depth(&inner, depth + 1)));
         }
     }
     out
@@ -412,8 +431,13 @@ fn strip_repo_override_tokens(seg: &str) -> String {
 
 pub fn analyze(cmd: &str) -> AnalyzeResult {
     let mut result = AnalyzeResult::default();
-    for seg in split_command_segments(cmd) {
-        let items = classify_segment(&seg);
+    let segments = split_command_segments(cmd);
+    let alone = segments.iter().filter(|s| !s.trim().is_empty()).count() <= 1;
+    for seg in segments {
+        let mut items = classify_segment(&seg);
+        if !alone {
+            items.iter_mut().for_each(require_alone);
+        }
 
         if as_single_cd_target(&seg).is_none() {
             let strips = items
@@ -549,6 +573,50 @@ mod tests {
         );
         let repos: Vec<_> = ps.iter().map(|p| p.repo.as_deref()).collect();
         assert_eq!(repos, [Some("pub/one"), Some("pub/two")]);
+    }
+
+    #[test]
+    fn body_file_post_must_stand_alone() {
+        // #78 の F2: 前段が本文ファイルを書き換えると、照合した中身と投稿される
+        // 中身がずれる。本文ファイルを持つ投稿は単独のコマンドに限る。
+        let alone = "gh issue create -R pub/r --body-file /tmp/x.md";
+        assert_eq!(posts(alone)[0].noncanonical, None);
+        for cmd in [
+            "cp /tmp/a.md /tmp/x.md && gh issue create -R pub/r --body-file /tmp/x.md",
+            "cd /x && gh issue create -R pub/r --body-file /tmp/x.md",
+            "git push && gh issue create -R pub/r --body-file /tmp/x.md",
+            "gh issue create -R pub/r --body-file /tmp/x.md; rm /tmp/x.md",
+            "gh issue create -R pub/r --body-file /tmp/x.md | tee log",
+            "printf x > /tmp/x.md\ngh issue create -R pub/r --body-file /tmp/x.md",
+            "sh -c 'gh issue create -R pub/r --body-file /tmp/x.md'",
+            "eval gh issue create -R pub/r --body-file /tmp/x.md",
+            "echo $(gh issue create -R pub/r --body-file /tmp/x.md)",
+        ] {
+            let ps = posts(cmd);
+            assert_eq!(ps.len(), 1, "{cmd}");
+            assert_eq!(ps[0].noncanonical, Some("not-alone"), "{cmd}");
+        }
+        // 前置は単独のコマンドのまま。
+        for cmd in [
+            "env X=1 gh issue create -R pub/r --body-file /tmp/x.md",
+            "timeout 30 gh issue create -R pub/r --body-file /tmp/x.md",
+            "gh issue create -R pub/r --body-file /tmp/x.md\n",
+            "gh issue create -R pub/r --body-file /tmp/x.md;",
+        ] {
+            assert_eq!(posts(cmd)[0].noncanonical, None, "{cmd}");
+        }
+        // 本文ファイルを持たない投稿と、別の違反が先に立つ投稿は影響を受けない。
+        assert_eq!(
+            posts("echo hi && gh issue close 5 -R pub/r")[0].noncanonical,
+            None
+        );
+        assert_eq!(
+            posts("cd /x && gh issue create -R pub/r --body hi")[0].noncanonical,
+            Some("inline-body")
+        );
+        // 複数の投稿は、並べた時点でどれも単独ではない。
+        let ps = posts("gh issue create -R a/b --body-file /tmp/a.md && gh issue comment 2 -R c/d -F /tmp/c.md");
+        assert!(ps.iter().all(|p| p.noncanonical == Some("not-alone")));
     }
 
     #[test]
