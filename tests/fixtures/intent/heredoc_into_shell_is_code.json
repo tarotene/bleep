@@ -1,0 +1,6 @@
+{
+  "command": "bash <<'EOF'\ngh issue close 5 -R pub/repo\nEOF",
+  "expect": [
+    {"surface": "issue", "action": "close", "repo_source": "flag", "repo": "pub/repo", "body_sources": [], "canonical": true, "noncanonical_reason": null}
+  ]
+}

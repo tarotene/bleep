@@ -308,9 +308,18 @@ tokenized and the command word is found **by position** — assignments
 (`X=1 gh …`), prefixes (`env`, `sudo`, `timeout`, `nohup`, …), the subshell
 opener, and an absolute path (`/usr/bin/gh`) are skipped — and the contents of
 `sh|bash|zsh -c '…'`, `eval '…'`, `$(…)` and backticks are classified the same
-way, recursively (depth-limited). A segment that cannot be tokenized (an
-unclosed quote — typically a heredoc body with an apostrophe) but looks like a
-`gh` post is denied as `unparsable` instead of passed through.
+way, recursively (depth-limited). Which strings count as **code** (looked at)
+and which as **data** (not looked at) is decided by the shell's own rules
+([docs/adr/0005-code-position-closure.md](docs/adr/0005-code-position-closure.md)):
+a heredoc body belongs to the command it is written on instead of being split
+into commands; with a quoted delimiter (`<<'EOF'`) it is data, with an unquoted
+one only its `$(…)`/backtick substitutions are code (POSIX 2.7.4), and it is
+code as a whole when a shell reads it from stdin (`bash <<'EOF'`,
+`cat <<'EOF' | bash`, `eval "$(cat <<'EOF' …)"`); single-quoted text, `$'…'`,
+escaped `\$(` and `#` comments are data. A segment that cannot be tokenized (an
+unclosed quote) but looks like a `gh` post is denied as `unparsable` instead of
+passed through. `cargo test` checks the recognizer against what a real `bash`
+executes (a stub `gh` on `PATH`): every executed `gh` must be recognized.
 
 Instead of reconstructing what an arbitrary `gh` command will publish, bleep
 accepts a **small grammar** and denies everything outside it
@@ -364,7 +373,9 @@ range or target: the range is decided by the pre-push hook from git's own input
 are the ones that switch that hook off — `--no-verify`, or a `-c
 core.hooksPath=…` global option (reason id `push-hook-bypass`). The forms the
 recursion does not reach (a deeper nesting, `python -c 'subprocess.run(["gh", …])'`,
-a binary other than `gh`) remain an approximation, within the scope this
+a command name held in a variable, text piped into a shell
+(`echo '…' | bash`), a script on disk, a binary other than `gh`) remain an
+approximation, within the scope this
 tool already states below: a guardrail against accidents, not a boundary.
 
 `bleep scan`/`scan-push`/`scan-bash-command` all share the same exit

@@ -1,0 +1,4 @@
+{
+  "command": "cat > /tmp/note.md <<'EOF'\nuse `gh issue close 5 -R pub/other` and it's fine: gh pr create x\nEOF",
+  "expect": []
+}

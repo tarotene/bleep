@@ -1133,11 +1133,11 @@ noncanonical_reason_text() {
     bad-repo) why='-R の値、または gh api の宛先が、リテラルの OWNER/REPO ではありません(変数や {owner} プレースホルダは使えません)。' ;;
     inline-body) why='本文を --body/-b/--notes/-n で直接渡す形は使えません。' ;;
     inline-comment) why='close/reopen の --comment は使えません。gh <pr|issue> comment --body-file で本文を投稿してから close してください。' ;;
-    body-stdin) why='本文を標準入力(-)で渡す形は使えません。' ;;
+    body-stdin) why='本文を標準入力(-、/dev/stdin、ヒアドキュメント)で渡す形は使えません。' ;;
     body-path) why='本文ファイルのパスが絶対パスのリテラルではありません(相対パス・~・変数は使えません)。' ;;
     dynamic-value) why='コマンド置換や変数展開($(…)、バッククォート、$VAR)を含む値は使えません。リテラルで書いてください。' ;;
     not-alone) why='本文ファイルを持つ投稿は、その投稿だけを 1 回のコマンドとして実行してください(&&・;・|・改行で他のコマンドと並べる形、sh -c・eval・$(…) の中は使えません。同じコマンドの前段が本文ファイルを書き換えると、照合した中身と投稿される中身がずれるため)。前段の処理は別の Bash 呼び出しに分けてください。' ;;
-    unparsable) why='コマンドを解釈できません(クォートが閉じていない、ヒアドキュメントなど)。本文はファイルに書いて --body-file で渡してください。' ;;
+    unparsable) why='コマンドを解釈できません(クォートが閉じていません)。本文はファイルに書いて --body-file で渡してください。' ;;
     *) why='正準形を外れています。' ;;
   esac
   printf '%s %s' "$why" "$base"
@@ -2106,13 +2106,27 @@ CASESWRAP
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#78: 前置つきの単独の投稿は pass): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
 
+  # #80: 引用符付きヒアドキュメントの本文はデータ。本文に gh の投稿の例(バッククォート
+  # やアポストロフィつき)を書いても、投稿と誤認して止めない。シェルが読む本文
+  # (bash <<'EOF')はコードなので、中の投稿は検査する(宛先が無ければ deny)。
+  set +e
+  (cd "$tmp" && "$SELF" scan-bash-command "$(printf 'cat > %s/note.md <<'"'"'EOF'"'"'\nuse `gh pr create` and it'"'"'s fine: gh issue close 5\nEOF' "$tmp")") > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#80: 引用符付きヒアドキュメントの本文はデータ): 期待=0 実際=$rc" >&2; fails=$((fails + 1)); }
+  set +e
+  (cd "$tmp" && "$SELF" scan-bash-command "$(printf 'bash <<'"'"'EOF'"'"'\ngh pr create --title t\nEOF')") > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 2 ]] || { echo "FAIL(#80: シェルが読む本文の gh は検査する): 期待=2 実際=$rc" >&2; fails=$((fails + 1)); }
+
   # ヒアドキュメントで本文を渡す形(本文の中のアポストロフィでクォートが閉じず、
   # コマンドを解釈できない)は、素通りにせず deny する。
   set +e
   out="$(cd "$tmp" && "$SELF" scan-bash-command "$(printf 'gh issue create -R pub/repo --body-file /dev/stdin <<EOF\nit'"'"'s a heredoc\nEOF')" 2>&1)"
   rc=$?
   set -e
-  [[ $rc -eq 2 && $out == *'解釈できません'* ]] || { echo "FAIL(ヒアドキュメントの gh 投稿は deny): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  [[ $rc -eq 2 && $out == *'標準入力'* ]] || { echo "FAIL(ヒアドキュメントの gh 投稿は deny): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   # #54: push の範囲は「実際に push される ref」から、remote が既に持つ内容を
   # 除いて求める(default branch / merge-base に依存しない)。

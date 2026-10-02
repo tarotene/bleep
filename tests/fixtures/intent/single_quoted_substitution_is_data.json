@@ -1,0 +1,4 @@
+{
+  "command": "echo '$(gh issue close 5 -R pub/repo)'",
+  "expect": []
+}

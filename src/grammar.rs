@@ -154,9 +154,18 @@ impl Violation {
     }
 }
 
+/// 標準入力・ファイル記述子・端末など、PreToolUse の時点で中身を読めない
+/// 入力元(`/dev/stdin`・`/dev/fd/N`・`/proc/self/fd/N`)か。ヒアドキュメントで
+/// 本文を流し込む形は、これを指す(`--body-file /dev/stdin <<EOF`)ので、`-` と
+/// 同じく標準入力として扱う。`..` を含むパスは、`/tmp/../dev/stdin` のように
+/// 字面でこの検査を迂回できるので、同じ扱いにする。
+fn is_stream_path(p: &str) -> bool {
+    p.starts_with("/dev/") || p.starts_with("/proc/") || p.split('/').any(|c| c == "..")
+}
+
 /// 本文の入力元ファイルの値を検査して `body_sources` に積む。
 fn take_body_file(v: &str, sources: &mut Vec<String>, viol: &mut Violation) {
-    if v == "-" {
+    if v == "-" || is_stream_path(v) {
         viol.set("body-stdin");
     } else if is_literal_abs_path(v) {
         if !sources.iter().any(|s| s == v) {
