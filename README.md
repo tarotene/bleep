@@ -334,10 +334,15 @@ with no free text (`pr ready`) — is not scanned, as before. A post is
   `gist create`; `-F key=@path` / `--input` for `gh api`) — never from
   `--body`/`-b`/`--notes`/`-n`, a `close|reopen --comment`, or stdin (`-`)
 - every other value is literal: no `$(…)`, backticks, or `$VAR`
+- a post that reads a body file **stands alone**: it is the whole command (an
+  `env`/`timeout` prefix is fine), not chained with `&&`, `;`, `|` or a newline,
+  and not inside `sh -c`, `eval` or `$(…)`. A preceding command could rewrite the
+  file between the scan and the post
+  ([docs/adr/0004-body-file-post-stands-alone.md](docs/adr/0004-body-file-post-stands-alone.md))
 
 Anything else is **denied** (reason id `gh-noncanonical`, with one of the
 closed codes `no-repo`, `bad-repo`, `inline-body`, `inline-comment`,
-`body-stdin`, `body-path`, `dynamic-value`, `unparsable` in the ledger's
+`body-stdin`, `body-path`, `dynamic-value`, `unparsable`, `not-alone` in the ledger's
 `detail`), and the reason text shows the canonical form: write the body to a
 file first, then `gh issue comment 5 -R OWNER/REPO --body-file /abs/path.md`
 (to close with a comment, comment first and then `gh issue close`). bleep does

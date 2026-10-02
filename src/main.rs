@@ -16,8 +16,10 @@ use std::process::ExitCode;
 /// (push_bypass)に置き換え(docs/adr/0003-constructive-grammar.md)、
 /// 版 4 = gh の投稿を正準形の認識器(grammar.rs)の結果に置き換え。投稿ごとに
 /// 宛先・違反コード・本文の入力元を返し、cd 追跡・unresolved_var・
-/// gh_effective_dir を廃止。
-const LEX_PROTOCOL: u32 = 4;
+/// gh_effective_dir を廃止、
+/// 版 5 = 違反コードに `not-alone`(本文ファイルを持つ投稿は単独のコマンド、
+/// docs/adr/0004-body-file-post-stands-alone.md)を追加。
+const LEX_PROTOCOL: u32 = 5;
 
 fn usage() -> String {
     "\

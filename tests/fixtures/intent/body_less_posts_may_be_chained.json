@@ -1,0 +1,7 @@
+{
+  "command": "gh issue close 1 -R pub/one && gh pr close 2 -R pub/two",
+  "expect": [
+    {"surface": "issue", "action": "close", "repo_source": "flag", "repo": "pub/one", "body_sources": [], "canonical": true, "noncanonical_reason": null},
+    {"surface": "pr", "action": "close", "repo_source": "flag", "repo": "pub/two", "body_sources": [], "canonical": true, "noncanonical_reason": null}
+  ]
+}

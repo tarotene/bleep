@@ -18,6 +18,10 @@
 //!   `close|reopen` の `--comment`・stdin(`-`)は文法の外
 //! - そのほかの値(タイトル・ラベルなど)はリテラルだけ — コマンド置換・変数
 //!   展開を含まない
+//! - 本文ファイルを持つ投稿は、単独のコマンド(`&&`・`;`・`|`・改行で他の
+//!   コマンドと並べない。`sh -c`・`eval`・`$(…)` の中でもない)。前段が本文
+//!   ファイルを書き換える TOCTOU を構成で閉じる(`lex.rs` の `require_alone`、
+//!   docs/adr/0004-body-file-post-stands-alone.md)。`not-alone` は lex が付ける
 //! - `gh api` の書き込み: パスと値がリテラル。`repos/<owner>/<repo>/…` なら
 //!   宛先はそのパス、プレースホルダ(`{owner}`)は cwd 依存なので文法の外
 //!
@@ -70,7 +74,7 @@ pub struct GhPost {
 /// (bleep 本体)に使う。テストが、`recognize` の返すコードがここに収まる
 /// ことを確かめる。
 #[cfg(test)]
-pub const NONCANONICAL_CODES: [&str; 8] = [
+pub const NONCANONICAL_CODES: [&str; 9] = [
     "no-repo",
     "bad-repo",
     "inline-body",
@@ -79,6 +83,7 @@ pub const NONCANONICAL_CODES: [&str; 8] = [
     "body-path",
     "dynamic-value",
     "unparsable",
+    "not-alone",
 ];
 
 /// 値がコマンド置換・変数展開を含み、コマンド文字列だけでは内容が定まらないか。
