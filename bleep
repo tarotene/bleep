@@ -1228,6 +1228,9 @@ cmd_scan_bash_command() {
     offset=$((offset + n))
   done
   if [[ $scan_public == 1 ]]; then
+    # 一致の出所(コマンド文字列か本文ファイルか)を理由文に出すため、本文を足す
+    # 前のコマンド側を取っておく(#85)。
+    local command_subject="$scan_subject"
     for body_path in "${scan_bodies[@]+"${scan_bodies[@]}"}"; do
       if [[ -f $body_path && -r $body_path ]]; then
         scan_subject+=$'\n'"$(cat -- "$body_path" 2>/dev/null)" || true
@@ -1238,7 +1241,15 @@ cmd_scan_bash_command() {
     require_orgs_file
     build_patterns
     if match_verdict "$scan_subject"; then
-      emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
+      local v="$VERDICT" c="$MATCH_CLASS" t="$MATCH_TERM" where reason
+      # コマンド側だけでも一致するならコマンド文字列中、そうでなければ本文ファイル中。
+      if match_verdict "$command_subject"; then
+        where="コマンド文字列中"
+      else
+        where="本文ファイルの中身"
+      fi
+      reason="$(verdict_reason "$v" "$c") 一致した場所: ${where}。語そのものは bleep explain で確認できます。"
+      emit_verdict "$v" "$reason" "$(reason_id_for_verdict "$v" "$c")" "$c" "$t"
     fi
   fi
 
@@ -2245,6 +2256,34 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 0 ]] || { echo "FAIL(#43 D2: PUBLIC 宛先でも --repo トークン自体は照合対象外): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  # #85: 本文の入力元ファイルのパスは gh に渡るだけで投稿されないので、
+  # パスに denylist の名前が含まれていても(エージェントの scratchpad は
+  # 作業中のプロジェクト名を含む)、中身とコマンド文字列が無関係なら pass する。
+  # 一致したときは、理由文に出所(コマンド文字列中 / 本文ファイルの中身)が出る。
+  mkdir -p "$tmp/my-private-tool-work"
+  cp "$gb/clean.md" "$tmp/my-private-tool-work/body.md"
+  printf 'notes about my-private-tool\n' > "$tmp/dirty-body.md"
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  (cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh pr create -R acme/public-oss --title t --body-file $tmp/my-private-tool-work/body.md") > /dev/null 2>&1
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { echo "FAIL(#85: 本文ファイルのパスは照合対象外): 期待=0(pass) 実際=$rc" >&2; fails=$((fails + 1)); }
+
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  out="$(cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh pr create -R acme/public-oss --title t --body-file $tmp/dirty-body.md" 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'本文ファイルの中身'* ]] || { echo "FAIL(#85: 本文の中身の一致は deny し、出所を本文ファイルと示す): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  out="$(cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh pr create -R acme/public-oss --title my-private-tool --body-file $gb/clean.md" 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'コマンド文字列中'* ]] || { echo "FAIL(#85: コマンド文字列の一致は deny し、出所をコマンドと示す): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   # #34 の後継: --repo が無い投稿は、cwd の origin から宛先を推測せず(cd の
   # 追跡も変数の解決もしない)、文法の外として deny する。cd の対象に変数が
