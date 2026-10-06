@@ -799,6 +799,7 @@ pub struct AnalyzeResult {
     /// denylist の照合対象。CMD 全文から `cd <単一トークン>` セグメントを除き、
     /// 宛先を `-R`/`--repo` で明示した gh セグメントからはその宛先トークンを
     /// 除いたもの(#9、#43 — 宛先そのものは漏洩ではない)。
+    /// 本文の入力元ファイルのパスも除く(#85 — 投稿されるのは中身で、パスではない)。
     pub scan_subject: String,
     pub found_push: bool,
     /// いずれかの `git push` が pre-push を無効にする形。
@@ -807,24 +808,45 @@ pub struct AnalyzeResult {
     pub posts: Vec<GhPost>,
 }
 
-/// gh セグメントの生テキストから `--repo`/`-R`(値を伴う2トークン形)と
-/// `--repo=値`(1トークン形)を取り除き、残りのトークンを
-/// `shell_words::join`(`split` の逆演算、必要最小限の再クォート)で
-/// 再結合したテキストを返す(#43、D2)。
-fn strip_repo_override_tokens(seg: &str) -> String {
+/// 本文の入力元ファイルを渡すフラグ。`-F` は gh の別サブコマンドでは別の意味
+/// (`gh api -F key=@file` の欄)なので、値が本文の入力元のパスと一致するときだけ
+/// 取り除く。
+const BODY_PATH_FLAGS: &[&str] = &["--body-file", "--notes-file", "--input", "-F"];
+
+/// gh セグメントの生テキストから、公開されないトークンを取り除いた残りを
+/// `shell_words::join`(`split` の逆演算、必要最小限の再クォート)で再結合した
+/// テキストを返す。取り除くのは次の 2 種類:
+///
+/// - `--repo`/`-R`(値を伴う2トークン形)と `--repo=値`(1トークン形)。
+///   `strip_repo` が真のとき(#43、D2 — 宛先そのものは漏洩ではない)
+/// - 本文の入力元ファイルのパス(フラグ+値の 2 トークン形と `--flag=値` の
+///   1 トークン形)。値が `body_sources` にあるものだけ。パスは gh に渡るだけで
+///   投稿されず、投稿されるのは中身で、中身は別途そのファイルを読んで照合する。
+///   パスに作業中のプロジェクト名が含まれる(エージェントの scratchpad 等)と、
+///   本文を直しても一致して拒否される(#85)
+fn strip_unpublished_tokens(seg: &str, strip_repo: bool, body_sources: &[String]) -> String {
     let t = split_words(seg).unwrap_or_default();
     let mut kept: Vec<String> = Vec::with_capacity(t.len());
+    let is_source = |v: &str| body_sources.iter().any(|b| b == v);
     let mut j = 0usize;
     while j < t.len() {
-        match t[j].as_str() {
-            "--repo" | "-R" => {
-                j += 2; // フラグ+値の2トークンを両方取り除く
-            }
-            s if s.starts_with("--repo=") => j += 1,
-            _ => {
-                kept.push(t[j].clone());
-                j += 1;
-            }
+        let tok = t[j].as_str();
+        let eq_form_source = BODY_PATH_FLAGS
+            .iter()
+            .filter(|f| f.starts_with("--"))
+            .find_map(|f| tok.strip_prefix(&format!("{f}=")))
+            .is_some_and(is_source);
+        if strip_repo && (tok == "--repo" || tok == "-R") {
+            j += 2; // フラグ+値の2トークンを両方取り除く
+        } else if strip_repo && tok.starts_with("--repo=") {
+            j += 1;
+        } else if BODY_PATH_FLAGS.contains(&tok) && t.get(j + 1).is_some_and(|v| is_source(v)) {
+            j += 2;
+        } else if eq_form_source {
+            j += 1;
+        } else {
+            kept.push(t[j].clone());
+            j += 1;
         }
     }
     shell_words::join(kept)
@@ -846,13 +868,23 @@ pub fn analyze(cmd: &str) -> AnalyzeResult {
         }
 
         if as_single_cd_target(&seg.text).is_none() {
-            let strips = items
+            let strip_repo = items
                 .iter()
                 .any(|it| matches!(it, Item::Gh(p) if p.repo_source == grammar::RepoSource::Flag));
-            if strips {
-                result
-                    .scan_subject
-                    .push_str(&strip_repo_override_tokens(&seg.text));
+            let body_sources: Vec<String> = items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Gh(p) => Some(p.body_sources.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if strip_repo || !body_sources.is_empty() {
+                result.scan_subject.push_str(&strip_unpublished_tokens(
+                    &seg.text,
+                    strip_repo,
+                    &body_sources,
+                ));
             } else {
                 result.scan_subject.push_str(&seg.text);
             }
@@ -928,6 +960,36 @@ mod tests {
         assert_eq!(r.posts.len(), 1);
         assert!(!r.scan_subject.contains("acme/public-oss"));
         assert!(r.scan_subject.contains("unrelated"));
+    }
+
+    #[test]
+    fn body_file_path_excluded_from_scan_subject() {
+        // #85: 本文の入力元ファイルのパスは gh に渡るだけで投稿されない。
+        // パスに作業中のプロジェクト名が含まれても、照合対象にしない。タイトル
+        // など、投稿される部分は残る。
+        for cmd in [
+            "gh pr create -R acme/public-oss --title unrelated --body-file /tmp/secret-project-x/b.md",
+            "gh pr create -R acme/public-oss --title unrelated --body-file=/tmp/secret-project-x/b.md",
+            "gh release create v1 -R acme/public-oss --title unrelated --notes-file /tmp/secret-project-x/b.md",
+            "gh api -X POST repos/acme/public-oss/issues --input /tmp/secret-project-x/b.json",
+        ] {
+            let r = analyze(cmd);
+            assert_eq!(r.posts.len(), 1, "{cmd}");
+            assert!(!r.scan_subject.contains("secret-project-x"), "{cmd}");
+        }
+        let r = analyze(
+            "gh pr create -R acme/public-oss --title secret-title --body-file /tmp/secret-project-x/b.md",
+        );
+        assert!(r.scan_subject.contains("secret-title"));
+    }
+
+    #[test]
+    fn body_file_flag_with_unrelated_value_is_kept() {
+        // 本文の入力元として受理されなかった値(相対パス)は、取り除かない。
+        let r = analyze(
+            "gh pr create -R acme/public-oss --title t --body-file rel/secret-project-x.md",
+        );
+        assert!(r.scan_subject.contains("secret-project-x"));
     }
 
     #[test]
