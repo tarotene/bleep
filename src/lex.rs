@@ -1088,6 +1088,14 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_heredoc_bodies_are_data() {
+        // インタプリタ(`python3 -`)の標準入力はシェルではなくそのインタプリタが読む。
+        // 本文の `gh pr create` 行はデータ(引用符あり・なしの両方)。
+        assert!(posts("python3 - <<'E'\ngh pr create -R a/b --title t\nE").is_empty());
+        assert!(posts("python3 - <<E\ngh pr create -R a/b --title t\nE").is_empty());
+    }
+
+    #[test]
     fn code_heredoc_bodies_are_scanned_for_posts() {
         let want = vec!["a/b".to_string()];
         // 標準入力をシェルが読む形(直接、パイプ越し、`-s`、`. /dev/stdin`)。
