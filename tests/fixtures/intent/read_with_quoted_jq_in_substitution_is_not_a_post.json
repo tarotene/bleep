@@ -1,0 +1,5 @@
+{
+  "command": "echo \"$(gh issue view 1 --jq \"a|b\")\"",
+  "expect": [
+  ]
+}

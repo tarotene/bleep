@@ -170,6 +170,15 @@ pub fn split_command_segments(cmd: &str) -> Vec<Segment> {
                         }
                     }
                 }
+                // 二重引用符の中の `$(…)`・バッククォートは、中が別の引用の文脈になる
+                // (`"$(echo "a|b")"` の内側の `"` は外側の閉じではない)。置換の終わりまでを
+                // 逐語で積み、内側の引用符・演算子で外側の状態を狂わせない。中身の分類は
+                // `substitutions` の再帰が担う。閉じない置換は、従来どおり文字として進める。
+                if let Some(end) = substitution_end(&chars, i) {
+                    buf.extend(&chars[i..end]);
+                    i = end;
+                    continue;
+                }
                 buf.push(c);
                 if c == '"' {
                     quote = None;
@@ -461,6 +470,29 @@ fn substitutions(text: &str, quote_aware: bool) -> Vec<String> {
     out
 }
 
+/// `i` で始まる `$(…)`(算術展開 `$((` は除く)またはバッククォートの置換が閉じる位置
+/// (その次の添字)。閉じない、または置換の始まりでなければ `None`。
+///
+/// 閉じ位置は `scan_substitutions`(入れ子・引用符の規則を持つ唯一の実装)で取る。
+/// バッククォートは、bash と同じく、引用符を見ずに、`\` で打ち消されない次の
+/// バッククォートまでである。
+fn substitution_end(chars: &[char], i: usize) -> Option<usize> {
+    match chars.get(i)? {
+        '$' if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') => {
+            let (end, closed) = scan_substitutions(chars, i + 2, true, true, &mut Vec::new());
+            closed.then_some(end)
+        }
+        '`' => {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '`' {
+                j += if chars[j] == '\\' { 2 } else { 1 };
+            }
+            (j < chars.len()).then_some(j + 1)
+        }
+        _ => None,
+    }
+}
+
 /// `i` から読み、`nested`(`$(` の中)なら対応する `)` の次の位置と閉じたか、
 /// そうでなければ末尾を返す。
 fn scan_substitutions(
@@ -524,7 +556,9 @@ fn scan_substitutions(
             }
             continue;
         }
-        if nested {
+        // 二重引用符の中の括弧は文字で、置換の入れ子には数えない(`$(echo ")")`)。
+        // `quote_aware` が偽なら `dq` は動かないので、ここは従来どおり。
+        if nested && !dq {
             if c == '(' {
                 paren += 1;
             } else if c == ')' {
@@ -893,6 +927,63 @@ mod tests {
         let segs = split_command_segments(r#"echo \" && gh pr create --title t"#);
         assert_eq!(segs.len(), 2);
         assert!(segs[1].text.trim_start().starts_with("gh pr create"));
+    }
+
+    #[test]
+    fn quoted_substitution_keeps_inner_quotes_and_operators_inside() {
+        // 二重引用符の中の `$(…)` は内側が別の引用の文脈で、内側の `"` は外側の閉じ
+        // ではない。内側の `|` `&&` で外側を切らない(`--jq "a|b"` が「クォート未閉じ」
+        // と誤解析されて読み取りの gh が deny されていた)。
+        for cmd in [
+            r#"echo "$(gh issue view 1 --jq "a|b")""#,
+            r#"echo "$(gh issue view 1 --jq '"a|b"')""#,
+            r#"echo "$(gh issue view 1 --json state --jq '"\(.state)"')""#,
+            r#"echo "$(echo ")")""#,
+            "echo \"`echo \"a|b\"`\"",
+        ] {
+            assert_eq!(split_nonempty(cmd).len(), 1, "{cmd}");
+            assert!(posts(cmd).is_empty(), "{cmd}");
+        }
+        // 置換の外の演算子は、これまでどおり切る。
+        let segs = split_nonempty(r#"echo "$(echo ")")" && gh issue close 5 -R a/b"#);
+        assert_eq!(segs.len(), 2);
+        assert!(segs[1].text.trim_start().starts_with("gh issue close"));
+        let segs = split_nonempty("echo \"`echo \"a|b\"`\" && gh issue close 5 -R a/b");
+        assert_eq!(segs.len(), 2);
+    }
+
+    #[test]
+    fn quoted_substitution_never_hides_an_executed_post() {
+        // 置換の中の gh は、内側の引用符・括弧を含んでいても認識される(偽陰性ゼロ)。
+        let want = vec!["a/b".to_string()];
+        for cmd in [
+            r#"echo "$(gh issue view 1 --jq "a|b" && gh issue close 5 -R a/b)""#,
+            r#"echo "$(echo ")" && gh issue close 5 -R a/b)""#,
+            "echo \"`echo \"a|b\" && gh issue close 5 -R a/b`\"",
+            r#"echo "$(echo "x|y")" && gh issue close 5 -R a/b"#,
+        ] {
+            assert_eq!(close_repos(cmd), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn unclosed_quoted_substitution_is_not_split() {
+        // 閉じない置換は、従来どおり(引用符が閉じない)1 セグメントのままにする。
+        let cmd = r#"echo "$(gh issue close 5 -R a/b"#;
+        assert_eq!(split_command_segments(cmd).len(), 1);
+    }
+
+    #[test]
+    fn parens_inside_double_quotes_do_not_close_a_substitution() {
+        assert_eq!(
+            substitutions(r#"echo "$(echo ")")""#, true),
+            vec![r#"echo ")""#.to_string()]
+        );
+        // 引用符の外の括弧は、これまでどおり入れ子として数える。
+        assert_eq!(
+            substitutions("echo $(echo $(echo a) b)", true),
+            vec!["echo $(echo a) b".to_string(), "echo a".to_string()]
+        );
     }
 
     #[test]

@@ -73,6 +73,17 @@ const CORPUS: &[Case] = &[
         "cat <<'EOF' >/dev/null\n$(gh issue close 5 -R pub/a)\nEOF\ngh pr close 2 -R pub/b",
         true,
     ),
+    // 二重引用符の中の置換: 内側の引用符・演算子・括弧が、外側を狂わせない
+    case(
+        "echo \"$(echo \"a|b\" && gh issue close 5 -R pub/a)\"",
+        true,
+    ),
+    case(
+        "echo \"$(echo ')' | cat && gh issue close 5 -R pub/a)\"",
+        true,
+    ),
+    case("echo \"$(echo \")\")\" && gh issue close 5 -R pub/a", true),
+    case("echo \"`echo \"a|b\"`\" && gh issue close 5 -R pub/a", true),
     // 引用符・コメントの中のデータ
     case("echo '$(gh issue close 5 -R pub/a)'", true),
     case("echo \"it's\" '$(gh pr close 2 -R pub/b)'", true),
