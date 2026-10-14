@@ -1,0 +1,4 @@
+{
+  "command": "python3 - <<'E'\nprint('gh pr create -R pub/other --title t')\ngh pr create -R pub/other --title t\nE",
+  "expect": []
+}
