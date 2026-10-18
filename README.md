@@ -1,10 +1,10 @@
-# bleep
-
 <img src="docs/img/bleep.svg" alt="A black censor bar over the word BLEEP" width="360">
 
-A deny/ask gate that prevents AI coding agents from leaking company/private repository names onto public GitHub surfaces (git push, PR/Issue creation, MCP tool calls).
+# bleep
 
-Where it hooks in: `git push` is checked by git's own **pre-push hook**
+A deny/ask gate that stops AI coding agents from leaking company/private repository names onto public GitHub surfaces.
+
+It covers `git push`, PR/Issue creation, and MCP tool calls. Where it hooks in: `git push` is checked by git's own **pre-push hook**
 (`hooks/pre-push`), which receives the exact refs and SHAs being pushed; `gh`
 and MCP tool calls are checked by the agent host's **PreToolUse hook**
 (`hooks/bleep.sh`). The design principle — shrink what is accepted to a small
@@ -45,6 +45,8 @@ If you skip the move, `bleep` does not silently run without your org list.
 While `orgs.txt` is missing and the old `~/.config/publish-guard/` directory
 still exists, every publish check returns **ask** and says the migration is
 incomplete.
+
+### Configuration
 
 This repository never commits denylist data (org names, repo names). You
 place your own under `$XDG_CONFIG_HOME/bleep/` (defaults to
@@ -89,7 +91,9 @@ comments and blank lines ignored):
 | `allow-regexes.txt` | If this regex matches the scanned text, it disables **only the ask** verdict (it does not loosen deny) |
 | `allow-paths.txt` | Regex of file paths excluded from `audit` |
 
-**Short repo names are downgraded to `ask` by default** (`BLEEP_SOFT_MAXLEN`,
+### Short repo names
+
+Short repo names are downgraded to `ask` by default (`BLEEP_SOFT_MAXLEN`,
 default `4`, #44): a live-swept private repo name that's `BLEEP_SOFT_MAXLEN`
 characters or shorter — the kind of short, generic name that's more likely to
 collide with ordinary prose in an unrelated public repo (`gizmo.json`,
@@ -109,9 +113,10 @@ per line instead of a bare name, so this downgrade has an owner to fall back
 to; an old-format cache from before #44 is detected and refreshed
 automatically the next time it's read.
 
-**Marking a private repo as "prospectively public"** (#15): a personal side
-project that's private only because it isn't polished yet — not because its
-name or existence is sensitive — can be exempted from the hard-deny tier
+### Marking a private repo as "prospectively public"
+
+A personal side project that's private only because it isn't polished yet
+(#15) — not because its name or existence is sensitive — can be exempted from the hard-deny tier
 with nothing more than `allow-stopwords.txt`; there is no separate
 "prospective public" file or config tier, because this exemption is fully
 covered by the stopword mechanism that already exists for false positives
@@ -208,9 +213,10 @@ PreToolUse only denies the forms that switch the hook off: `git push
 /plugin install bleep@bleep
 ```
 
-`.claude-plugin/plugin.json` reads `hooks/hooks.json`, which registers
-`hooks/bleep.sh --host=claude` on `PreToolUse` with a single compound
-matcher `Bash|mcp__.*` (self-resolved via `${CLAUDE_PLUGIN_ROOT}`).
+The plugin registers `hooks/bleep.sh --host=claude` on `PreToolUse` with a
+single compound matcher `Bash|mcp__.*` (self-resolved via
+`${CLAUDE_PLUGIN_ROOT}`); the plugin's own hook registration is the canonical
+definition.
 
 **Why the matchers aren't split**: you might be tempted to write two
 separate hook entries, one for Bash and one for MCP — don't. Combined with a
@@ -240,8 +246,8 @@ and pre-install for every user via `enabledPlugins`.
 
 Denylist data (`orgs.txt`, etc.) does not travel through this distribution
 path — each user still has to write their org name into their own
-`~/.config/bleep/orgs.txt` (this is intentional; see "This is not a
-security boundary" under [Scope](#scope) for details).
+`orgs.txt` (see [Configuration](#configuration); this is intentional, see
+"This is not a security boundary" under [Scope](#scope) for details).
 
 ### Codex CLI
 
@@ -287,13 +293,25 @@ Copilot's `preToolUse` **has no matcher** (verified against a real
 instance — it fires unconditionally on every tool call). Filtering happens
 inside `bleep-hook` itself (checking whether `toolName == "bash"`).
 
+### Checking your install
+
+`bleep doctor` prints `ok:` / `NG:` lines and exits 1 on any `NG`. It checks that
+`bleep-hook` runs, that its lex output version matches the `bleep` script (a
+mismatched pair would otherwise misread each other's output; `scan-bash-command`
+also asks in that case, with reason id `lex-protocol-mismatch`), that the
+effective pre-push hook (`core.hooksPath`, else `.git/hooks/`; `BLEEP_PRE_PUSH_HOOK`
+points it at another file) calls `scan-push --pre-push` — without it, pushes are
+not checked — and that `hooks/hooks.json` matches both `Bash` and `mcp__` tools
+(`BLEEP_HOOKS_JSON` points it at another file). Design notes:
+[docs/adr/0002-gh-intent-and-layers.md](docs/adr/0002-gh-intent-and-layers.md).
+
 ## Usage
 
 **`--cwd DIR`**: a global option, placed before the subcommand name, that
 tells `scan-push` (both forms) to treat `DIR` as the target repository's
 location instead of the process's own cwd. `bleep-hook` still passes it for all
 three hosts from the PreToolUse payload's `cwd` field (Claude, Codex, and
-Copilot all expose one; see `src/host.rs` for the field paths), but
+Copilot all expose one; the field path is in the `bleep-hook` host adapter), but
 `scan-bash-command` no longer uses it: a PreToolUse hook runs as a separate
 process **before** the shell command executes, so a `cd /other/repo && …` can't
 be resolved from the hook's own cwd (#10, #14) — and bleep now doesn't try. A
@@ -306,7 +324,7 @@ into segments on `;`, `&&`, `||`, `|`, and newlines (quote-aware — `&&`
 inside a quoted string is not treated as a separator). Each segment is
 tokenized and the command word is found **by position** — assignments
 (`X=1 gh …`), prefixes (`env`, `sudo`, `timeout`, `nohup`, …), the subshell
-opener, and an absolute path (`/usr/bin/gh`) are skipped — and the contents of
+opener, and an absolute path to the binary are skipped — and the contents of
 `sh|bash|zsh -c '…'`, `eval '…'`, `$(…)` and backticks are classified the same
 way, recursively (depth-limited). Which strings count as **code** (looked at)
 and which as **data** (not looked at) is decided by the shell's own rules
@@ -444,6 +462,59 @@ repository never commits denylist data," CONTRIBUTING's sanitization
 rules). Run `audit --since` locally, by hand, right before you flip
 visibility.
 
+### Verdict ledger (local only, never sent anywhere)
+
+Every `deny`/`ask` verdict from `scan`/`scan-push`/`scan-bash-command`
+(including the fail-loud `ask`s such as a missing `orgs.txt`) is appended,
+one JSON object per line, to
+`$XDG_STATE_HOME/agent-verdicts/bleep.jsonl` (default
+`~/.local/state/agent-verdicts/bleep.jsonl`). Nothing is transmitted
+anywhere — this exists so an agent that keeps getting blocked by the same
+judgment can have that fact surfaced locally and, if you choose to, turned
+into a bug report against this repository, instead of silently working
+around the denial. See
+[tarotene/dotfiles docs/adr/](https://github.com/tarotene/dotfiles/tree/main/docs/adr)
+(search for "agent-verdict-ledger") for the consuming side and the
+canonical [JSON Schema](https://github.com/tarotene/dotfiles/blob/main/docs/schemas/agent-verdict.schema.json)
+for the record shape.
+
+- **What is written**: a closed-vocabulary `reason_id` and `match_class`,
+  the host name, an optional session id, the invoked tool name, and an
+  HMAC-SHA256 hash (keyed by a random, machine-local key at
+  `$XDG_STATE_HOME/agent-verdicts/hmac-key`, generated on first use) of
+  whichever denylist term matched.
+- **What is never written**: the command text, `cwd`, the plaintext
+  matched term, or the deny/ask reason text itself. Writing any of these
+  would defeat this tool's own purpose.
+- **Opt out**: set `DO_NOT_TRACK` (any non-empty value) or
+  `BLEEP_NO_LEDGER=1`. A write failure never affects the verdict itself
+  (fail-open).
+
+**Diagnosing a repeated denial: `bleep explain TERM_HASH`** (#44). Because
+the ledger only ever stores an HMAC of the matched term, an agent that keeps
+getting denied by the same judgment has no way to identify — even by
+brute-forcing every word in its own diff — which denylist entry actually
+matched; the false-positive reports filed against this tool as a result
+could never name the offending word. Run this **on your own terminal**,
+never inside an agent session, since it prints denylist entries (org/repo
+names) in plaintext:
+
+```
+$ jq -r 'select(.match_class != "none") | .term_hash' \
+    ~/.local/state/agent-verdicts/bleep.jsonl | tail -1
+4fe91aa1f4f5089de7f37664256681d75908f013dde5bec9cb43cc0e67b0837f
+$ bleep explain 4fe91aa1f4f5089de7f37664256681d75908f013dde5bec9cb43cc0e67b0837f
+word-hard	gizmo
+```
+
+This rehashes every current denylist entry with the same machine-local key
+and prints whichever one matches, alongside its `match_class`. It does not
+touch `match_verdict` and writes nothing to the ledger — it is purely a
+read of the current denylist, not a re-run of any verdict. **The deny/ask
+reason text never mentions this subcommand**, for the same reason it never
+mentions `BLEEP_ALLOW` (see [Scope](#scope)): the constrained party should not be
+able to read its own way out of a false positive.
+
 ## Scope
 
 This repository owns the decision-engine CLI (`scan`/`scan-push`/
@@ -505,71 +576,6 @@ This is an escape hatch for when you deliberately want to skip the check.
 constrained party (the agent) could otherwise read the deny reason and
 re-run the bypass itself. The existence of this bypass is meant to be known
 only to the human who configures this tool.
-
-## Verdict ledger (local only, never sent anywhere)
-
-Every `deny`/`ask` verdict from `scan`/`scan-push`/`scan-bash-command`
-(including the fail-loud `ask`s such as a missing `orgs.txt`) is appended,
-one JSON object per line, to
-`$XDG_STATE_HOME/agent-verdicts/bleep.jsonl` (default
-`~/.local/state/agent-verdicts/bleep.jsonl`). Nothing is transmitted
-anywhere — this exists so an agent that keeps getting blocked by the same
-judgment can have that fact surfaced locally and, if you choose to, turned
-into a bug report against this repository, instead of silently working
-around the denial. See
-[tarotene/dotfiles docs/adr/](https://github.com/tarotene/dotfiles/tree/main/docs/adr)
-(search for "agent-verdict-ledger") for the consuming side and the
-canonical [JSON Schema](https://github.com/tarotene/dotfiles/blob/main/docs/schemas/agent-verdict.schema.json)
-for the record shape.
-
-- **What is written**: a closed-vocabulary `reason_id` and `match_class`,
-  the host name, an optional session id, the invoked tool name, and an
-  HMAC-SHA256 hash (keyed by a random, machine-local key at
-  `$XDG_STATE_HOME/agent-verdicts/hmac-key`, generated on first use) of
-  whichever denylist term matched.
-- **What is never written**: the command text, `cwd`, the plaintext
-  matched term, or the deny/ask reason text itself. Writing any of these
-  would defeat this tool's own purpose.
-- **Opt out**: set `DO_NOT_TRACK` (any non-empty value) or
-  `BLEEP_NO_LEDGER=1`. A write failure never affects the verdict itself
-  (fail-open).
-
-**Diagnosing a repeated denial: `bleep explain TERM_HASH`** (#44). Because
-the ledger only ever stores an HMAC of the matched term, an agent that keeps
-getting denied by the same judgment has no way to identify — even by
-brute-forcing every word in its own diff — which denylist entry actually
-matched; the false-positive reports filed against this tool as a result
-could never name the offending word. Run this **on your own terminal**,
-never inside an agent session, since it prints denylist entries (org/repo
-names) in plaintext:
-
-```
-$ jq -r 'select(.match_class != "none") | .term_hash' \
-    ~/.local/state/agent-verdicts/bleep.jsonl | tail -1
-4fe91aa1f4f5089de7f37664256681d75908f013dde5bec9cb43cc0e67b0837f
-$ bleep explain 4fe91aa1f4f5089de7f37664256681d75908f013dde5bec9cb43cc0e67b0837f
-word-hard	gizmo
-```
-
-This rehashes every current denylist entry with the same machine-local key
-and prints whichever one matches, alongside its `match_class`. It does not
-touch `match_verdict` and writes nothing to the ledger — it is purely a
-read of the current denylist, not a re-run of any verdict. **The deny/ask
-reason text never mentions this subcommand**, for the same reason it never
-mentions `BLEEP_ALLOW` (see above): the constrained party should not be
-able to read its own way out of a false positive.
-
-## Checking your install
-
-`bleep doctor` prints `ok:` / `NG:` lines and exits 1 on any `NG`. It checks that
-`bleep-hook` runs, that its lex output version matches the `bleep` script (a
-mismatched pair would otherwise misread each other's output; `scan-bash-command`
-also asks in that case, with reason id `lex-protocol-mismatch`), that the
-effective pre-push hook (`core.hooksPath`, else `.git/hooks/`; `BLEEP_PRE_PUSH_HOOK`
-points it at another file) calls `scan-push --pre-push` — without it, pushes are
-not checked — and that `hooks/hooks.json` matches both `Bash` and `mcp__` tools
-(`BLEEP_HOOKS_JSON` points it at another file). Design notes:
-[docs/adr/0002-gh-intent-and-layers.md](docs/adr/0002-gh-intent-and-layers.md).
 
 ## Development
 
