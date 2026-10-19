@@ -250,14 +250,16 @@ term_hash() {
 #               $4=平文のマッチ語(既定空、無ければ term_hash は null)
 #               $5=detail(既定空。空なら "detail" 欄自体を書かない。閉じた語彙の
 #                 失敗コードだけを渡す — 自由文・パス・git の stderr は入れない、#54)
+#               $6=term の term_hash(既定空。呼び出し側が理由文のために計算済みなら
+#                 渡す。空なら、term があるときここで計算する)
 ledger_write() {
   ledger_enabled || return 0
-  local verdict="$1" reason_id="$2" match_class="${3:-none}" term="${4-}" detail="${5-}"
+  local verdict="$1" reason_id="$2" match_class="${3:-none}" term="${4-}" detail="${5-}" hash="${6-}"
   local detail_json=""
   [[ $detail =~ ^[a-z][a-z-]*$ ]] && detail_json=",\"detail\":\"$detail\""
-  local hash="" hash_json="null"
+  local hash_json="null"
   if [[ -n "$term" ]]; then
-    hash="$(term_hash "$term")"
+    [[ -n "$hash" ]] || hash="$(term_hash "$term")"
     [[ -n "$hash" ]] && hash_json="\"$hash\""
   fi
   local sid_json="null"
@@ -675,12 +677,33 @@ reason_id_for_verdict() {
   esac
 }
 
+# term_hint: $1=term_hash(空でもよい) -> repo-ref 系の理由文の末尾に足す案内。
+# 語の平文は出さない(README の「Verdict ledger」)。`explain` は人の端末で実行する
+# 読み取りで、迂回手段ではない(鍵と denylist は人の端末にしか無い)。bypass の
+# 手段(BLEEP_ALLOW)はここにも書かない(README、CONTRIBUTING)。
+term_hint() {
+  local hash="$1"
+  if [[ -n $hash ]]; then
+    printf ' 一致した語の term_hash: %s。語そのものは、人の端末で `%s explain %s` を実行すると確認できます(出力に非公開名が出るので、エージェントは実行しないでください)。' "$hash" "$SELF" "$hash"
+  fi
+  printf ' 次の一手: 該当の語を伏せて書き直すか、人に確認を求めてください。人が偽陽性と判断した場合は、allow-stopwords.txt に追加します(README の Configuration 参照)。'
+}
+
 # emit_verdict: $1=deny|ask $2=reason(理由文) $3=reason_id
 #               $4=match_class(既定 none) $5=平文のマッチ語(既定空)
 # レッジャーに書いてから理由を印字し、対応する exit code で終了する。
 emit_verdict() {
   local verdict="$1" reason="$2" reason_id="$3" match_class="${4:-none}" term="${5-}" detail="${6-}"
-  ledger_write "$verdict" "$reason_id" "$match_class" "$term" "$detail"
+  local hash=""
+  if [[ -n $term ]]; then
+    # 語の平文は理由文に出さない。代わりに、レッジャーと同じ term_hash(鍵つきの
+    # ハッシュ。語は復元できない)と、人が語を確かめる手順、エージェントの次の一手を
+    # 添える。レッジャーを無効にしている(DO_NOT_TRACK)ときは、鍵を作らないよう
+    # ハッシュを出さない。
+    ledger_enabled && hash="$(term_hash "$term")"
+    reason+="$(term_hint "$hash")"
+  fi
+  ledger_write "$verdict" "$reason_id" "$match_class" "$term" "$detail" "$hash"
   printf '%s\n' "$reason"
   case "$verdict" in
     deny) exit 2 ;;
@@ -1248,7 +1271,7 @@ cmd_scan_bash_command() {
       else
         where="本文ファイルの中身"
       fi
-      reason="$(verdict_reason "$v" "$c") 一致した場所: ${where}。語そのものは bleep explain で確認できます。"
+      reason="$(verdict_reason "$v" "$c") 一致した場所: ${where}。"
       emit_verdict "$v" "$reason" "$(reason_id_for_verdict "$v" "$c")" "$c" "$t"
     fi
   fi
@@ -1562,6 +1585,32 @@ acme で議論した"
       echo "FAIL(ledger: 1回の deny で1行のはず): $(cat "$BLEEP_LEDGER_DIR/bleep.jsonl")" >&2
       fails=$((fails + 1))
     fi
+  fi
+
+  # 理由文(#102): 語の平文は出さず、レッジャーと同じ term_hash と、人の端末での
+  # explain の手順(実行できる絶対パスつき)、エージェントの次の一手を添える。
+  local reason_out ledger_hash
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  reason_out="$(BLEEP_HOST=claude "$SELF" scan <<< "acme/secret-project の件" 2>&1)"
+  set -e
+  ledger_hash="$(tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl" | sed -n 's/.*"term_hash":"\([0-9a-f]*\)".*/\1/p')"
+  if [[ -z $ledger_hash || $reason_out != *"term_hash: $ledger_hash"* || $reason_out != *"$SELF explain $ledger_hash"* || $reason_out != *'次の一手'* ]]; then
+    echo "FAIL(#102: 理由文にレッジャーと同じ term_hash・explain の実行手順・次の一手が要る): $reason_out" >&2
+    fails=$((fails + 1))
+  fi
+  if [[ $reason_out == *'acme/secret-project'* ]]; then
+    echo "FAIL(#102: 理由文に平文のマッチ語が出ている): $reason_out" >&2
+    fails=$((fails + 1))
+  fi
+  # レッジャーを無効にしている間は、ハッシュのために鍵を作らない。次の一手は出す。
+  rm -rf "$BLEEP_LEDGER_DIR"
+  set +e
+  reason_out="$(DO_NOT_TRACK=1 BLEEP_HOST=claude "$SELF" scan <<< "acme/secret-project の件" 2>&1)"
+  set -e
+  if [[ $reason_out == *'term_hash:'* || $reason_out != *'次の一手'* || -e "$BLEEP_LEDGER_DIR/hmac-key" ]]; then
+    echo "FAIL(#102: DO_NOT_TRACK ではハッシュを出さず鍵も作らない): $reason_out" >&2
+    fails=$((fails + 1))
   fi
 
   # pass では書かない。

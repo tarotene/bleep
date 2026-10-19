@@ -515,10 +515,21 @@ word-hard	gizmo
 This rehashes every current denylist entry with the same machine-local key
 and prints whichever one matches, alongside its `match_class`. It does not
 touch `match_verdict` and writes nothing to the ledger — it is purely a
-read of the current denylist, not a re-run of any verdict. **The deny/ask
-reason text never mentions this subcommand**, for the same reason it never
-mentions `BLEEP_ALLOW` (see [Scope](#scope)): the constrained party should not be
-able to read its own way out of a false positive.
+read of the current denylist, not a re-run of any verdict.
+
+**What the deny/ask reason says** (#102). A repo-ref reason ends with the
+`term_hash` of the match, the exact command to resolve it, and a next step for
+the agent (rewrite the text without the term, or ask the person). `bleep` is
+normally not on `PATH` — the shim reaches it through `BLEEP_BIN` — so the command
+is spelled with the absolute path of the `bleep` that produced the reason.
+`explain` is not a bypass: it changes no verdict, and a denied text stays denied
+until the term is gone or the person allows it. What it prints is a denylist
+entry in plaintext, which is why the reason tells the agent not to run it and the
+person to run it on their own terminal. The reason still never names the matched
+term itself and never mentions `BLEEP_ALLOW` (see [Scope](#scope)): the
+constrained party should not be able to read its own way out of a false
+positive. With the ledger off (`DO_NOT_TRACK`, `BLEEP_NO_LEDGER=1`) the hash is
+not shown, so that no key is created for it, and only the next step remains.
 
 ## Scope
 
