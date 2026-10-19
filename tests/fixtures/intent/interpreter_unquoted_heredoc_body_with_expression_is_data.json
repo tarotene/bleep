@@ -1,0 +1,4 @@
+{
+  "command": "python3 - <<EOF\nrun: gh issue create --repo \"${{ github.repository }}\" --title x\nEOF",
+  "expect": []
+}

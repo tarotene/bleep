@@ -1126,7 +1126,7 @@ cmd_scan_pre_push() {
 # NONCANONICAL_CODES)-> 理由文。正準形の定義と、書き直し方を案内する。bypass 手段は
 # ここに書かない(README 参照)。
 noncanonical_reason_text() {
-  local base='gh の投稿は、次の正準形だけを受け付けます: gh <pr|issue> <create|edit|comment> -R OWNER/REPO … --body-file /絶対/パス(本文は先にファイルへ書き、絶対パスのリテラルで渡す。release は --notes-file)。'
+  local base='gh の投稿は、次の正準形だけを受け付けます: gh <pr|issue> <create|edit|comment> -R OWNER/REPO … --body-file /絶対/パス(本文は先にファイルへ書き、絶対パスのリテラルで渡す。release は --notes-file)。本文ファイルを持つ投稿は、その投稿だけを 1 回のコマンドとして実行します(&&・;・| で他のコマンドと並べない)。'
   local why
   case "$1" in
     no-repo) why='宛先 -R OWNER/REPO がありません(cwd の origin からは推測しません)。' ;;
@@ -2094,6 +2094,9 @@ CASES55
 2|sh -c 'gh issue comment 1 -R pub/repo --body-file @gb@/clean.md'
 0|gh pr view 5 -R pub/repo && gh pr checks 5 && gh run watch 1
 0|gh pr merge 5 -R pub/repo --squash
+0|gh issue create --help
+0|gh repo edit --help
+0|gh pr create -R pub/repo --help | head -5
 CASESWRAP
 
   # #78 の F2(TOCTOU): 前段が本文ファイルを書き換える形は、照合した中身と

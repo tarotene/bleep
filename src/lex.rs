@@ -302,6 +302,16 @@ pub fn split_command_segments(cmd: &str) -> Vec<Segment> {
             }
             '&' | '|' => {
                 let two: String = chars[i..(i + 2).min(n)].iter().collect();
+                // `>&`・`<&`(fd の複製、POSIX 2.7.5/2.7.6)と `&>`(bash の拡張)の `&` は
+                // リダイレクトの一部で、非同期リストの区切りではない。
+                if c == '&'
+                    && two != "&&"
+                    && (buf.ends_with('>') || buf.ends_with('<') || chars.get(i + 1) == Some(&'>'))
+                {
+                    buf.push(c);
+                    i += 1;
+                    continue;
+                }
                 if two == "&&" || two == "||" || two == "|&" {
                     flush(&mut segments, &mut buf);
                     i += 2;
@@ -1241,11 +1251,57 @@ mod tests {
     }
 
     #[test]
+    fn gh_text_inside_an_argument_is_data() {
+        // 引数の文字列の中の `gh …` は、コマンド位置でないのでデータ(#84)。
+        assert!(posts("echo \"gh pr create -R pub/x --title t\"").is_empty());
+        assert!(posts("tool --arg '{\"cmd\": \"gh issue create --title x\"}'").is_empty());
+        assert!(posts("tool --arg \"gh issue create --repo pub/x\"").is_empty());
+    }
+
+    #[test]
     fn interpreter_heredoc_bodies_are_data() {
         // インタプリタ(`python3 -`)の標準入力はシェルではなくそのインタプリタが読む。
         // 本文の `gh pr create` 行はデータ(引用符あり・なしの両方)。
         assert!(posts("python3 - <<'E'\ngh pr create -R a/b --title t\nE").is_empty());
         assert!(posts("python3 - <<E\ngh pr create -R a/b --title t\nE").is_empty());
+        // GitHub Actions の YAML 本文にある、非リテラルな `--repo` の値も同じ(#90)。
+        assert!(posts(
+            "python3 - <<'E'\nrun: gh issue create --repo \"${{ github.repository }}\" --title x\nE"
+        )
+        .is_empty());
+        assert!(posts(
+            "python3 - <<E\nrun: gh issue create --repo \"${{ github.repository }}\" --title x\nE"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn fd_duplication_ampersand_is_not_a_separator() {
+        // `2>&1`・`<&0`・`&>f` の `&` はリダイレクトの一部(POSIX 2.7.5/2.7.6、bash の `&>`)。
+        for (cmd, want) in [
+            ("x 2>&1", 1usize),
+            ("x 2>&1 | tail -1", 2),
+            ("x <&0", 1),
+            ("x &> f", 1),
+            ("x &>> f", 1),
+            ("x >&2 && y", 2),
+            // 単独の `&`(バックグラウンド)は従来どおり区切り。
+            ("x & y", 2),
+            ("x && y", 2),
+        ] {
+            assert_eq!(split_nonempty(cmd).len(), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn stderr_redirect_keeps_a_body_file_post_alone() {
+        // パイプを外した後に `2>&1` が残っても、投稿は単独のコマンド(往復を増やさない)。
+        let ps = posts("gh issue create -R pub/r --title t --body-file /tmp/x.md 2>&1");
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].noncanonical, None);
+        // パイプは従来どおり単独でない。
+        let ps = posts("gh issue create -R pub/r --title t --body-file /tmp/x.md 2>&1 | tail -1");
+        assert_eq!(ps[0].noncanonical, Some("not-alone"));
     }
 
     #[test]

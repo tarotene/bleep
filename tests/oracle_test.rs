@@ -84,6 +84,12 @@ const CORPUS: &[Case] = &[
     ),
     case("echo \"$(echo \")\")\" && gh issue close 5 -R pub/a", true),
     case("echo \"`echo \"a|b\"`\" && gh issue close 5 -R pub/a", true),
+    // fd の複製(`2>&1`・`<&0`)と `&>` の `&` は区切りではない
+    case("gh issue close 5 -R pub/a 2>&1", true),
+    case(
+        "gh issue close 5 -R pub/a 2>&1 && gh pr close 2 -R pub/b &> /dev/null",
+        true,
+    ),
     // 引用符・コメントの中のデータ
     case("echo '$(gh issue close 5 -R pub/a)'", true),
     case("echo \"it's\" '$(gh pr close 2 -R pub/b)'", true),
