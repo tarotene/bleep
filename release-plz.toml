@@ -2,6 +2,14 @@
 # bleep-hook は単一クレート(Cargo workspace ではない)なので、
 # rust-repo-governance テンプレートが行う「canonical crate だけがタグを
 # 持つ」分割は不要 — [workspace] レベルで直接有効化する。
+# bleep-hook は publish = false(crates.io に載せない)。既定の release-plz は版を
+# crates.io で確かめるため、載っていないこのクレートでは毎回「nothing to release」に
+# なり、tag も release も切られなかった。git_only は版を git tag から決める
+# モードで、publish = false のクレートも tag され、tag が無ければ初回 release として
+# 扱われる。
+# release-plz, "Configuration — git_only", https://release-plz.dev/docs/config
+# (取得 2026-10-19)
+git_only = true
 git_release_enable = true
 git_tag_enable = true
 git_release_name = "v{{ version }}"
