@@ -292,10 +292,25 @@ pub fn recognize(t: &[String]) -> Option<GhPost> {
     if !known {
         return None;
     }
+    if sub != "api" && asks_for_help(&t[idx + 2..], sub) {
+        return None;
+    }
     if sub == "api" {
         return recognize_api(t, idx);
     }
     Some(recognize_cli(t, idx, sub, action))
+}
+
+/// `--help` / `-h` は、gh(cobra)が使い方を表示して終わる。何も投稿しないので
+/// 文法の外に置く。ただし値を取るフラグの値の位置(`--title --help`)の `--help` は
+/// 値として食われ、投稿は実行されるので、直前が `-` で始まるトークンのときは
+/// 従来どおり投稿として扱う(過剰側)。`gh repo edit` の `-h` は `--homepage` の
+/// 短縮形(`REPO_EDIT_VALUE_FLAGS`)なので、`repo` では `--help` だけを見る。
+fn asks_for_help(args: &[String], sub: &str) -> bool {
+    args.iter().enumerate().any(|(k, a)| {
+        let is_help = a == "--help" || (a == "-h" && sub != "repo");
+        is_help && (k == 0 || !args[k - 1].starts_with('-'))
+    })
 }
 
 fn recognize_cli(t: &[String], idx: usize, sub: &str, action: &str) -> GhPost {
@@ -574,9 +589,23 @@ mod tests {
             "gh api -X GET repos/pub/repo/issues -f q=x",
             "gh repo view pub/repo",
             "git push",
+            // 使い方の表示だけで、何も投稿しない。
+            "gh issue create --help",
+            "gh pr create -h",
+            "gh repo edit --help",
+            "gh pr create -R pub/repo --help",
+            "gh release create --help",
         ] {
             assert!(rec(cmd).is_none(), "{cmd}");
         }
+    }
+
+    #[test]
+    fn help_in_a_value_position_is_still_a_post() {
+        // `--title` の値として食われる `--help` は、投稿が実行される。
+        assert!(rec("gh issue create -R pub/repo --title --help --body-file /tmp/b.md").is_some());
+        // `gh repo edit` の `-h` は `--homepage` の短縮形。
+        assert!(rec("gh repo edit -h https://example.com pub/repo").is_some());
     }
 
     #[test]

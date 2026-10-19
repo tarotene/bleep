@@ -348,7 +348,12 @@ surface: `pr create|edit|comment|review|close|merge|reopen`,
 `gist create`, and `api` with a write method (`-X`/`--method` `POST`, `PUT` or
 `PATCH`, or `-f`/`-F`/`--input` without a method). A `gh` command that is not in
 that table — a read (`pr view`, `run watch`, a `gh api` GET), or an operation
-with no free text (`pr ready`) — is not scanned, as before. A post is
+with no free text (`pr ready`) — is not scanned, as before. So is a call that
+only asks for usage (`--help`, or `-h` outside `gh repo edit`, where `-h` is
+`--homepage`): it prints help and posts nothing. A `--help` sitting where a flag
+value goes (`--title --help`) is consumed as that value, so it stays a post. The
+`&` of `2>&1`, `<&0` and `&>file` is part of the redirection, not a command
+separator, so a post followed by `2>&1` is still a standalone command. A post is
 **canonical** when:
 
 - the destination is a literal `-R|--repo OWNER/REPO` (position-independent,

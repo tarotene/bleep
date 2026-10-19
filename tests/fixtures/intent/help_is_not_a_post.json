@@ -1,0 +1,4 @@
+{
+  "command": "gh issue create --help",
+  "expect": []
+}

@@ -1,0 +1,4 @@
+{
+  "command": "tool --arg '{\"cmd\": \"gh issue create --title x\"}'",
+  "expect": []
+}
