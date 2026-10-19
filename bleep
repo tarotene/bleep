@@ -2086,6 +2086,10 @@ CASESMULTI
 2|gh api -X POST repos/pub/repo/issues -f body="acme/secret-project"
 2|gh api repos/pub/repo/issues -f body="acme/secret-project"
 2|gh api graphql -f query="acme/secret-project"
+0|gh api graphql -f query='query($id:ID!){node(id:$id){id}}' -F id=X
+0|gh api graphql -f query='{ viewer { login } }'
+0|gh api graphql -f query='query{search(query:"acme/secret-project",type:REPOSITORY,first:1){repositoryCount}}'
+2|gh api graphql -f query='mutation{addStar(input:{starrableId:"acme/secret-project"}){clientMutationId}}'
 0|gh api -X POST repos/priv/repo/issues -f body="acme/secret-project"
 2|gh api repos/{owner}/{repo}/issues -f body="acme/secret-project"
 0|gh api -X GET repos/pub/repo/issues -f q="acme/secret-project"

@@ -1,0 +1,4 @@
+{
+  "command": "gh api graphql -f query='query($id:ID!){node(id:$id){id}}' -F id=X",
+  "expect": []
+}

@@ -438,10 +438,26 @@ fn api_path_dest(path: &str) -> ApiDest {
     }
 }
 
+/// GraphQL の query 文書が読み取りだけか。先頭が `query`(操作名・変数宣言が続く)か
+/// `{`(省略形の query)で、語 `mutation` を含まないもの。`$id:ID!` のような GraphQL の
+/// 変数宣言はシェルの変数展開と字面で区別できないので、`$` の有無は見ない。
+/// `query` の値が `$Q`・`@file` なら先頭が合わず、従来どおり投稿として扱う。
+/// シェル変数が展開されて mutation になる形は、不透明な実行と同じ種類の取りこぼし
+/// (ADR-0005)で、セキュリティ境界は主張しない。
+fn is_graphql_read(doc: &str) -> bool {
+    let d = doc.trim_start();
+    let starts_like_a_query = d.starts_with('{')
+        || d.strip_prefix("query")
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'));
+    starts_like_a_query && !d.contains("mutation")
+}
+
 fn recognize_api(t: &[String], idx: usize) -> Option<GhPost> {
     let rest = &t[idx + 1..];
     let mut method = String::new();
     let mut has_field = false;
+    let mut has_input = false;
+    let mut query: Option<&str> = None;
     let mut path: Option<&str> = None;
     let mut viol = Violation::default();
     let mut body_sources: Vec<String> = Vec::new();
@@ -454,18 +470,25 @@ fn recognize_api(t: &[String], idx: usize) -> Option<GhPost> {
             j += n;
         } else if let Some((v, n)) = flag_value(rest, j, &["input"]) {
             has_field = true;
+            has_input = true;
             take_body_file(v, &mut body_sources, &mut viol);
             j += n;
         } else if let Some((v, n)) = flag_value(rest, j, &["field", "F"]) {
             has_field = true;
-            if let Some((_, val)) = v.split_once('=') {
+            if let Some((k, val)) = v.split_once('=') {
+                if k == "query" {
+                    query = Some(val);
+                }
                 if let Some(p) = val.strip_prefix('@') {
                     take_body_file(p, &mut body_sources, &mut viol);
                 }
             }
             j += n;
-        } else if let Some((_, n)) = flag_value(rest, j, &["raw-field", "f"]) {
+        } else if let Some((v, n)) = flag_value(rest, j, &["raw-field", "f"]) {
             has_field = true;
+            if let Some(("query", val)) = v.split_once('=') {
+                query = Some(val);
+            }
             j += n;
         } else if matches!(
             a,
@@ -502,6 +525,11 @@ fn recognize_api(t: &[String], idx: usize) -> Option<GhPost> {
         method.as_str()
     };
     if !matches!(effective.to_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
+        return None;
+    }
+    // GraphQL は読み取りも書き込みも POST で、`-f query=…` が必ず付く。method では
+    // 区別できないので、リテラルの query 文書そのものを見る(#83)。
+    if path == Some("graphql") && !has_input && query.is_some_and(is_graphql_read) {
         return None;
     }
 
@@ -590,6 +618,11 @@ mod tests {
             "gh repo view pub/repo",
             "git push",
             // 使い方の表示だけで、何も投稿しない。
+            // GraphQL の読み取り query は、`-f query=` が付いても投稿でない(#83)。
+            "gh api graphql -f query='query($id:ID!){node(id:$id){id}}' -F id=X",
+            "gh api graphql -f query='{ viewer { login } }'",
+            "gh api graphql --raw-field query='query Q { viewer { login } }'",
+            "gh api graphql -F query='query{viewer{login}}'",
             "gh issue create --help",
             "gh pr create -h",
             "gh repo edit --help",
@@ -597,6 +630,21 @@ mod tests {
             "gh release create --help",
         ] {
             assert!(rec(cmd).is_none(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn graphql_writes_and_unreadable_documents_are_still_posts() {
+        for cmd in [
+            "gh api graphql -f query='mutation{addComment(input:{}){clientMutationId}}'",
+            "gh api graphql -f query='query{x} mutation{y}'",
+            "gh api graphql -f query=\"$Q\"",
+            "gh api graphql -F query=@/tmp/q.graphql",
+            "gh api graphql --input /tmp/q.json",
+            "gh api graphql -f query=queryX",
+            "gh api graphql -f other=x",
+        ] {
+            assert!(rec(cmd).is_some(), "{cmd}");
         }
     }
 

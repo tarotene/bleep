@@ -348,7 +348,11 @@ surface: `pr create|edit|comment|review|close|merge|reopen`,
 `gist create`, and `api` with a write method (`-X`/`--method` `POST`, `PUT` or
 `PATCH`, or `-f`/`-F`/`--input` without a method). A `gh` command that is not in
 that table — a read (`pr view`, `run watch`, a `gh api` GET), or an operation
-with no free text (`pr ready`) — is not scanned, as before. So is a call that
+with no free text (`pr ready`) — is not scanned, as before. So is a `gh api graphql`
+whose `-f`/`-F query=` document is a literal read: it starts with `query` or `{`
+and has no `mutation` (GraphQL carries reads and writes in the same POST, so the
+method cannot tell them apart; `query="$Q"`, `query=@file` and `--input` stay
+posts). So is a call that
 only asks for usage (`--help`, or `-h` outside `gh repo edit`, where `-h` is
 `--homepage`): it prints help and posts nothing. A `--help` sitting where a flag
 value goes (`--title --help`) is consumed as that value, so it stays a post. The

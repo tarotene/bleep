@@ -114,7 +114,10 @@ Inputs" と同じ構造)。コマンドを後から検査する側は、書き�
 
    **文法の対象外は pass のまま**: 読み取り(`pr view`・`run watch`・`api` の GET)や、
    自由記述を持たない操作(`pr ready` など)、表に載っていない `gh` のサブコマンドは、
-   従来どおり検査しない。表に載っていないものを一律 deny にすると `gh pr merge` の
+   従来どおり検査しない。`gh api graphql` は、読み取りも書き込みも POST で `-f query=`
+   が付くので method では区別できない。リテラルの query 文書が `query` か `{` で始まり
+   `mutation` を含まないものは、読み取りとして対象外にする(#83。値が `$Q`・`@file`、
+   または `--input` なら従来どおり投稿)。表に載っていないものを一律 deny にすると `gh pr merge` の
    ような日常の操作まで止まり、偽陽性の多さで迂回が常態化する(README の
    「偽陽性の高さは、エージェントにも人間にも迂回を常態化させる」)。Dejector も
    SQL の部分文法を検証するだけで、SQL でないものは対象外である。宛先が PRIVATE/
@@ -164,7 +167,8 @@ gh の正準形(決定 2)の執行点:
 - `bleep` — `cmd_scan_bash_command`(投稿ごとの可視性判定、`gh-noncanonical` の deny)、
   `noncanonical_reason_text`、selftest
 - `tests/fixtures/intent/*.json` — 適合 fixture(正準形と文法外のコマンド →
-  期待される意図。31 件)
+  期待される意図。31 件。`api_graphql_query_is_not_a_post.json`・
+  `api_graphql_mutation_is_a_post.json` は #83 で追加)
 - `tests/intent_test.rs`・`tests/lex_protocol_test.rs`・`tests/host_test.rs`
 
 ## Consequences
