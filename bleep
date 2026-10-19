@@ -396,23 +396,36 @@ refresh_private_repo_cache() {
   done < <(read_lines "$ORGS_FILE")
   ((${#owners[@]} > 0)) || return 1
 
-  local tmp got_any=false o vis nwos
-  tmp="$(mktemp "$STATE_DIR/private-repos-cache.txt.XXXXXX")"
-  : > "$tmp"
+  # 遅い `gh repo list` の間は、一時ファイルを持たない。hook のタイムアウトで
+  # このプロセスが殺されると、その時点の一時ファイルは誰も消さずに残る。取得結果は
+  # 変数に溜め、書き込みの短い区間(mktemp から mv まで)だけ一時ファイルを置く。
+  sweep_stale_cache_temp_files
+  local got_any=false o vis nwos all=""
   for o in "${owners[@]}"; do
     for vis in private internal; do
       if nwos="$("$GH_BIN" repo list "$o" --visibility "$vis" --limit 500 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null)"; then
-        [[ -n $nwos ]] && { printf '%s\n' "$nwos" >> "$tmp"; got_any=true; }
+        [[ -n $nwos ]] && { all+="$nwos"$'\n'; got_any=true; }
       fi
     done
   done
   if [[ $got_any == true ]]; then
-    sort -u "$tmp" -o "$tmp"
+    local tmp
+    tmp="$(mktemp "$STATE_DIR/private-repos-cache.txt.XXXXXX")"
+    printf '%s' "$all" | sort -u > "$tmp"
     mv "$tmp" "$PRIVATE_CACHE"
     return 0
   fi
-  rm -f "$tmp"
   return 1
+}
+
+# sweep_stale_cache_temp_files: 過去に殺されたプロセスが残した、キャッシュ更新の
+# 一時ファイル(mktemp の XXXXXX)を消す。書き込みの区間は一瞬なので、60 分より古い
+# ものは持ち主がいない。進行中の別プロセスの新しい一時ファイルには触れない。
+sweep_stale_cache_temp_files() {
+  [[ -d $STATE_DIR ]] || return 0
+  find "$STATE_DIR" -maxdepth 1 -type f \
+    \( -name 'private-repos-cache.txt.??????' -o -name 'visibility-cache.tsv.??????' \) \
+    -mmin +60 -delete 2>/dev/null || true
 }
 
 # private_repo_names: キャッシュが TTL 内ならそれを、無ければ live 取得して
@@ -1522,6 +1535,43 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 2 ]] || { echo "FAIL(BLEEP_SOFT_MAXLEN=0 で降格無効): rc=$rc out=$out" >&2; fails=$((fails + 1)); }
+
+  # キャッシュ更新の一時ファイル: 遅い取得の間は存在せず、更新後も残らない。
+  # 過去に殺されたプロセスの古い残骸(60 分より古い)は回収し、新しいものには触れない。
+  local probe_hit="$tmp/probe-hit" stale_tmp="$STATE_DIR/private-repos-cache.txt.StaleA" fresh_tmp="$STATE_DIR/private-repos-cache.txt.FreshB"
+  rm -f "$probe_hit"
+  cat > "$tmp/bin-gh-probe" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "repo list")
+    # 取得中に、キャッシュ更新の一時ファイルがあれば記録する(テストが置いた
+    # 新しい残骸 FreshB は別の更新の進行中を装ったもので、数えない)。
+    for f in "$PROBE_STATE_DIR"/private-repos-cache.txt.??????; do
+      [[ -e $f && $f != *.FreshB ]] && : > "$PROBE_HIT"
+    done
+    printf 'test-owner/my-private-tool\n'
+    ;;
+  "api user") printf 'test-owner' ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod +x "$tmp/bin-gh-probe"
+  : > "$stale_tmp"
+  : > "$fresh_tmp"
+  touch -d '2 hours ago' "$stale_tmp" 2>/dev/null || touch -t "$(date -v-2H +%Y%m%d%H%M 2>/dev/null)" "$stale_tmp"
+  rm -f "$PRIVATE_CACHE"
+  (
+    export BLEEP_GH_BIN="$tmp/bin-gh-probe" PROBE_STATE_DIR="$STATE_DIR" PROBE_HIT="$probe_hit"
+    init_vars
+    refresh_private_repo_cache
+  ) || { echo "FAIL(キャッシュ更新が失敗した)" >&2; fails=$((fails + 1)); }
+  [[ ! -e $probe_hit ]] || { echo "FAIL(遅い取得の間に一時ファイルがある。殺されると残る)" >&2; fails=$((fails + 1)); }
+  [[ ! -e $stale_tmp ]] || { echo "FAIL(60 分より古い一時ファイルが回収されていない)" >&2; fails=$((fails + 1)); }
+  [[ -e $fresh_tmp ]] || { echo "FAIL(新しい一時ファイルまで消している。進行中の更新を壊す)" >&2; fails=$((fails + 1)); }
+  grep -qx 'test-owner/my-private-tool' "$PRIVATE_CACHE" 2>/dev/null || { echo "FAIL(キャッシュの中身): $(cat "$PRIVATE_CACHE" 2>/dev/null)" >&2; fails=$((fails + 1)); }
+  [[ -z "$(find "$STATE_DIR" -maxdepth 1 -name 'private-repos-cache.txt.??????' ! -name '*FreshB' 2>/dev/null)" ]] || { echo "FAIL(更新の後に一時ファイルが残っている)" >&2; fails=$((fails + 1)); }
+  rm -f "$fresh_tmp"
+  init_vars
 
   # 旧形式(裸名のみ)キャッシュを置いても、次回参照時に TTL 無視で
   # 自動再取得され owner/name 形に復元される(#44 D5)。
