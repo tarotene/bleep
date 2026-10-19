@@ -38,6 +38,8 @@
 #     無効化しない — 「ほぼ確実に意図しない漏洩」の強さを緩めないため)。
 #   $XDG_CONFIG_HOME/bleep/allow-paths.txt      — audit 対象から
 #     除外するファイルパスの正規表現。
+#   $XDG_CONFIG_HOME/bleep/allow-tools.txt      — ツール名に全体一致する
+#     Bash 以外のツール(MCP)を scan の検査から外す拡張正規表現(#95)。
 #
 # 縮退(ADR-0005 の binary-existence gating に倣う): fail-loud に寄せている。
 # 判定不能を無言の pass にはしない(下記の各関数のコメント参照)。ただし
@@ -140,6 +142,7 @@ init_vars() {
   ALLOW_STOPWORDS_FILE="${BLEEP_ALLOW_STOPWORDS_FILE:-$CONFIG_DIR/allow-stopwords.txt}"
   ALLOW_REGEXES_FILE="${BLEEP_ALLOW_REGEXES_FILE:-$CONFIG_DIR/allow-regexes.txt}"
   ALLOW_PATHS_FILE="${BLEEP_ALLOW_PATHS_FILE:-$CONFIG_DIR/allow-paths.txt}"
+  ALLOW_TOOLS_FILE="${BLEEP_ALLOW_TOOLS_FILE:-$CONFIG_DIR/allow-tools.txt}"
   OWNER="${BLEEP_OWNER:-}"
   GH_BIN="${BLEEP_GH_BIN:-gh}"
   LEX_BIN="${BLEEP_LEX_BIN:-bleep-hook}" # cmd_scan_bash_command の字句解析(D1)
@@ -185,7 +188,7 @@ BLEEP_ALLOW=1 で3つの scan* サブコマンドを意識的に bypass でき�
   — フックプロセスの cwd への暗黙依存を解消する)。
 
 設定は $XDG_CONFIG_HOME/bleep/ 以下、一切コミットしない:
-  orgs.txt / repos.txt / allow-stopwords.txt / allow-regexes.txt / allow-paths.txt
+  orgs.txt / repos.txt / allow-stopwords.txt / allow-regexes.txt / allow-paths.txt / allow-tools.txt
 orgs.txt が存在しなければ scan* は ask を返す(空ファイルは明示的な opt-out)。
 
 doctor: 導入の健全性を検査する。hooks/hooks.json の matcher が Bash と mcp__
@@ -910,11 +913,28 @@ repo_visibility() {
 
 # ---- サブコマンド -----------------------------------------------------------
 
+# tool_is_allowed: BLEEP_TOOL_NAME が allow-tools.txt のいずれかの拡張正規表現に
+# 全体一致するか(#95)。bleep は宛先の公開/非公開を知らない(Slack の下書きや、組織内の
+# チャンネルへの投稿が公開面かどうかは、ツール名からは分からない)ので、検査から外す
+# ツールは人がツール名で宣言する。allow-stopwords などと同じく、置き場は設定ディレクトリ。
+# 不正な正規表現は一致しない扱い(外れる側 = 検査する側に倒す)。読むのは `scan`
+# (Bash 以外のツール)だけで、Bash は `scan-bash-command` なのでここを通らない。
+tool_is_allowed() {
+  local name="${BLEEP_TOOL_NAME:-}" re
+  [[ -n $name ]] || return 1
+  while IFS= read -r re; do
+    [[ -n $re ]] || continue
+    [[ $name =~ ^($re)$ ]] && return 0
+  done < <(read_lines "$ALLOW_TOOLS_FILE")
+  return 1
+}
+
 # cmd_scan: 任意のテキスト(stdin または FILE)を denylist と突き合わせる。
 # MCP tool_input など、シェルコマンド文字列でない入力全般が対象。stdin/FILE
 # を読めなければ ask にエスカレートする(以前は無言 exit 0 だった)。
 cmd_scan() {
   local src="${1--}" text
+  tool_is_allowed && exit 0
   if [[ $src == "-" || -z $src ]]; then
     if ! text="$(cat)"; then
       emit_verdict ask "stdin を読み取れませんでした。" engine-unavailable
@@ -1381,6 +1401,7 @@ selftest() {
   export BLEEP_ALLOW_STOPWORDS_FILE="$tmp/config/allow-stopwords.txt"
   export BLEEP_ALLOW_REGEXES_FILE="$tmp/config/allow-regexes.txt"
   export BLEEP_ALLOW_PATHS_FILE="$tmp/config/allow-paths.txt"
+  export BLEEP_ALLOW_TOOLS_FILE="$tmp/config/allow-tools.txt"
   # 実ホストの ~/.config/publish-guard の有無で理由文が変わらないよう固定する
   # (このパスは作らない — 「移行未了」を見るケースだけ別パスを渡す)。
   export BLEEP_LEGACY_CONFIG_DIR="$tmp/legacy-config-absent"
@@ -1612,6 +1633,38 @@ acme で議論した"
     echo "FAIL(#102: DO_NOT_TRACK ではハッシュを出さず鍵も作らない): $reason_out" >&2
     fails=$((fails + 1))
   fi
+
+  # allow-tools.txt(#95): ツール名に全体一致する MCP ツールは repo-ref の検査から外す。
+  # 一致しないツール、部分一致だけのツール、不正な正規表現は、従来どおり検査する。
+  printf '# 組織内の Slack\nmcp__slack__.*\nmcp__chat__draft\n[unclosed\n' > "$BLEEP_ALLOW_TOOLS_FILE"
+  local at_name at_want at_rc
+  for at_case in \
+    'mcp__slack__slack_send_message_draft|0' \
+    'mcp__chat__draft|0' \
+    'mcp__github__create_issue|2' \
+    'mcp__chat__draft_extra|2' \
+    'x_mcp__slack__draft|2' \
+    'Bash|2'; do
+    at_name="${at_case%%|*}" at_want="${at_case##*|}"
+    set +e
+    (BLEEP_HOST=claude BLEEP_TOOL_NAME="$at_name" "$SELF" scan <<< "acme/secret-project の件") > /dev/null 2>&1
+    at_rc=$?
+    set -e
+    [[ $at_rc -eq $at_want ]] || { echo "FAIL(#95 allow-tools: $at_name): 期待=$at_want 実際=$at_rc" >&2; fails=$((fails + 1)); }
+  done
+  # Bash の `scan-bash-command` には効かない(ツール名での除外が全面バイパスにならない)。
+  set +e
+  (BLEEP_HOST=claude BLEEP_TOOL_NAME=Bash "$SELF" scan-bash-command "gh issue comment 1 -R pub/repo --body 'acme/secret-project'") > /dev/null 2>&1
+  at_rc=$?
+  set -e
+  [[ $at_rc -eq 2 ]] || { echo "FAIL(#95 allow-tools は scan-bash-command に効かない): 期待=2 実際=$at_rc" >&2; fails=$((fails + 1)); }
+  printf '.*\n' > "$BLEEP_ALLOW_TOOLS_FILE"
+  set +e
+  (BLEEP_HOST=claude BLEEP_TOOL_NAME=Bash "$SELF" scan-bash-command "gh issue comment 1 -R pub/repo --body 'acme/secret-project'") > /dev/null 2>&1
+  at_rc=$?
+  set -e
+  [[ $at_rc -eq 2 ]] || { echo "FAIL(#95 allow-tools の .* でも scan-bash-command は検査する): 期待=2 実際=$at_rc" >&2; fails=$((fails + 1)); }
+  rm -f "$BLEEP_ALLOW_TOOLS_FILE"
 
   # pass では書かない。
   rm -rf "$BLEEP_LEDGER_DIR"
