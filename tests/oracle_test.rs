@@ -9,8 +9,11 @@
 //! - 精密性(`exact`): 認識された `gh` は、すべて実際に呼ばれる(偽陽性ゼロ)。
 //!   `||` の短絡や終端の無いヒアドキュメントのように、実行されなくても認識して
 //!   よい形(過剰側の近似)は `exact: false` にする
-//! - 既知の限界(`GAPS`): 文法の外に残ると ADR に書いた不透明な実行。認識されない
-//!   ことを固定する(境界が変わったら、ADR と一緒に直す)
+//! - 不透明な実行のうち deny にした 2 形(`OPAQUE`): コマンド名が変数、標準入力の
+//!   テキストをシェルが実行する形。実行はされるが宛先を取れないので、どの実行も覆う
+//!   deny(`*`)として認識されることを固定する
+//! - 既知の限界(`GAPS`): 文法の外に残ると ADR に書いた不透明な実行(ディスク上の
+//!   スクリプト、alias)。認識されないことを固定する(境界が変わったら、ADR と一緒に直す)
 //!
 //! 宛先は `pub/…` の架空の名前だけを使う(CONTRIBUTING.md)。
 
@@ -84,6 +87,13 @@ const CORPUS: &[Case] = &[
     ),
     case("echo \"$(echo \")\")\" && gh issue close 5 -R pub/a", true),
     case("echo \"`echo \"a|b\"`\" && gh issue close 5 -R pub/a", true),
+    // 不透明な 2 形の隣にある、認識されるべき形(偽陽性にしない)
+    case(
+        "cat <<'EOF' 2>&1 | bash\ngh issue close 5 -R pub/a\nEOF",
+        true,
+    ),
+    case("echo x | bash -c 'gh issue close 5 -R pub/a'", true),
+    case("echo x | env X=1 bash -c 'gh issue close 5 -R pub/a'", true),
     // fd の複製(`2>&1`・`<&0`)と `&>` の `&` は区切りではない
     case("gh issue close 5 -R pub/a 2>&1", true),
     case(
@@ -105,10 +115,27 @@ const CORPUS: &[Case] = &[
     case("echo $'a\\'b' $(gh issue close 5 -R pub/a)", true),
 ];
 
+/// 文法の外として deny にする不透明な実行(ADR-0005、#81)。実行はされるが、宛先を
+/// 取れないので、`opaque-exec` の疑似投稿(`*`)として認識される。
+const OPAQUE: &[&str] = &[
+    "f=gh; $f issue close 5 -R pub/gap",
+    "f=gh; \"$f\" issue close 5 -R pub/gap",
+    "f=gh; ${f} issue close 5 -R pub/gap",
+    "echo 'gh issue close 5 -R pub/gap' | bash",
+    "echo 'gh issue close 5 -R pub/gap' | sh -s",
+    "echo 'gh issue close 5 -R pub/gap' |& bash",
+    "x='gh issue close 5 -R pub/gap'; bash -c \"$x\"",
+    "echo 'gh issue close 5 -R pub/gap' |\nbash",
+];
+
 /// 文法の外に残る不透明な実行(ADR-0005)。実行はされるが、認識されない。
 const GAPS: &[&str] = &[
-    "f=gh; $f issue close 5 -R pub/gap",
-    "echo 'gh issue close 5 -R pub/gap' | bash",
+    // ディスク上のスクリプト
+    "printf 'gh issue close 5 -R pub/gap\\n' > s.sh; bash s.sh",
+    // alias
+    "shopt -s expand_aliases\nalias g=gh\ng issue close 5 -R pub/gap",
+    // 前置の語の後ろの変数(`timeout $T make` のような日常の形まで止めないので、検出のみ)
+    "f=gh; env $f issue close 5 -R pub/gap",
 ];
 
 /// 認識された投稿の宛先の集合。宛先を取れない投稿(`unparsable` など)は、どの
@@ -246,6 +273,22 @@ fn heredoc_lookalikes_never_hide_an_executed_command() {
                 "偽陰性(実行されたが認識されない): {cmd:?}"
             );
         }
+    }
+}
+
+#[test]
+fn opaque_executions_are_denied_as_a_whole() {
+    let Some(dir) = setup() else { return };
+    for cmd in OPAQUE {
+        assert!(
+            !executed(cmd, dir.path()).is_empty(),
+            "スタブが呼ばれない(テストの前提が崩れた): {cmd:?}"
+        );
+        assert_eq!(
+            recognized(cmd),
+            BTreeSet::from(["*".to_string()]),
+            "不透明な実行が、宛先を取れない deny として認識されない: {cmd:?}"
+        );
     }
 }
 

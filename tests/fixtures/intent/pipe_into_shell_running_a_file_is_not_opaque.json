@@ -1,0 +1,4 @@
+{
+  "command": "echo x | bash /tmp/run.sh",
+  "expect": []
+}

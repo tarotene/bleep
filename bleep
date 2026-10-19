@@ -1194,6 +1194,7 @@ noncanonical_reason_text() {
     dynamic-value) why='コマンド置換や変数展開($(…)、バッククォート、$VAR)を含む値は使えません。リテラルで書いてください。' ;;
     not-alone) why='本文ファイルを持つ投稿は、その投稿だけを 1 回のコマンドとして実行してください(&&・;・|・改行で他のコマンドと並べる形、sh -c・eval・$(…) の中は使えません。同じコマンドの前段が本文ファイルを書き換えると、照合した中身と投稿される中身がずれるため)。前段の処理は別の Bash 呼び出しに分けてください。' ;;
     unparsable) why='コマンドを解釈できません(クォートが閉じていません)。本文はファイルに書いて --body-file で渡してください。' ;;
+    opaque-exec) why='コマンド名を変数で与える形($f …、"$cmd" …)や、テキストを標準入力からシェルに流し込む形(echo … | bash、bash -c "$x")は、実行される内容を PreToolUse の時点で読めないので使えません。gh をリテラルで書き、スクリプトはヒアドキュメント(bash <<'"'"'EOF'"'"')か sh -c のリテラルで渡してください。' ;;
     *) why='正準形を外れています。' ;;
   esac
   printf '%s %s' "$why" "$base"
@@ -2251,6 +2252,13 @@ CASES55
 0|gh pr view 5 -R pub/repo && gh pr checks 5 && gh run watch 1
 0|gh pr merge 5 -R pub/repo --squash
 0|gh issue create --help
+2|f=gh; $f issue comment 1 -R pub/repo --body-file @gb@/clean.md
+2|echo 'gh issue comment 1 -R pub/repo' | bash
+2|cat @gb@/clean.md | sh -s
+2|x='gh issue comment 1 -R pub/repo'; bash -c "$x"
+0|echo x | bash -c 'gh pr view 5 -R pub/repo'
+0|echo x | bash @gb@/clean.md
+0|$HOME/bin/tool run && timeout $T make
 0|gh repo edit --help
 0|gh pr create -R pub/repo --help | head -5
 CASESWRAP
@@ -2268,6 +2276,15 @@ CASESWRAP
     rc=$?
     set -e
     [[ $rc -eq 2 && $out == *'1 回のコマンド'* ]] || { echo "FAIL(#78 F2: 本文ファイル付きの投稿は単独のコマンドだけ): 期待=2 実際=$rc cmd=$f2_cmd out=$out" >&2; fails=$((fails + 1)); }
+  done
+  # #81: 実行される内容を読めない 2 形は、理由文がリテラルでの書き直し方を案内して deny する。
+  local opq_cmd
+  for opq_cmd in 'f=gh; $f issue close 5 -R pub/repo' "echo 'gh issue close 5 -R pub/repo' | bash"; do
+    set +e
+    out="$(cd "$tmp" && "$SELF" scan-bash-command "$opq_cmd" 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 2 && $out == *'読めないので使えません'* && $out == *'リテラルで書き'* ]] || { echo "FAIL(#81: opaque-exec は deny で書き直し方を案内する): 期待=2 実際=$rc cmd=$opq_cmd out=$out" >&2; fails=$((fails + 1)); }
   done
   # 前置(env)は単独のコマンドのまま通る(照合は本文ファイルまで届く)。
   set +e

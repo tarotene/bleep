@@ -402,8 +402,8 @@ separator, so a post followed by `2>&1` is still a standalone command. A post is
 
 Anything else is **denied** (reason id `gh-noncanonical`, with one of the
 closed codes `no-repo`, `bad-repo`, `inline-body`, `inline-comment`,
-`body-stdin`, `body-path`, `dynamic-value`, `unparsable`, `not-alone` in the ledger's
-`detail`), and the reason text shows the canonical form: write the body to a
+`body-stdin`, `body-path`, `dynamic-value`, `unparsable`, `not-alone`, `opaque-exec` in
+the ledger's `detail`), and the reason text shows the canonical form: write the body to a
 file first, then `gh issue comment 5 -R OWNER/REPO --body-file /abs/path.md`
 (to close with a comment, comment first and then `gh issue close`). bleep does
 not guess a destination from the cwd, track `cd`, or resolve variables any more
@@ -422,11 +422,17 @@ stays in the scanned text. A `git push` segment is **not** inspected for its
 range or target: the range is decided by the pre-push hook from git's own input
 (see "What `scan-push` checks" below). The only push forms that are denied here
 are the ones that switch that hook off — `--no-verify`, or a `-c
-core.hooksPath=…` global option (reason id `push-hook-bypass`). The forms the
-recursion does not reach (a deeper nesting, `python -c 'subprocess.run(["gh", …])'`,
-a command name held in a variable, text piped into a shell
-(`echo '…' | bash`), a script on disk, a binary other than `gh`) remain an
-approximation, within the scope this
+core.hooksPath=…` global option (reason id `push-hook-bypass`). Two forms whose
+content cannot be read at PreToolUse are denied as `opaque-exec` (#81): a command
+name that is a variable (`f=gh; $f issue …`, `"$cmd" …`, `bash -c "$x"`), and text
+piped into a shell (`echo '…' | bash`, `… | sh -s`; `cat <<'EOF' | bash` and
+`… | bash script.sh` are not, since the body is inspected as code and a file is
+run, respectively). Both have no everyday use and can be rewritten with a literal
+`gh` ([docs/adr/0005-code-position-closure.md](docs/adr/0005-code-position-closure.md)).
+The forms the recursion does not reach (a deeper nesting,
+`python -c 'subprocess.run(["gh", …])'`, a script on disk, an alias, a variable
+after a prefix such as `env $f …`, a `|` inside an unquoted `$(…)`, a binary other
+than `gh`) remain an approximation, within the scope this
 tool already states below: a guardrail against accidents, not a boundary.
 
 `bleep scan`/`scan-push`/`scan-bash-command` all share the same exit

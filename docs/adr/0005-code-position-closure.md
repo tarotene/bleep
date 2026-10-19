@@ -5,6 +5,7 @@
 - Context: #80(ヒアドキュメント本文の偽陽性・偽陰性)。#79(ADR-0004)の作業中、
   ADR を書くヒアドキュメントの本文にあった `gh` の例が、投稿と誤認されて deny になった
 - 関連: ADR-0003(gh の正準形)、ADR-0004(本文ファイルを持つ投稿は単独)
+- Amended: 2026-10-19(#81。不透明な実行のうち 2 形を `opaque-exec` で deny にした)
 
 ## Context
 
@@ -65,18 +66,39 @@ bleep は、コマンド文字列のうち「シェルが実行しうる部分(�
 
 ### 閉じないもの(不透明な実行)
 
-次は、字面の構文では「コード位置」を決められず、検出のみ(README の「セキュリティ境界では
-ない」の範囲)に残る。差分テストが、認識されないことを固定している
-(`tests/oracle_test.rs` の `GAPS`)。
+字面の構文では「コード位置」を決められない形がある。次の 2 形は文法の外として deny にし
+(`opaque-exec`、#81)、残りは検出のみ(README の「セキュリティ境界ではない」の範囲)に残す。
 
-- コマンド名を変数で与える形(`f=gh; $f issue …`)
-- 標準入力にテキストを流し込む形(`echo '…' | bash`。ヒアドキュメントの本文は読めるが、`echo` の
-  引数は読まない)
-- python などのインタプリタ、ディスク上のスクリプト、alias
+**deny にする 2 形**(実行される内容を PreToolUse の時点で読めず、リテラルで書き直せば同じ
+意図を表せる):
+
+- コマンド名が変数そのもの: `f=gh; $f issue …`、`"$cmd" …`、`${CMD} …`。`bash -c "$x"`・
+  `sh -c "$script"`・`eval "$cmd"` は、スクリプトの先頭の語が変数なので同じ規則で拾う。
+  語の一部だけが動的なパス(`$HOME/bin/x`、`$(pwd)/x`)、代入だけの接頭辞(`X=$Y make`)、
+  コマンド置換(`eval "$(ssh-agent -s)"`)、前置の語の後ろの変数(`timeout $T make`、
+  `sudo -u $USER make`)は含めない — 日常に出る形で、止めると迂回が常態化する
+- 標準入力のテキストをシェルが実行する形: `echo '…' | bash`、`… | sh -s`、`… |& bash`、
+  `… | . /dev/stdin`。`|`・`|&` の右辺のシェルが、`-c` を持たず、`-s` があるか位置引数
+  (スクリプトのファイル)を持たないとき。`cat <<'EOF' | bash`(前のセグメントがヒアドキュメント
+  を持つ)は、流れるのが本文で、本文はコードとして検査されるので deny にしない。
+  `echo x | bash script.sh` はファイルを実行するので deny にしない
+
+実装は、セグメントに「`|`・`|&` の右辺か」(`after_pipe`)を持たせ、`$f` と `| bash` を宛先も本文も
+取れない疑似投稿 `opaque-exec` にする(`unparsable` と同じ経路。`LEX_PROTOCOL` は上げない —
+出力の形式は変わらず、違反コードの語彙が 1 つ増えるだけ)。`cat <<'EOF' | sed … | bash` は、
+ヒアドキュメントの本文が `sed` で加工されて流れるので、deny に変わる。
+
+**検出のみに残る形**:
+
+- python などのインタプリタ、ディスク上のスクリプト(`bash script.sh`)、alias
 - 深さ 3 を超える入れ子(`sh -c` の中の `sh -c` …)
+- 前置の語の後ろの変数(`env $f issue …`)、`bash -o errexit` のようにオプションの値を位置引数と
+  取り違える形、引用符の外の `$(…)` の中の `|`(外側の分割が `$(` を知らず、内側の `| bash` を
+  右辺として見ない)
 
 任意のプログラムが `gh` を呼ぶかどうかは、静的には決定不能である(Rice の定理)。閉じているのは、
-透過的な構文で到達できる `gh` だけで、その外は偽陰性を許す。
+透過的な構文で到達できる `gh` だけで、その外は偽陰性を許す。deny にした 2 形は、静的に決められない
+うちの、書き手が避けられて日常の用途が無いものである。
 
 ## 検証: 本物の bash を正解にした差分テスト
 
@@ -106,7 +128,11 @@ bleep は、コマンド文字列のうち「シェルが実行しうる部分(�
 - **データ位置の本文も照合する(従来の過剰な近似)。** 偽陽性の頻度が高く、公開する地点で
   照合する原則(ADR-0004)と重複する。照合しても、プログラムが作る中身は見えない
 - **不透明な実行を一律 deny にする。** 日常の操作(`python -c`、スクリプトの実行)まで止まり、
-  迂回が常態化する(ADR-0003 と同じ理由)
+  迂回が常態化する(ADR-0003 と同じ理由)。退けたのは**一律**の deny で、日常の用途が無い 2 形
+  (変数のコマンド名、シェルへ流すテキスト)は、止めても迂回が常態化しないので deny にした
+  (#81。パスの通る呼び出しは判定レッジャーに残らないので、日常の操作を止めていないかは、
+  deny の記録(`gh-noncanonical` の `detail` が `opaque-exec`)に日常の操作が混ざらないかで、
+  運用の中で確かめる。混ざったら、その形を deny から外す)
 
 ### 先行研究
 
@@ -122,13 +148,21 @@ bleep は、コマンド文字列のうち「シェルが実行しうる部分(�
 
 ## 執行点
 
-- `src/lex.rs` — `split_command_segments`(ヒアドキュメント・コメント・ANSI-C 引用符)、
-  `substitutions`、`reads_code_from_stdin`、`classify_segment_full`、`normalize_ansi_c`
-- `src/grammar.rs` — `is_stream_path`(`/dev/…`・`/proc/…`・`..` を `body-stdin` に)
-- `bleep` — `body-stdin` の理由文、selftest(引用符付き本文はデータ、シェルが読む本文は検査)
-- `tests/oracle_test.rs` — bash を正解にした差分テスト
+- `src/lex.rs` — `split_command_segments`(ヒアドキュメント・コメント・ANSI-C 引用符、
+  `after_pipe`)、`substitutions`、`reads_code_from_stdin`、`classify_segment_full`、
+  `normalize_ansi_c`、`is_opaque_command_word`、`shell_reads_stdin_as_code`、
+  `pipes_text_into_shell`、`opaque_exec`
+- `src/grammar.rs` — `is_stream_path`(`/dev/…`・`/proc/…`・`..` を `body-stdin` に)、
+  違反コード `opaque-exec` の語彙
+- `bleep` — `body-stdin`・`opaque-exec` の理由文、selftest(引用符付き本文はデータ、
+  シェルが読む本文は検査、不透明な 2 形は deny)
+- `tests/oracle_test.rs` — bash を正解にした差分テスト(`OPAQUE` は deny、`GAPS` は検出のみ)
 - `tests/fixtures/intent/quoted_heredoc_body_is_data.json`
 - `tests/fixtures/intent/heredoc_into_shell_is_code.json`
+- `tests/fixtures/intent/variable_command_name_is_opaque.json`
+- `tests/fixtures/intent/text_piped_into_shell_is_opaque.json`
+- `tests/fixtures/intent/shell_c_with_variable_script_is_opaque.json`
+- `tests/fixtures/intent/pipe_into_shell_running_a_file_is_not_opaque.json`
 
 ## Consequences
 
@@ -138,3 +172,5 @@ bleep は、コマンド文字列のうち「シェルが実行しうる部分(�
 - `unparsable` が出る形が減る。理由文から「ヒアドキュメント」を外した
 - `--body-file /dev/stdin <<EOF` は、`unparsable` ではなく `body-stdin` で deny になる
 - `LEX_PROTOCOL` は上げない(出力の形式は変わらない。認識の結果が変わるだけ)
+- (#81)コマンド名が変数の形と、`… | bash` のようにテキストをシェルへ流す形は、`opaque-exec` で
+  deny になる。リテラルの `gh` に書き直すか、スクリプトを `bash <<'EOF'` か `sh -c` のリテラルで渡す

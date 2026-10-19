@@ -74,7 +74,7 @@ pub struct GhPost {
 /// (bleep 本体)に使う。テストが、`recognize` の返すコードがここに収まる
 /// ことを確かめる。
 #[cfg(test)]
-pub const NONCANONICAL_CODES: [&str; 9] = [
+pub const NONCANONICAL_CODES: [&str; 10] = [
     "no-repo",
     "bad-repo",
     "inline-body",
@@ -84,6 +84,7 @@ pub const NONCANONICAL_CODES: [&str; 9] = [
     "dynamic-value",
     "unparsable",
     "not-alone",
+    "opaque-exec",
 ];
 
 /// 値がコマンド置換・変数展開を含み、コマンド文字列だけでは内容が定まらないか。
