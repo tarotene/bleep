@@ -90,6 +90,30 @@ comments and blank lines ignored):
 | `allow-stopwords.txt` | Words excluded from the denylist (`.github` is a built-in default) |
 | `allow-regexes.txt` | If this regex matches the scanned text, it disables **only the ask** verdict (it does not loosen deny) |
 | `allow-paths.txt` | Regex of file paths excluded from `audit` |
+| `allow-tools.txt` | Extended regex matched against the **whole** tool name; a non-Bash tool that matches is not scanned (see [Excluding a tool](#excluding-a-tool)) |
+
+### Excluding a tool
+
+bleep scans every string in the input of every non-Bash tool (`mcp__*`), and it
+does not know where the tool sends it. A draft in an in-house Slack channel and
+a public Issue look the same from here, so the exclusion is yours to declare, by
+tool name (#95). Put one extended regular expression per line in
+`allow-tools.txt`; a tool whose name matches **the whole line** is passed
+without a denylist check:
+
+```
+# in-house chat; drafts are reviewed by a person before they are sent
+mcp__slack__.*
+```
+
+Look the exact names up in the ledger (`tool_name`) or in the host's tool list.
+The file applies to the `scan` path only: `Bash` goes through
+`scan-bash-command`, which never reads it, so excluding a tool name cannot turn
+into a bypass of the `gh` grammar or of the push check. An invalid line matches
+nothing (the tool stays scanned). A broad line such as `mcp__.*` removes the
+check for every MCP tool, including the ones that publish; the file is the place
+for the tools you have judged non-public, not for silencing a false positive —
+for that, use `allow-stopwords.txt`.
 
 ### Short repo names
 
