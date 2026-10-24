@@ -146,6 +146,13 @@ init_vars() {
   OWNER="${BLEEP_OWNER:-}"
   GH_BIN="${BLEEP_GH_BIN:-gh}"
   LEX_BIN="${BLEEP_LEX_BIN:-bleep-hook}" # cmd_scan_bash_command の字句解析(D1)
+  # #112: `/` を含む相対パスは、selftest の子プロセスが `cd` したあとに見失う。起動時の
+  # cwd で絶対パスに直し、環境変数にも書き戻す(子の bleep はここを読み直す)。`/` を
+  # 含まない名前は PATH で引くのでそのまま。
+  if [[ $LEX_BIN == */* && $LEX_BIN != /* ]]; then
+    LEX_BIN="$PWD/$LEX_BIN"
+    export BLEEP_LEX_BIN="$LEX_BIN"
+  fi
   CACHE_TTL="${BLEEP_CACHE_TTL:-86400}"
   # #44: WORD_HARD(裸のリポ名 hard-deny)のうち、この長さ以下の語は
   # word-soft(ask)に降格する。一般的な英単語が私物 private リポ名として

@@ -26,7 +26,7 @@ jobs:
       - name: cargo build (bleep-hook)
         run: cargo build
       - name: export BLEEP_LEX_BIN
-        run: echo "BLEEP_LEX_BIN=$PWD/target/debug/bleep-hook" >> "$GITHUB_ENV"
+        run: echo "BLEEP_LEX_BIN=target/debug/bleep-hook" >> "$GITHUB_ENV"
 
       - name: selftest (core CLI)
         run: ./bleep selftest
