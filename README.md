@@ -402,7 +402,7 @@ separator, so a post followed by `2>&1` is still a standalone command. A post is
 
 Anything else is **denied** (reason id `gh-noncanonical`, with one of the
 closed codes `no-repo`, `bad-repo`, `inline-body`, `inline-comment`,
-`body-stdin`, `body-path`, `dynamic-value`, `unparsable`, `not-alone`, `opaque-exec` in
+`body-stdin`, `body-path`, `dynamic-value`, `unparsable`, `not-alone` in
 the ledger's `detail`), and the reason text shows the canonical form: write the body to a
 file first, then `gh issue comment 5 -R OWNER/REPO --body-file /abs/path.md`
 (to close with a comment, comment first and then `gh issue close`). bleep does
@@ -423,7 +423,9 @@ range or target: the range is decided by the pre-push hook from git's own input
 (see "What `scan-push` checks" below). The only push forms that are denied here
 are the ones that switch that hook off — `--no-verify`, or a `-c
 core.hooksPath=…` global option (reason id `push-hook-bypass`). Two forms whose
-content cannot be read at PreToolUse are denied as `opaque-exec` (#81): a command
+content cannot be read at PreToolUse are denied with their own reason id,
+`opaque-exec` (#81; #115 split it from `gh-noncanonical` because it can fire without
+any `gh` in the command, and its reason text carries no `gh` post rules): a command
 name that is a variable (`f=gh; $f issue …`, `"$cmd" …`, `bash -c "$x"`), and text
 piped into a shell (`echo '…' | bash`, `… | sh -s`; `cat <<'EOF' | bash` and
 `… | bash script.sh` are not, since the body is inspected as code and a file is
