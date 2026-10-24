@@ -683,6 +683,48 @@ verdict_reason() {
   esac
 }
 
+# match_line_no: $1=match_class $2=一致した語(平文) $3=テキスト -> テキストの中で
+# その語に最初に一致する行の番号(1 始まり)を印字する。無ければ何も印字せず非 0。
+# 拒否文に「どこに当たったか」を添えるための位置で、語・語の長さ・桁は出さない(#116。
+# テキストと合わせて語が復元できる情報は、拒否文に出さない — README の Verdict ledger)。
+# 照合は match_verdict と同じ規則: plain の固定文字列は -F、それ以外は語の境界つき ERE。
+match_line_no() {
+  local class="$1" term="$2" text="$3" p n=''
+  [[ -n $term ]] || return 1
+  if [[ $class == plain ]]; then
+    for p in "${PLAIN_PATTERNS[@]+"${PLAIN_PATTERNS[@]}"}"; do
+      if [[ $p == "$term" ]]; then
+        n="$(grep -Fn -m1 -e "$term" <<< "$text" | cut -d: -f1 || true)"
+        break
+      fi
+    done
+  fi
+  if [[ -z $n ]]; then
+    n="$(grep -En -m1 -e "$(word_boundary_pattern "$term")" <<< "$text" | cut -d: -f1 || true)"
+  fi
+  [[ $n =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$n"
+}
+
+# describe_field_line: $1=結合したテキストでの行番号 -> 「<欄> の第 N 行」。欄の一覧
+# (BLEEP_FIELD_MAP。`<開始行><TAB><経路>` の行の列。bleep-hook の host モードが渡す)が
+# あれば、行番号が属する欄の名前と、その欄の中での行番号に直す。無ければ「入力の第 N 行」。
+describe_field_line() {
+  local n="$1" start path best_start='' best_path=''
+  while IFS=$'\t' read -r start path; do
+    [[ $start =~ ^[0-9]+$ ]] || continue
+    if ((start <= n)); then
+      best_start=$start
+      best_path=$path
+    fi
+  done <<< "${BLEEP_FIELD_MAP:-}"
+  if [[ -n $best_start ]]; then
+    printf '%s の第 %d 行' "$best_path" $((n - best_start + 1))
+  else
+    printf '入力の第 %d 行' "$n"
+  fi
+}
+
 # match_verdict の結果から reason_id(判定レッジャーの閉語彙)を決める。
 # $1=deny|ask $2=match_class。#44: ask の reason_id は match_class で
 # 分岐する(word-soft はリポ名一致なので repo-ref、word-warn は org 名
@@ -967,7 +1009,13 @@ cmd_scan() {
   require_orgs_file
   build_patterns
   if match_verdict "$text"; then
-    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
+    local reason line
+    reason="$(verdict_reason "$VERDICT" "$MATCH_CLASS")"
+    # #116: 一致した場所(MCP 入力なら欄と欄の中の行)を添える。語は出さない。
+    if line="$(match_line_no "$MATCH_CLASS" "$MATCH_TERM" "$text")"; then
+      reason+=" 一致した場所: $(describe_field_line "$line")。"
+    fi
+    emit_verdict "$VERDICT" "$reason" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
   fi
   exit 0
 }
@@ -1304,10 +1352,13 @@ cmd_scan_bash_command() {
   if [[ $scan_public == 1 ]]; then
     # 一致の出所(コマンド文字列か本文ファイルか)を理由文に出すため、本文を足す
     # 前のコマンド側を取っておく(#85)。
-    local command_subject="$scan_subject"
+    local command_subject="$scan_subject" body_text
+    local -a body_texts=()
     for body_path in "${scan_bodies[@]+"${scan_bodies[@]}"}"; do
       if [[ -f $body_path && -r $body_path ]]; then
-        scan_subject+=$'\n'"$(cat -- "$body_path" 2>/dev/null)" || true
+        body_text="$(cat -- "$body_path" 2>/dev/null)" || true
+        scan_subject+=$'\n'"$body_text"
+        body_texts+=("$body_text")
       else
         emit_verdict ask "gh の本文の入力元ファイルを読めません: ${body_path}" body-source-unreadable
       fi
@@ -1315,12 +1366,25 @@ cmd_scan_bash_command() {
     require_orgs_file
     build_patterns
     if match_verdict "$scan_subject"; then
-      local v="$VERDICT" c="$MATCH_CLASS" t="$MATCH_TERM" where reason
-      # コマンド側だけでも一致するならコマンド文字列中、そうでなければ本文ファイル中。
-      if match_verdict "$command_subject"; then
-        where="コマンド文字列中"
+      local v="$VERDICT" c="$MATCH_CLASS" t="$MATCH_TERM" where reason line k=0
+      # 一致した語が現れる場所を、コマンド文字列(照合対象 = `cd` 区間などを除いたもの)、
+      # 本文ファイルの順に探し、行番号まで示す(#116)。語・語の長さ・桁は出さない。
+      # 本文ファイルが複数のときは何個目かで示す(パスは公開名でないことがあるので出さない)。
+      if line="$(match_line_no "$c" "$t" "$command_subject")"; then
+        where="コマンド文字列中(照合対象の第 ${line} 行)"
       else
         where="本文ファイルの中身"
+        for body_text in "${body_texts[@]+"${body_texts[@]}"}"; do
+          k=$((k + 1))
+          if line="$(match_line_no "$c" "$t" "$body_text")"; then
+            if ((${#body_texts[@]} > 1)); then
+              where="${k} 個目の本文ファイルの中身(第 ${line} 行)"
+            else
+              where="本文ファイルの中身(第 ${line} 行)"
+            fi
+            break
+          fi
+        done
       fi
       reason="$(verdict_reason "$v" "$c") 一致した場所: ${where}。"
       emit_verdict "$v" "$reason" "$(reason_id_for_verdict "$v" "$c")" "$c" "$t"
@@ -2482,6 +2546,41 @@ STUB
   rc=$?
   set -e
   [[ $rc -eq 2 && $out == *'コマンド文字列中'* ]] || { echo "FAIL(#85: コマンド文字列の一致は deny し、出所をコマンドと示す): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+
+  # #116: 一致の場所は行番号まで示す。語・語の長さ・桁は理由文に出さない。
+  printf 'first line\nsecond line\nnotes about my-private-tool\n' > "$tmp/dirty-line3.md"
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  out="$(cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh pr create -R acme/public-oss --title t --body-file $tmp/dirty-line3.md" 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'本文ファイルの中身(第 3 行)'* && $out != *'my-private-tool'* ]] || { echo "FAIL(#116: 本文ファイルの一致は行番号まで示し、語は出さない): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  out="$(cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh api graphql -F query=@$gb/clean.md -F query2=@$tmp/dirty-line3.md" 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'2 個目の本文ファイルの中身(第 3 行)'* ]] || { echo "FAIL(#116: 本文ファイルが複数のときは何個目かを示す): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  rm -f "$BLEEP_STATE_DIR/visibility-cache.tsv"
+  set +e
+  out="$(cd "$tmp/not-a-repo2" && "$SELF" scan-bash-command "gh pr create -R acme/public-oss --title my-private-tool --body-file $gb/clean.md" 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'コマンド文字列中(照合対象の第 1 行)'* ]] || { echo "FAIL(#116: コマンド文字列の一致は行番号まで示す): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+
+  # #116: MCP 入力(bleep-hook の host モードが BLEEP_FIELD_MAP で欄の一覧を渡す)では、
+  # 欄の名前と欄の中の行番号に直す。欄の一覧が無いときは「入力の第 N 行」。
+  local fm=$'1\ttool_input.title\n2\ttool_input.blocks[0].text\n'
+  set +e
+  out="$(BLEEP_FIELD_MAP="$fm" "$SELF" scan <<< $'t\nfirst\nsecond\nacme/secret-project の件' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'一致した場所: tool_input.blocks[0].text の第 3 行'* && $out != *'secret-project'* ]] || { echo "FAIL(#116: MCP 入力は欄の名前と欄の中の行番号を示す): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
+  set +e
+  out="$("$SELF" scan <<< $'t\nacme/secret-project の件' 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -eq 2 && $out == *'一致した場所: 入力の第 2 行'* ]] || { echo "FAIL(#116: 欄の一覧が無いときは入力の第 N 行): 期待=2 実際=$rc out=$out" >&2; fails=$((fails + 1)); }
 
   # #34 の後継: --repo が無い投稿は、cwd の origin から宛先を推測せず(cd の
   # 追跡も変数の解決もしない)、文法の外として deny する。cd の対象に変数が
