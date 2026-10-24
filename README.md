@@ -567,6 +567,20 @@ constrained party should not be able to read its own way out of a false
 positive. With the ledger off (`DO_NOT_TRACK`, `BLEEP_NO_LEDGER=1`) the hash is
 not shown, so that no key is created for it, and only the next step remains.
 
+**Where the match is** (#116). A repo-ref reason also says where in the checked
+text the term was found, so the agent can drop only that part: `一致した場所:
+<field> の第 N 行` for an MCP/tool input (`<field>` is the JSON key path under the
+host's input key, such as `tool_input.blocks[1].text`, and N counts lines inside
+that field), and, for a `gh` post, the command string (the text actually checked,
+i.e. without the `cd` segments and the `-R` value) or the n-th body file, with the
+line number. Only the field and the line are shown — never the term, its length,
+or its column, since together with the text the agent already holds those would
+spell the term out (a character range is what gitleaks reports for a secret; here
+the term is a private name that must not appear in a reason). Field names are
+limited to short `[A-Za-z0-9_-]` keys (anything else shows as `?`), and the field
+list reaches `bleep` in `BLEEP_FIELD_MAP`, dropped when it would exceed 32 KiB (the
+reason then says `入力の第 N 行`).
+
 ## Scope
 
 This repository owns the decision-engine CLI (`scan`/`scan-push`/

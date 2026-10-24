@@ -174,6 +174,69 @@ fn noncanonical_gh_post_is_denied_whatever_the_cwd() {
     assert_eq!(run("echo hello".to_string(), "/does-not-exist"), None);
 }
 
+fn decision_reason(stdout: &[u8], flat: bool) -> String {
+    let v: serde_json::Value = serde_json::from_slice(stdout).expect("valid JSON output");
+    let r = if flat {
+        &v["permissionDecisionReason"]
+    } else {
+        &v["hookSpecificOutput"]["permissionDecisionReason"]
+    };
+    r.as_str().unwrap_or_default().to_string()
+}
+
+#[test]
+fn mcp_deny_names_the_field_and_line_of_the_match_without_the_term() {
+    // #116: 文字列リーフを結合して検査するので、拒否文は一致した欄(JSON のキーの経路)と
+    // 欄の中の行番号を示す。欄の一覧は host モードが BLEEP_FIELD_MAP で bleep に渡す。
+    // 語そのものは拒否文に出ない。キーに英数字・`_`・`-` 以外が入る欄は `?` に置き換わる。
+    let env = Env::new();
+    let input = serde_json::json!({
+        "tool_name": "mcp__x__post",
+        "tool_input": {
+            "title": "t",
+            "blocks": [{"text": "a\nb"}, {"text": "c\nacme/secret-project の件"}],
+            "odd key\n": "z",
+        },
+    });
+    let assert = env
+        .pg_command()
+        .arg("--host=claude")
+        .write_stdin(input.to_string())
+        .assert()
+        .success();
+    let out = assert.get_output().stdout.clone();
+    assert_eq!(decision_wrapped(&out), Some("deny".to_string()));
+    let reason = decision_reason(&out, false);
+    assert!(
+        reason.contains("一致した場所: tool_input.blocks[1].text の第 2 行"),
+        "{reason}"
+    );
+    assert!(!reason.contains("secret-project"), "{reason}");
+}
+
+#[test]
+fn copilot_deny_names_the_field_with_its_own_root() {
+    // Copilot は入力のキーが `toolArgs`。欄の名前の根もそれに合わせる。
+    let env = Env::new();
+    let input = serde_json::json!({
+        "toolName": "someTool",
+        "toolArgs": {"query": "acme/secret-project"},
+    });
+    let assert = env
+        .pg_command()
+        .arg("--host=copilot")
+        .write_stdin(input.to_string())
+        .assert()
+        .success();
+    let out = assert.get_output().stdout.clone();
+    assert_eq!(decision_flat(&out), Some("deny".to_string()));
+    let reason = decision_reason(&out, true);
+    assert!(
+        reason.contains("一致した場所: toolArgs.query の第 1 行"),
+        "{reason}"
+    );
+}
+
 #[test]
 fn session_id_and_host_reach_ledger() {
     // host.rs が受け取った session_id/host/tool_name が BLEEP_SESSION_ID/
