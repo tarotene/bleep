@@ -1185,6 +1185,13 @@ cmd_scan_pre_push() {
 # fail-open の退行 — 自前実装がシェルの引用規則を不完全に近似していた)
 # を参照。
 
+# opaque_exec_reason_text: 実行される内容を PreToolUse の時点で読めない形(コマンド名を
+# 変数で与える、テキストをシェルに流し込む)を deny するときの理由文。gh の投稿の
+# 規則ではない(gh を呼んでいない命令でも当たる、#115)ので、gh の正準形の説明は付けない。
+opaque_exec_reason_text() {
+  printf '%s' 'コマンド名を変数で与える形($f …、"$cmd" …)や、テキストを標準入力からシェルに流し込む形(echo … | bash、bash -c "$x")は、実行される内容を PreToolUse の時点で読めないので使えません。コマンド名はリテラルで書き、スクリプトはヒアドキュメント(bash <<'"'"'EOF'"'"')か sh -c のリテラルで渡してください。'
+}
+
 # noncanonical_reason_text: $1=gh の投稿が正準形を外れた理由コード(src/grammar.rs の
 # NONCANONICAL_CODES)-> 理由文。正準形の定義と、書き直し方を案内する。bypass 手段は
 # ここに書かない(README 参照)。
@@ -1201,7 +1208,6 @@ noncanonical_reason_text() {
     dynamic-value) why='コマンド置換や変数展開($(…)、バッククォート、$VAR)を含む値は使えません。リテラルで書いてください。' ;;
     not-alone) why='本文ファイルを持つ投稿は、その投稿だけを 1 回のコマンドとして実行してください(&&・;・|・改行で他のコマンドと並べる形、sh -c・eval・$(…) の中は使えません。同じコマンドの前段が本文ファイルを書き換えると、照合した中身と投稿される中身がずれるため)。前段の処理は別の Bash 呼び出しに分けてください。' ;;
     unparsable) why='コマンドを解釈できません(クォートが閉じていません)。本文はファイルに書いて --body-file で渡してください。' ;;
-    opaque-exec) why='コマンド名を変数で与える形($f …、"$cmd" …)や、テキストを標準入力からシェルに流し込む形(echo … | bash、bash -c "$x")は、実行される内容を PreToolUse の時点で読めないので使えません。gh をリテラルで書き、スクリプトはヒアドキュメント(bash <<'"'"'EOF'"'"')か sh -c のリテラルで渡してください。' ;;
     *) why='正準形を外れています。' ;;
   esac
   printf '%s %s' "$why" "$base"
@@ -1283,6 +1289,10 @@ cmd_scan_bash_command() {
       fi
     fi
     if [[ -n ${post_code[i]} ]]; then
+      # opaque-exec は gh の投稿の違反ではない(#115)。reason_id も理由文も gh と分ける。
+      if [[ ${post_code[i]} == opaque-exec ]]; then
+        emit_verdict deny "$(opaque_exec_reason_text)" opaque-exec
+      fi
       emit_verdict deny "$(noncanonical_reason_text "${post_code[i]}")" gh-noncanonical none "" "${post_code[i]}"
     fi
     scan_public=1
@@ -2285,13 +2295,18 @@ CASESWRAP
     [[ $rc -eq 2 && $out == *'1 回のコマンド'* ]] || { echo "FAIL(#78 F2: 本文ファイル付きの投稿は単独のコマンドだけ): 期待=2 実際=$rc cmd=$f2_cmd out=$out" >&2; fails=$((fails + 1)); }
   done
   # #81: 実行される内容を読めない 2 形は、理由文がリテラルでの書き直し方を案内して deny する。
-  local opq_cmd
-  for opq_cmd in 'f=gh; $f issue close 5 -R pub/repo' "echo 'gh issue close 5 -R pub/repo' | bash"; do
+  # #115: gh を呼ばない形(`for c in …; do $c; done`)でも当たるので、理由文に gh の投稿の
+  # 規則を混ぜず、レッジャーの reason_id も gh-noncanonical と分ける。
+  local opq_cmd opq_last
+  for opq_cmd in 'f=gh; $f issue close 5 -R pub/repo' "echo 'gh issue close 5 -R pub/repo' | bash" $'for c in "uv run ruff check ." "uv run mypy"; do\n  "$c" --x\ndone'; do
     set +e
     out="$(cd "$tmp" && "$SELF" scan-bash-command "$opq_cmd" 2>&1)"
     rc=$?
     set -e
     [[ $rc -eq 2 && $out == *'読めないので使えません'* && $out == *'リテラルで書き'* ]] || { echo "FAIL(#81: opaque-exec は deny で書き直し方を案内する): 期待=2 実際=$rc cmd=$opq_cmd out=$out" >&2; fails=$((fails + 1)); }
+    [[ $out != *'gh の投稿は'* && $out != *'--body-file'* ]] || { echo "FAIL(#115: opaque-exec の理由文に gh の正準形の説明が混ざる): cmd=$opq_cmd out=$out" >&2; fails=$((fails + 1)); }
+    opq_last="$(tail -n1 "$BLEEP_LEDGER_DIR/bleep.jsonl" 2>/dev/null)"
+    [[ $opq_last == *'"reason_id":"opaque-exec"'* && $opq_last != *'gh-noncanonical'* ]] || { echo "FAIL(#115: レッジャーの reason_id が opaque-exec にならない): cmd=$opq_cmd ledger=$opq_last" >&2; fails=$((fails + 1)); }
   done
   # 前置(env)は単独のコマンドのまま通る(照合は本文ファイルまで届く)。
   set +e
