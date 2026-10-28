@@ -393,6 +393,12 @@ const WRAPPERS: [&str; 13] = [
 ];
 const SHELLS: [&str; 5] = ["sh", "bash", "zsh", "dash", "ksh"];
 
+/// コマンド位置に現れ、後ろにコマンドがそのまま続く予約語(bash の `compgen -k` のうち)。
+/// 含めないもの: `for`・`case`・`select` は後ろが変数名と語の並びでコマンドではなく、
+/// `fi`・`done`・`esac` は終端で後ろにコマンドが来ない。`{` は `word`、`time` は
+/// `WRAPPERS` が扱う。
+const COMMAND_KEYWORDS: [&str; 7] = ["if", "then", "else", "elif", "while", "until", "do"];
+
 fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
@@ -416,15 +422,15 @@ fn is_assignment(tok: &str) -> bool {
     }
 }
 
-/// 代入・サブシェルの開き・`!`・前置の語を読み飛ばして、実際のコマンド語の
-/// 位置を返す。前置の語(env、sudo、timeout …)はオプションの形が語ごとに違う
+/// 代入・サブシェルの開き・`!`・制御キーワード(`then`・`do` …)・前置の語を読み飛ばして、
+/// 実際のコマンド語の位置を返す。前置の語(env、sudo、timeout …)はオプションの形が語ごとに違う
 /// ので、後ろに最初に現れる gh / git / シェルの位置までを前置として飛ばす。
 /// 見つからなければ `t.len()`。
 fn command_start(t: &[String]) -> usize {
     let mut i = 0usize;
     while i < t.len() {
         let w = word(&t[i]);
-        if w.is_empty() || w == "!" || is_assignment(w) {
+        if w.is_empty() || w == "!" || COMMAND_KEYWORDS.contains(&w) || is_assignment(w) {
             i += 1;
             continue;
         }
@@ -1462,6 +1468,40 @@ mod tests {
             opaque_codes("X=$Y gh issue close 5 -R pub/a"),
             [None::<&str>]
         );
+    }
+
+    #[test]
+    fn command_after_a_control_keyword_is_recognized() {
+        // #122: `then`・`do`・`else` などの直後のコマンドが、`!` や代入と同じく
+        // コマンド位置として読まれる。本文付きの `gh` は inline-body で止まり、
+        // 変数のコマンド名は opaque-exec になる。
+        for cmd in [
+            "if true; then gh issue create -R pub/r --body x; fi",
+            "for c in a; do gh issue create -R pub/r --body x; done",
+            "if false; then true; else gh issue create -R pub/r --body x; fi",
+            "if false; then true; elif true; then gh issue create -R pub/r --body x; fi",
+            "while true; do gh issue create -R pub/r --body x; done",
+            "until false; do gh issue create -R pub/r --body x; done",
+            "if gh issue create -R pub/r --body x; then true; fi",
+        ] {
+            assert_eq!(opaque_codes(cmd), [Some("inline-body")], "{cmd}");
+        }
+        for cmd in [
+            "for c in a b; do $c; done",
+            "if true; then $c x; fi",
+            "for c in a b; do\n\"$c\" x\ndone",
+        ] {
+            assert_eq!(opaque_codes(cmd), [Some("opaque-exec")], "{cmd}");
+        }
+        // 後ろが語の並びの `for`・`case`・`select` と、終端の語は、コマンドの前置ではない。
+        for cmd in [
+            "for c in gh issue create -R pub/r --body x; do true; done",
+            "case gh in gh) true;; esac",
+            "select c in gh issue; do true; done",
+            "if true; then true; fi",
+        ] {
+            assert!(opaque_codes(cmd).is_empty(), "{cmd}");
+        }
     }
 
     #[test]
