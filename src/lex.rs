@@ -396,8 +396,11 @@ const SHELLS: [&str; 5] = ["sh", "bash", "zsh", "dash", "ksh"];
 /// コマンド位置に現れ、後ろにコマンドがそのまま続く予約語(bash の `compgen -k` のうち)。
 /// 含めないもの: `for`・`case`・`select` は後ろが変数名と語の並びでコマンドではなく、
 /// `fi`・`done`・`esac` は終端で後ろにコマンドが来ない。`{` は `word`、`time` は
-/// `WRAPPERS` が扱う。
-const COMMAND_KEYWORDS: [&str; 7] = ["if", "then", "else", "elif", "while", "until", "do"];
+/// `WRAPPERS` が扱う。`coproc` は単純コマンドなら NAME を取れない(man bash「Coprocesses」)ので
+/// 飛ばしてよい。複合コマンドの `coproc NAME { …; }` は NAME が残るので認識されない(未対応)。
+const COMMAND_KEYWORDS: [&str; 8] = [
+    "if", "then", "else", "elif", "while", "until", "do", "coproc",
+];
 
 fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
@@ -1483,11 +1486,13 @@ mod tests {
             "while true; do gh issue create -R pub/r --body x; done",
             "until false; do gh issue create -R pub/r --body x; done",
             "if gh issue create -R pub/r --body x; then true; fi",
+            "coproc gh issue create -R pub/r --body x",
         ] {
             assert_eq!(opaque_codes(cmd), [Some("inline-body")], "{cmd}");
         }
         for cmd in [
             "for c in a b; do $c; done",
+            "coproc $c x",
             "if true; then $c x; fi",
             "for c in a b; do\n\"$c\" x\ndone",
         ] {
