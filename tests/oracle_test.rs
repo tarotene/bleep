@@ -42,6 +42,22 @@ const CORPUS: &[Case] = &[
     ),
     case("true || gh issue close 5 -R pub/a", false),
     case("env X=1 gh issue close 5 -R pub/a", true),
+    // 制御キーワードの直後(#122)。実行される分岐は exact、実行されないかもしれない分岐は過剰側
+    case("if true; then gh issue close 5 -R pub/a; fi", true),
+    case("for c in a; do gh issue close 5 -R pub/a; done", true),
+    case("if gh issue close 5 -R pub/a; then true; fi", true),
+    case(
+        "if false; then true; else gh issue close 5 -R pub/a; fi",
+        true,
+    ),
+    case(
+        "if false; then true; elif true; then gh issue close 5 -R pub/a; fi",
+        true,
+    ),
+    case("while false; do gh issue close 5 -R pub/a; done", false),
+    case("until true; do gh issue close 5 -R pub/a; done", false),
+    // `for` の後ろは語の並びで、コマンドではない(`gh` と書いてあっても実行されない)
+    case("for c in gh issue close 5 -R pub/a; do true; done", true),
     case("sh -c 'gh issue close 5 -R pub/a'", true),
     case(
         "sh -c \"gh issue close 5 -R pub/a; sh -c 'gh pr close 2 -R pub/b'\"",
@@ -126,6 +142,9 @@ const OPAQUE: &[&str] = &[
     "echo 'gh issue close 5 -R pub/gap' |& bash",
     "x='gh issue close 5 -R pub/gap'; bash -c \"$x\"",
     "echo 'gh issue close 5 -R pub/gap' |\nbash",
+    // 制御キーワードの直後の変数のコマンド名(#122)
+    "for c in gh; do $c issue close 5 -R pub/gap; done",
+    "if true; then f=gh; $f issue close 5 -R pub/gap; fi",
 ];
 
 /// 文法の外に残る不透明な実行(ADR-0005)。実行はされるが、認識されない。
