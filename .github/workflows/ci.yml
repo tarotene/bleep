@@ -10,10 +10,10 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: ShellCheck
-        uses: ludeeus/action-shellcheck@2.0.0
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         with:
           scandir: '.'
           severity: error
@@ -22,7 +22,7 @@ jobs:
       # bleep-hook に委ねているため(D1)、Bash の selftest 自体が
       # このバイナリを必要とする。
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: cargo build (bleep-hook)
         run: cargo build
       - name: export BLEEP_LEX_BIN
@@ -38,13 +38,13 @@ jobs:
     name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -59,7 +59,7 @@ jobs:
     name: API docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: tarotene/dotfiles/.github/actions/docs-rust@main
         with:
           upload: 'false'
