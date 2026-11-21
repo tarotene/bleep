@@ -567,6 +567,15 @@ constrained party should not be able to read its own way out of a false
 positive. With the ledger off (`DO_NOT_TRACK`, `BLEEP_NO_LEDGER=1`) the hash is
 not shown, so that no key is created for it, and only the next step remains.
 
+The next step also names the two ordinary rewrites that cost round trips when a
+denylisted word was only the owner's login or a project path: `gh`'s assignee
+(`--assignee`, `--add-assignee`) is `@me` for oneself, and a scratch file goes in a
+place whose path has no project name (`${XDG_RUNTIME_DIR:-/tmp}`). It is one fixed
+sentence on every repo-ref reason and does not say which kind of word matched, so
+it reveals nothing about the denylist. (A `gh issue edit --add-assignee <login>` and a
+Playwright snapshot written under a project path were each denied with no
+replacement named, and each took two attempts to get past, 2026-11-20.)
+
 **Where the match is** (#116). A repo-ref reason also says where in the checked
 text the term was found, so the agent can drop only that part: `一致した場所:
 <field> の第 N 行` for an MCP/tool input (`<field>` is the JSON key path under the

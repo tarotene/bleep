@@ -752,6 +752,9 @@ term_hint() {
     printf ' 一致した語の term_hash: %s。語そのものは、人の端末で `%s explain %s` を実行すると確認できます(出力に非公開名が出るので、エージェントは実行しないでください)。' "$hash" "$SELF" "$hash"
   fi
   printf ' 次の一手: 該当の語を伏せて書き直すか、人に確認を求めてください。人が偽陽性と判断した場合は、allow-stopwords.txt に追加します(README の Configuration 参照)。'
+  # 往復を失った 2 つの型(担当者の名前と、ファイルの置き場のパス)に、語を出さずに一般的な書き方を添える。
+  # どの語に一致したかは言わない(すべての repo-ref の理由に付ける固定の文)。
+  printf ' 担当者の名前やファイルの置き場のパスが原因のときは、`gh` の担当者(`--assignee`・`--add-assignee`)を自分なら `@me` と書くか、一時ファイルをプロジェクト名を含まない置き場(`${XDG_RUNTIME_DIR:-/tmp}`)に置くと、書き直せます。'
 }
 
 # emit_verdict: $1=deny|ask $2=reason(理由文) $3=reason_id
@@ -1754,6 +1757,12 @@ acme で議論した"
   fi
   if [[ $reason_out == *'acme/secret-project'* ]]; then
     echo "FAIL(#102: 理由文に平文のマッチ語が出ている): $reason_out" >&2
+    fails=$((fails + 1))
+  fi
+  # 次の一手に、担当者の名前とファイルの置き場のパスが原因のときの、一般的な書き方(@me、プロジェクト名を含まない置き場)を
+  # 添える。語は出さず、BLEEP_ALLOW も書かない。
+  if [[ $reason_out != *'@me'* || $reason_out != *'XDG_RUNTIME_DIR'* || $reason_out == *'BLEEP_ALLOW'* ]]; then
+    echo "FAIL(理由文の次の一手に、@me と語を含まない置き場の案内が要る。BLEEP_ALLOW は書かない): $reason_out" >&2
     fails=$((fails + 1))
   fi
   # レッジャーを無効にしている間は、ハッシュのために鍵を作らない。次の一手は出す。
