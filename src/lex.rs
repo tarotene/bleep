@@ -137,7 +137,39 @@ fn read_heredoc_body(chars: &[char], start: usize, p: &PendingHeredoc) -> Option
 ///
 /// クォートが閉じないまま終わった場合は分割せず、コマンド全体を1セグメント
 /// にする(Bash 版と同じ、パーサの失敗を緩和側の分割として使わない設計)。
+///
+/// `[[ … ]]` の条件式は、1 つのコマンドとして分割しない(#128)。`[[` は予約語で、
+/// **コマンドの位置**(セグメントの先頭、または `if`・`then`・`do` などの制御キーワードの
+/// 直後)でだけ式を始める。式の中の `&&`・`||`・`|`・`&` は式の演算子であり、区切りでは
+/// ない(bash マニュアルの Compound Commands)。引数の位置の `[[`(`echo [[ x && gh … ]]`)は
+/// ただの文字列なので、従来どおり分割して、後ろの `gh` を検査に残す。`]]` が来ないまま
+/// 文が終わる(`;`・改行・入力の終わり)`[[` は、条件式として扱わず、無効にして分割し直す
+/// (割れない向きの失敗にしない)。
 pub fn split_command_segments(cmd: &str) -> Vec<Segment> {
+    let mut skip_open: Vec<usize> = Vec::new();
+    loop {
+        match split_pass(cmd, &skip_open) {
+            (segments, None) => return segments,
+            // 閉じない `[[` を 1 つ無効にして分割し直す。無効にした位置は二度と開きにならない
+            // ので、有限回で終わる。
+            (_, Some(pos)) => skip_open.push(pos),
+        }
+    }
+}
+
+/// コマンドの位置か: セグメントのこれまでの語が、制御キーワード・`!`・`time`・`{` だけ。
+fn at_command_position(buf: &str) -> bool {
+    buf.split_whitespace().all(|w| {
+        matches!(
+            w,
+            "if" | "elif" | "while" | "until" | "then" | "do" | "else" | "!" | "time" | "{"
+        )
+    })
+}
+
+/// `split_command_segments` の 1 回分。閉じない `[[`(`skip_open` に無い開き)があれば、その
+/// 位置を返して打ち切る。
+fn split_pass(cmd: &str, skip_open: &[usize]) -> (Vec<Segment>, Option<usize>) {
     let chars: Vec<char> = cmd.chars().collect();
     let n = chars.len();
     let mut segments: Vec<Segment> = Vec::new();
@@ -151,6 +183,9 @@ pub fn split_command_segments(cmd: &str) -> Vec<Segment> {
     // 次に flush するセグメントが、直前の `|`・`|&` の右辺か。`|` の直後の改行は
     // パイプラインの継続なので、中身の無いセグメントでは引き継ぐ。
     let mut next_after_pipe = false;
+    // `[[ … ]]` の中か(#128)。開きの位置は、閉じなかったときに無効にするために覚える。
+    let mut in_dbl = false;
+    let mut dbl_open = 0usize;
 
     while i < n {
         let c = chars[i];
@@ -210,6 +245,47 @@ pub fn split_command_segments(cmd: &str) -> Vec<Segment> {
             }
             None => {}
             Some(_) => unreachable!("quote is only ever set to ', \" or $"),
+        }
+
+        // `[[ … ]]`(#128)。クォートの中は上で処理済みなので、ここに来る `;`・`&&` などは
+        // 引用されていない。
+        if in_dbl {
+            if c == ';' || c == '\n' {
+                // 式の途中で文が終わる。この `[[` は条件式でなかったとして、無効にして
+                // 分割し直す。
+                return (Vec::new(), Some(dbl_open));
+            }
+            if c == ']'
+                && chars.get(i + 1) == Some(&']')
+                && buf.chars().last().is_some_and(char::is_whitespace)
+                && chars
+                    .get(i + 2)
+                    .is_none_or(|&nx| nx.is_whitespace() || matches!(nx, ';' | '&' | '|' | ')'))
+            {
+                buf.push_str("]]");
+                i += 2;
+                in_dbl = false;
+                continue;
+            }
+            if c == '&' || c == '|' {
+                // 式の演算子(`&&`・`||`)と、正規表現の `|`。区切りではない。
+                buf.push(c);
+                i += 1;
+                continue;
+            }
+        } else if c == '['
+            && chars.get(i + 1) == Some(&'[')
+            && chars.get(i + 2).is_none_or(|&nx| nx.is_whitespace())
+            && buf.chars().last().is_none_or(char::is_whitespace)
+            && arith == 0
+            && !skip_open.contains(&i)
+            && at_command_position(&buf)
+        {
+            buf.push_str("[[");
+            dbl_open = i;
+            i += 2;
+            in_dbl = true;
+            continue;
         }
 
         // here-string(`<<<`)は三文字ごと読み飛ばす(ヒアドキュメントではない)。
@@ -347,13 +423,20 @@ pub fn split_command_segments(cmd: &str) -> Vec<Segment> {
 
     if quote.is_some() {
         // クォート閉じ忘れ = パース不能。分割しない。
-        return vec![Segment {
-            text: cmd.to_string(),
-            ..Default::default()
-        }];
+        return (
+            vec![Segment {
+                text: cmd.to_string(),
+                ..Default::default()
+            }],
+            None,
+        );
+    }
+    if in_dbl {
+        // 入力の終わりまで `]]` が来なかった。
+        return (Vec::new(), Some(dbl_open));
     }
     flush(&mut segments, &mut buf, next_after_pipe);
-    segments
+    (segments, None)
 }
 
 /// セグメントが「厳密に `cd <単一トークン>`」だけであれば、そのターゲット
@@ -1471,6 +1554,72 @@ mod tests {
             opaque_codes("X=$Y gh issue close 5 -R pub/a"),
             [None::<&str>]
         );
+    }
+
+    #[test]
+    fn double_bracket_expression_is_one_command() {
+        // #128: コマンド位置の `[[ … ]]` の中の `&&`・`||`・`|` は式の演算子で、区切りではない。
+        // 割ると、後半(`$w == x ]]`)の先頭語が変数に見えて opaque-exec で止まっていた。
+        for cmd in [
+            "[[ -z $w || $w == x ]] && continue",
+            "[[ -n $a && $a == x ]] && echo y",
+            "for w in a b; do\n  [[ -z $w || $w == \\#* ]] && continue\ndone",
+            "if [[ a && b ]]; then echo y; fi",
+            "while [[ -n $x && -n $y ]]; do true; done",
+            "[[ $x =~ ^[[:space:]]+$ ]] && echo y",
+            "[[ $x =~ a|b ]] && echo y",
+            "! [[ -n $a || -n $b ]]",
+            "[[ -n $a && -n $b ]] || [[ -n $c && -n $d ]]",
+            "[[ \"$a\" == \"x && y\" ]]",
+        ] {
+            assert!(opaque_codes(cmd).is_empty(), "{cmd}");
+        }
+        let segs = split_nonempty("[[ -n $a && $a == x ]] && echo y");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text.trim(), "[[ -n $a && $a == x ]]");
+        assert_eq!(segs[1].text.trim(), "echo y");
+        // 式の後ろの `&&` は、これまでどおり区切り。後ろの `gh` は検査に残る。
+        assert_eq!(
+            close_repos("[[ -n $a && -n $b ]] && gh issue close 5 -R pub/a"),
+            ["pub/a"]
+        );
+    }
+
+    #[test]
+    fn double_bracket_in_argument_position_does_not_hide_the_next_command() {
+        // 引数の位置の `[[` は、ただの文字列。ここを式の開始と取り違えると、`&&` の後ろの
+        // 実行される `gh` が 1 つのセグメントに呑まれて、検査から落ちる。
+        for cmd in [
+            "echo [[ x && gh issue close 5 -R pub/a ]]",
+            "echo [[ x && gh issue close 5 -R pub/a && echo ]]",
+            "x=1 [[ a && gh issue close 5 -R pub/a ]]",
+            "cmd arg[[ a && gh issue close 5 -R pub/a ]]",
+        ] {
+            assert_eq!(close_repos(cmd), ["pub/a"], "{cmd}");
+        }
+        // `]]` が来ないまま文が終わる `[[` は、条件式として扱わず、分割し直す。
+        for cmd in [
+            "[[ a && gh issue close 5 -R pub/a",
+            "[[ a && gh issue close 5 -R pub/a ; echo",
+            "[[ a && gh issue close 5 -R pub/a\necho ]]",
+        ] {
+            assert_eq!(close_repos(cmd), ["pub/a"], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn variable_command_after_a_double_bracket_is_still_opaque() {
+        for cmd in [
+            "[[ -n $a && -n $b ]] && \"$cmd\" --x",
+            "if [[ a && b ]]; then $f x; fi",
+            "f=gh; $f issue close 5 -R pub/a",
+        ] {
+            assert!(
+                opaque_codes(cmd).contains(&Some("opaque-exec")),
+                "{cmd}: {:?}",
+                opaque_codes(cmd)
+            );
+        }
     }
 
     #[test]
