@@ -1124,7 +1124,18 @@ cmd_scan_push() {
   require_orgs_file
   build_patterns
   if match_verdict "$text"; then
-    emit_verdict "$VERDICT" "$(verdict_reason "$VERDICT" "$MATCH_CLASS")" "$(reason_id_for_verdict "$VERDICT" "$MATCH_CLASS")" "$MATCH_CLASS" "$MATCH_TERM"
+    local verdict="$VERDICT" class="$MATCH_CLASS" term="$MATCH_TERM"
+    local reason dir="${TARGET_CWD:-.}" default_branch base
+    reason="$(verdict_reason "$verdict" "$class")"
+    # #128: 一致した commit と場所を添える。範囲は compute_push_diff_text と同じ
+    # merge-base..HEAD(ここまで来たので、default branch と merge-base は解決できている)。
+    default_branch="$(resolve_default_branch)"
+    base="$(git -C "$dir" merge-base HEAD "origin/$default_branch" 2> /dev/null)" || base=''
+    if [[ -n $base ]]; then
+      push_range=("$base..HEAD")
+      reason+="$(push_match_note "$dir")"
+    fi
+    emit_verdict "$verdict" "$reason" "$(reason_id_for_verdict "$verdict" "$class")" "$class" "$term"
   fi
   exit 0
 }
@@ -1153,19 +1164,92 @@ push_range_for_ref() {
 # 一致が context 行なのか中間 commit の patch なのかを切り分けられなかった)。
 # 語は出さない。100 commit を超える範囲は属性づけを諦めて空を返す。
 # match_verdict のグローバル(VERDICT 等)を壊すので、呼び出し側は先に退避する。
+# 出力は 1 行目が短い SHA、2 行目(任意)がその commit の中の場所(locate_match_in_commit、#128)。
 # $1=dir、範囲は配列 push_range。
 attribute_commit() {
-  local dir="$1" sha t n=0
+  local dir="$1" sha t n=0 class term
   while IFS= read -r sha; do
     [[ -n $sha ]] || continue
     n=$((n + 1))
     ((n <= 100)) || return 0
     t="$(diff_text_for_range "$dir" -1 "$sha")" || continue
     if match_verdict "$t"; then
+      # この commit に当たった語と種別(全体の判定の語とは別でありうる)で場所を探す。
+      class="$MATCH_CLASS" term="$MATCH_TERM"
       git -C "$dir" rev-parse --short "$sha" 2>/dev/null
+      locate_match_in_commit "$dir" "$sha" "$class" "$term"
       return 0
     fi
   done < <(git -C "$dir" rev-list "${push_range[@]}" 2>/dev/null)
+  return 0
+}
+
+# locate_match_in_commit: 1 つの commit の中で、語が当たった場所を 1 行で印字する(#128)。
+# $1=dir $2=sha $3=match_class $4=一致した語(平文)。「<パス> の第 N 行」(追加行。N は
+# 新しい側のファイルの行番号)、「ファイル名」、「コミットメッセージ」のいずれか。見つからな
+# ければ何も印字しない。#116 の線は守る: 語・語の長さ・桁は出さない。パスは、パス自体が
+# denylist に当たるとき(パスに非公開名がある)は書かず、安全な文字([A-Za-z0-9_./-])だけで
+# 書かれていないときは「?」と書く(README「Where the match is」の欄名の規則と同じ)。
+# match_verdict のグローバルを壊す(呼び出し側 attribute_commit が先に退避している)。
+locate_match_in_commit() {
+  local dir="$1" sha="$2" class="$3" term="$4"
+  local rows contents n row path line label names msgs
+  # 追加行を `パス<TAB>新しい側の行番号<TAB>行の中身` に直す(-U0 なので文脈行は無い)。
+  # 見出しの `+++ ` は、`diff --git` の直後から最初の `@@` までの間だけ(追加行の中身が
+  # `++ ` で始まっても見出しと取り違えない)。
+  rows="$(git -C "$dir" log -p --diff-merges=first-parent --no-renames --unified=0 --format= -1 "$sha" 2> /dev/null | awk '
+    /^diff --git / { inh = 0; path = ""; next }
+    !inh && /^\+\+\+ / { p = substr($0, 5); if (p == "/dev/null") { path = "" } else { sub(/^b\//, "", p); path = p }; next }
+    /^@@ / { inh = 1; if (match($0, /\+[0-9]+/)) { ln = substr($0, RSTART + 1, RLENGTH - 1) + 0 }; next }
+    inh && /^\+/ { printf "%s\t%d\t%s\n", path, ln, substr($0, 2); ln++ }
+  ')" || rows=''
+  if [[ -n $rows ]]; then
+    contents="$(cut -f3- <<< "$rows")"
+    if n="$(match_line_no "$class" "$term" "$contents")"; then
+      row="$(sed -n "${n}p" <<< "$rows")"
+      path="$(cut -f1 <<< "$row")"
+      line="$(cut -f2 <<< "$row")"
+      if [[ $path =~ ^[A-Za-z0-9_./-]+$ ]]; then
+        if match_verdict "$path"; then
+          label='パスに一致を含むファイル'
+        else
+          label="$path"
+        fi
+      else
+        label='?'
+      fi
+      if [[ $label == パスに* ]]; then
+        printf '%sの第 %s 行' "$label" "$line"
+      else
+        printf '%s の第 %s 行' "$label" "$line"
+      fi
+      return 0
+    fi
+  fi
+  names="$(git -C "$dir" log --diff-merges=first-parent --no-renames --diff-filter=A --name-only --format= -1 "$sha" 2> /dev/null)" || names=''
+  if [[ -n $names ]] && match_line_no "$class" "$term" "$names" > /dev/null; then
+    printf 'ファイル名'
+    return 0
+  fi
+  msgs="$(git -C "$dir" log --format=%B -1 "$sha" 2> /dev/null)" || msgs=''
+  if [[ -n $msgs ]] && match_line_no "$class" "$term" "$msgs" > /dev/null; then
+    printf 'コミットメッセージ'
+    return 0
+  fi
+  return 0
+}
+
+# push_match_note: push_range の中で最初に一致した commit と、その中の場所を、理由文に
+# 足す断片(先頭が空白)として印字する。特定できなければ何も印字しない。
+# $1=dir、範囲は配列 push_range。
+push_match_note() {
+  local dir="$1" out sha loc=''
+  out="$(attribute_commit "$dir")" || return 0
+  sha="${out%%$'\n'*}"
+  [[ -n $sha ]] || return 0
+  [[ $out == *$'\n'* ]] && loc="${out#*$'\n'}"
+  printf ' 一致した commit: %s(git show %s で確認できます)。' "$sha" "$sha"
+  [[ -n $loc ]] && printf ' 一致した場所: %s。' "$loc"
   return 0
 }
 
@@ -1214,14 +1298,14 @@ cmd_scan_pre_push() {
   build_patterns
   if match_verdict "$text"; then
     local verdict="$VERDICT" class="$MATCH_CLASS" term="$MATCH_TERM"
-    local reason sha='' r
+    local reason note='' r
     reason="$(verdict_reason "$verdict" "$class")"
     for r in "${all_ranges[@]}"; do
       read -r -a push_range <<< "$r"
-      sha="$(attribute_commit "$dir")"
-      [[ -n $sha ]] && break
+      note="$(push_match_note "$dir")"
+      [[ -n $note ]] && break
     done
-    [[ -n $sha ]] && reason+=" 一致した commit: ${sha}(git show ${sha} で確認できます)。"
+    reason+="$note"
     emit_verdict "$verdict" "$reason" "$(reason_id_for_verdict "$verdict" "$class")" "$class" "$term"
   fi
   exit 0
@@ -1925,6 +2009,16 @@ acme で議論した"
     echo "FAIL: compute_push_diff_text が diff 内の denylist 文字列を拾わなかった" >&2
     fails=$((fails + 1))
   }
+
+  # #128: 引数なしの scan-push(従来の経路)の理由文にも、一致した commit と場所が出る。
+  local legacy_out legacy_rc
+  set +e
+  legacy_out="$(cd "$repo" && "$SELF" scan-push 2>&1)"
+  legacy_rc=$?
+  set -e
+  [[ $legacy_rc -eq 2 ]] || { echo "FAIL(引数なし scan-push: deny): rc=$legacy_rc out=$legacy_out" >&2; fails=$((fails + 1)); }
+  [[ $legacy_out == *"一致した場所: a.txt の第 2 行"* ]] || { echo "FAIL(引数なし scan-push: 場所が出る): out=$legacy_out" >&2; fails=$((fails + 1)); }
+  [[ $legacy_out != *"secret-project"* ]] || { echo "FAIL(引数なし scan-push: 語が出ていない): out=$legacy_out" >&2; fails=$((fails + 1)); }
 
   # 追加行のみスキャン(#7)の回帰テスト群。共通ヘルパで独立リポジトリを作る。
   new_pushed_repo() { # $1=repo dir -> 初期コミット済み・push 済み・origin/HEAD 設定済みの repo を作る
@@ -2963,6 +3057,62 @@ STUB
   [[ $E2E_OUT == *"$e2e_sha"* ]] || { echo "FAIL(e2e: 理由文に一致した commit の SHA が出る): sha=$e2e_sha out=$E2E_OUT" >&2; fails=$((fails + 1)); }
   [[ $E2E_OUT != *"secret-project"* ]] || { echo "FAIL(e2e: 理由文に語が出ていない): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
   git -C "$e2e_remote" rev-parse -q --verify refs/heads/topic-leak > /dev/null 2>&1 && { echo "FAIL(e2e: 止めたはずのブランチが remote にある)" >&2; fails=$((fails + 1)); }
+
+  # #128: 理由文に、一致した場所(パスと、新しい側の行番号)が出る。語は出ない。
+  # (1) 追加行: パスが安全で、パス自体は denylist に当たらない。
+  git -C "$e2e" switch -q main
+  git -C "$e2e" switch -qc topic-loc-line
+  mkdir -p "$e2e/docs"
+  printf 'first\nsecond\nsee acme/secret-project here\n' > "$e2e/docs/notes.txt"
+  git -C "$e2e" add docs/notes.txt
+  git -C "$e2e" commit -qm "add notes"
+  set +e
+  e2e_push "$e2e" origin topic-loc-line
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL(e2e: 場所つき: 追加行の secret は止まる): push が通った" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT == *"一致した場所: docs/notes.txt の第 3 行"* ]] || { echo "FAIL(e2e: 場所つき: パスと行番号が出る): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT != *"secret-project"* ]] || { echo "FAIL(e2e: 場所つき: 語が出ていない): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  # (2) パス自体に denylist の語がある(語を含むディレクトリ名)。パスも語も出さず、行番号だけ出す。
+  git -C "$e2e" switch -q main
+  git -C "$e2e" switch -qc topic-loc-path
+  mkdir -p "$e2e/docs/secret-project"
+  printf 'first\nacme/secret-project\n' > "$e2e/docs/secret-project/a.txt"
+  git -C "$e2e" add docs/secret-project/a.txt
+  git -C "$e2e" commit -qm "add under a named dir"
+  set +e
+  e2e_push "$e2e" origin topic-loc-path
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL(e2e: 場所つき: パスに語がある secret は止まる): push が通った" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT == *"一致した場所: パスに一致を含むファイルの第 2 行"* ]] || { echo "FAIL(e2e: 場所つき: パスを伏せて行番号だけ出る): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT != *"secret-project"* ]] || { echo "FAIL(e2e: 場所つき: パスにも語が出ていない): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  # (3) ファイル名だけが当たる(追加行は無い空ファイル)。
+  git -C "$e2e" switch -q main
+  git -C "$e2e" switch -qc topic-loc-name
+  mkdir -p "$e2e/secret-project"
+  : > "$e2e/secret-project/keep"
+  git -C "$e2e" add secret-project/keep
+  git -C "$e2e" commit -qm "add an empty file"
+  set +e
+  e2e_push "$e2e" origin topic-loc-name
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL(e2e: 場所つき: ファイル名の secret は止まる): push が通った" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT == *"一致した場所: ファイル名。"* ]] || { echo "FAIL(e2e: 場所つき: ファイル名と出る): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT != *"secret-project"* ]] || { echo "FAIL(e2e: 場所つき: ファイル名の語が出ていない): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  # (4) コミットメッセージだけが当たる。
+  git -C "$e2e" switch -q main
+  git -C "$e2e" switch -qc topic-loc-msg
+  echo msg >> "$e2e/f.txt"
+  git -C "$e2e" commit -qam "mention acme/secret-project in the message"
+  set +e
+  e2e_push "$e2e" origin topic-loc-msg
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL(e2e: 場所つき: メッセージの secret は止まる): push が通った" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT == *"一致した場所: コミットメッセージ。"* ]] || { echo "FAIL(e2e: 場所つき: コミットメッセージと出る): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
+  [[ $E2E_OUT != *"secret-project"* ]] || { echo "FAIL(e2e: 場所つき: メッセージの語が出ていない): out=$E2E_OUT" >&2; fails=$((fails + 1)); }
 
   # 既存ブランチの更新(remote-sha が手元にある)+ クリーンは通る。
   git -C "$e2e" switch -q topic-clean
