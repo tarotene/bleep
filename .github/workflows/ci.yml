@@ -55,6 +55,24 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      # crates.io に出す中身(Cargo.toml の include)が組めて、その中身だけで
+      # ビルドが通ること。include の書き漏らし(README・LICENSE・src のファイル)を
+      # publish の前に捕まえる。
+      - name: cargo package
+        run: cargo package --locked
+
+      # Claude Code は plugin.json の version を最優先して更新を判定するので、
+      # クレートの版とずれると、プラグインの利用者が古い Bash 本体のままになる。
+      # 版は Release-plz のリリース PR が両方そろえる(release-plz.yml)。
+      - name: plugin.json の version が Cargo.toml と一致する
+        run: |
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          plugin="$(jq -r '.version' .claude-plugin/plugin.json)"
+          if [ "$crate" != "$plugin" ]; then
+            echo "::error file=.claude-plugin/plugin.json::version ($plugin) が Cargo.toml の version ($crate) と一致しません"
+            exit 1
+          fi
+
   docs:
     name: API docs
     runs-on: ubuntu-latest

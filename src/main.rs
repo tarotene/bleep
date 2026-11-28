@@ -27,11 +27,14 @@ usage: bleep-hook --host=<claude|codex|copilot>
        bleep-hook lex [--cwd DIR] -- CMD
        bleep-hook intent [--cwd DIR] -- CMD
        bleep-hook --protocol
+       bleep-hook --version
        bleep-hook hash --key-file FILE -- TERM
 
 --host=<name>   PreToolUse hook adapter モード。stdin から host 固有の JSON
                 を読み、BLEEP_BIN(既定 \"bleep\")を呼び出して
                 判定結果を host 固有の出力 JSON に翻訳する。
+--version, -V   このバイナリの版(`bleep-hook <版>`)を1行印字する。
+                bleep(Bash)本体・プラグインと同じ版かを確かめるのに使う。
 --protocol      lex の出力形式の版(整数)を1行印字する。`bleep doctor` が
                 bash 本体との整合の検査に使う。
 lex             bleep(Bash)本体の cmd_scan_bash_command から呼ばれる
@@ -184,6 +187,10 @@ fn main() -> ExitCode {
         }
         if first == "--protocol" {
             println!("{LEX_PROTOCOL}");
+            return ExitCode::SUCCESS;
+        }
+        if first == "--version" || first == "-V" {
+            println!("bleep-hook {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         if first == "--help" || first == "-h" {
