@@ -1,6 +1,6 @@
 [package]
 name = "bleep-hook"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "PreToolUse hook adapter and command lexer for bleep, a gate that stops AI coding agents from leaking private repository names onto public GitHub"
 license = "MIT"
