@@ -42,6 +42,16 @@ const CORPUS: &[Case] = &[
     ),
     case("true || gh issue close 5 -R pub/a", false),
     case("env X=1 gh issue close 5 -R pub/a", true),
+    // `[[ … ]]`(#128)。コマンド位置の式の中の `&&`・`||` は区切りではなく、式の後ろの
+    // `&&` は区切り。引数の位置の `[[` は文字列なので、後ろの `gh` は実行される。
+    case("[[ -n a && -n b ]] && gh issue close 5 -R pub/a", true),
+    case("[[ -z '' || -n x ]] && gh issue close 5 -R pub/a", true),
+    case(
+        "if [[ a == a && b == b ]]; then gh issue close 5 -R pub/a; fi",
+        true,
+    ),
+    case("echo [[ x && gh issue close 5 -R pub/a ]]", true),
+    case("echo [[ x && gh issue close 5 -R pub/a && echo ]]", true),
     // 制御キーワードの直後(#122)。実行される分岐は exact、実行されないかもしれない分岐は過剰側
     case("if true; then gh issue close 5 -R pub/a; fi", true),
     case("for c in a; do gh issue close 5 -R pub/a; done", true),
