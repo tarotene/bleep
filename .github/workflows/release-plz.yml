@@ -38,14 +38,10 @@ jobs:
           client-id: ${{ secrets.RELEASER_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
-      # 下の「plugin.json の version」step がリリース PR の branch へ push するので、
-      # この job の checkout だけ credential を残し、App token を使う。既定の
-      # GITHUB_TOKEN で push すると、PR の CI が再帰的に起動しない(上のコメント)。
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-          token: ${{ steps.generate-token.outputs.token }}
-          persist-credentials: true
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -65,11 +61,16 @@ jobs:
       # https://code.claude.com/docs/en/plugins/loading.md、取得 2026-11-28)。一方
       # release-plz は Cargo.toml 以外のファイルの版を書き換えない
       # (release-plz/release-plz#1024、Open)。そこで、リリース PR の branch に、
-      # plugin.json の version を PR の版へそろえる commit を足す。公式の
-      # "Example: commit files to the release PR" の形
-      # (https://release-plz.dev/docs/github/output、取得 2026-11-28)。
+      # plugin.json の version を PR の版へそろえる commit を足す。
       # release-plz は PR を更新するたびに branch を作り直すので、毎回実行する。
       # 版が同じなら何もしない。ci.yml が、この 2 つの版の一致を検査する。
+      #
+      # commit は git push でなく、Contents API で作る。このリポジトリの Quality
+      # Ruleset は署名された commit を求め、リリース PR に署名の無い commit が 1 つでも
+      # あると、マージ画面が "Commits must have verified signatures" で止まる
+      # (2026-11-28、git push で足した commit が `unsigned` でマージできなかった)。
+      # API で作った commit は GitHub が署名する(release-plz 自身の commit も同じ)。
+      # App の token を使うので、PR の CI も起動する。
       - name: Sync the plugin.json version into the release PR
         env:
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
@@ -81,18 +82,20 @@ jobs:
             exit 0
           fi
           version="$(jq -r '.releases[0].version' <<< "$PR")"
-          gh pr checkout "$pr_number"
-          jq --arg v "$version" '.version = $v' .claude-plugin/plugin.json > "$RUNNER_TEMP/plugin.json"
-          cp "$RUNNER_TEMP/plugin.json" .claude-plugin/plugin.json
-          if git diff --quiet -- .claude-plugin/plugin.json; then
+          branch="$(gh pr view "$pr_number" --json headRefName --jq '.headRefName')"
+          path=".claude-plugin/plugin.json"
+          current="$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$branch")"
+          jq -r '.content' <<< "$current" | base64 -d > "$RUNNER_TEMP/plugin.current.json"
+          jq --arg v "$version" '.version = $v' "$RUNNER_TEMP/plugin.current.json" > "$RUNNER_TEMP/plugin.json"
+          if cmp -s "$RUNNER_TEMP/plugin.current.json" "$RUNNER_TEMP/plugin.json"; then
             echo "plugin.json is already at $version"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .claude-plugin/plugin.json
-          git commit -m "chore: sync the plugin version to $version"
-          git push
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message="chore: sync the plugin version to $version" \
+            -f branch="$branch" \
+            -f sha="$(jq -r '.sha' <<< "$current")" \
+            -f content="$(base64 -w0 "$RUNNER_TEMP/plugin.json")"
 
   # リリース PR がマージされたら GitHub Release + git tag を作り、
   # crates.io へ publish する(OIDC Trusted Publishing、id-token: write)。
