@@ -495,6 +495,16 @@ build_patterns() {
   # filter_stopwords の後に降格処理を行うため自然にここへ現れない。
   local -A live_nwo_of=()
 
+  # #128: 自分の GitHub ログイン名と同じ名前のリポジトリ(別の owner・org にある)は、裸の
+  # 語としては denylist に入れない。ログイン名は公開の情報で、ホームのパス・メール
+  # アドレス・自分の公開リポジトリへの参照に必ず現れ、裸の語で hard-deny すると
+  # 正当な書き込みが止まり続ける。"owner/name" 形(repos.txt と orgs.txt の `org/`
+  # 接頭辞は PLAIN_PATTERNS、live sweep の行は NWO_HARD)は残すので、そのリポジトリへの
+  # 明示的な参照は引き続き拒否する。ログイン名を解決できないとき(gh の失敗・
+  # キャッシュ無し)は空になり、従来どおり裸の語で拒否する(緩める向きに倒さない)。
+  local login=''
+  login="$(resolve_owner_login 2> /dev/null)" || login=''
+
   while IFS= read -r org; do
     [[ -n $org ]] || continue
     PLAIN_PATTERNS+=("${org}/")
@@ -505,7 +515,9 @@ build_patterns() {
     [[ -n $nwo ]] || continue
     PLAIN_PATTERNS+=("$nwo")
     repo="${nwo#*/}"
-    [[ -n $repo && $repo != "$nwo" ]] && WORD_HARD+=("$repo")
+    [[ -n $repo && $repo != "$nwo" ]] || continue
+    [[ -n $login && ${repo,,} == "${login,,}" ]] && continue
+    WORD_HARD+=("$repo")
   done < <(read_lines "$REPOS_FILE")
 
   # live sweep(#44): private_repo_names は "owner/name" 形を返す(旧形式の
@@ -517,6 +529,10 @@ build_patterns() {
     [[ -n $nwo ]] || continue
     repo="${nwo#*/}"
     if [[ -n $repo && $repo != "$nwo" ]]; then
+      if [[ -n $login && ${repo,,} == "${login,,}" ]]; then
+        NWO_HARD+=("$nwo") # #128: 裸のログイン名は拒否せず、owner/name 形だけ残す
+        continue
+      fi
       WORD_HARD+=("$repo")
       live_nwo_of["$repo"]="$nwo"
     else
@@ -1523,7 +1539,12 @@ selftest() {
 # 有無であり、private/internal の呼び分け自体は本体側の実装(--visibility
 # を private/internal で2回呼ぶ)でカバーする。
 case "$1 $2" in
-  "repo list") printf 'test-owner/my-private-tool\ntest-owner/wren\n' ;;
+  "repo list")
+    printf 'test-owner/my-private-tool\ntest-owner/wren\n'
+    # #128: 会社側の org に、自分のログイン名と同名の非公開リポジトリがある。
+    [[ ${3-} == acme ]] && printf 'acme/test-owner\n'
+    exit 0
+    ;;
   "repo view") printf 'PUBLIC' ;;
   "api user") printf 'test-owner' ;;
   *) exit 1 ;;
@@ -1558,6 +1579,28 @@ STUB
   expect_verdict pass "これは無関係な文章です"
   expect_verdict pass "academia という単語だけの文章"
 
+  # #128: 会社側の org に、自分のログイン名(test-owner)と同名の非公開リポジトリが
+  # ある(gh スタブが acme/test-owner を返す)。裸のログイン名は、ホームのパス・
+  # メールアドレス・自分の公開リポジトリへの参照に現れるので、拒否しない。
+  expect_verdict pass "/home/test-owner/src/project を読んだ"
+  expect_verdict pass "連絡先は test-owner@example.com です"
+  expect_verdict pass "uses: test-owner/public-tool/.github/actions/x@main を足した"
+  # 負例: そのリポジトリへの明示的な参照(org/name 形)は、引き続き拒否する。
+  expect_verdict deny "acme/test-owner の話"
+  expect_verdict deny "https://github.com/acme/test-owner/issues/1"
+  # 負例: 別の非公開リポジトリ名の裸の語は、引き続き拒否する。
+  expect_verdict deny "my-private-tool のドリフトを見つけた"
+  # 負例: ログイン名を解決できないときは、緩めず、従来どおり裸の語で拒否する。
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$tmp/bin-gh-fail"
+  chmod +x "$tmp/bin-gh-fail"
+  local saved_gh="$GH_BIN" saved_owner="$OWNER"
+  GH_BIN="$tmp/bin-gh-fail"
+  OWNER=''
+  rm -f "$OWNER_CACHE"
+  expect_verdict deny "/home/test-owner/src/project を読んだ"
+  GH_BIN="$saved_gh"
+  OWNER="$saved_owner"
+
   # explain(#44): レッジャーの term_hash から現在の denylist の一致語を
   # 平文で復元できること。判定エンジン(match_verdict)には触れないので
   # build_patterns の呼び直しだけで検証できる。
@@ -1575,6 +1618,11 @@ STUB
   }
   if cmd_explain "$(term_hash no-such-term-xyz)" > /dev/null 2>&1; then
     echo "FAIL(explain: 未知の hash は非 0 を返すべき)" >&2
+    fails=$((fails + 1))
+  fi
+  # #128: ログイン名は裸の語として denylist に無い(explain が一致を返さない)。
+  if cmd_explain "$(term_hash test-owner)" > /dev/null 2>&1; then
+    echo "FAIL(explain: 自分のログイン名は denylist の語であってはならない)" >&2
     fails=$((fails + 1))
   fi
   if cmd_explain 'not-a-hash' > /dev/null 2>&1; then

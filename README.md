@@ -137,6 +137,20 @@ per line instead of a bare name, so this downgrade has an owner to fall back
 to; an old-format cache from before #44 is detected and refreshed
 automatically the next time it's read.
 
+### A repo named like your own login
+
+Your GitHub login is public, and it shows up in home paths, e-mail addresses, and
+references to your own public repos. If a private repo in one of your orgs happens
+to have the same name as your login, a bare-word hard-`deny` on that name would
+block every such write (#128). So a repo whose name equals the authenticated login
+(case-insensitive; `BLEEP_OWNER`, or `gh api user` as for the live sweep) is not
+added to the bare-word list at all — no `allow-stopwords.txt` entry is needed. Its
+`owner/name` form stays denied: for a live-swept repo as a word-boundary match, for
+an org in `orgs.txt` through the `org/` prefix, and for `repos.txt` through its
+`org/repo` line. A bare name from a private repo that is *not* named like your login
+is unaffected. When the login can't be resolved (no `BLEEP_OWNER`, no cached login,
+and `gh api user` fails), nothing is relaxed and the bare name is denied as before.
+
 ### Marking a private repo as "prospectively public"
 
 A personal side project that's private only because it isn't polished yet
