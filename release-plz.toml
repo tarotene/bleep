@@ -2,13 +2,24 @@
 # bleep-hook は単一クレート(Cargo workspace ではない)なので、
 # rust-repo-governance テンプレートが行う「canonical crate だけがタグを
 # 持つ」分割は不要 — [workspace] レベルで直接有効化する。
-# bleep-hook は publish = false(crates.io に載せない)。既定の release-plz は版を
-# crates.io で確かめるため、載っていないこのクレートでは毎回「nothing to release」に
-# なり、tag も release も切られなかった。git_only は版を git tag から決める
-# モードで、publish = false のクレートも tag され、tag が無ければ初回 release として
-# 扱われる。
-# release-plz, "Configuration — git_only", https://release-plz.dev/docs/config
-# (取得 2026-10-19)
+# git_only は、版を crates.io でなく git tag から決めるモードで、このモードの間は
+# `cargo publish` を実行しない("The package will not be published to any cargo
+# registry"、release-plz, "Configuration — git_only",
+# https://release-plz.dev/docs/config、取得 2026-11-28)。
+#
+# bleep-hook がまだ crates.io に載っていないので、既定(registry モード)では毎回
+# 「nothing to release」になり、tag も GitHub Release も切られない。そのため今は
+# git_only にしている。crates.io に出す手順は次の順で、順序を変えない:
+#   1. git_only のまま、リリース PR をマージして tag `vX.Y.Z` を切る
+#   2. その tag から人が手で `cargo publish` する(新しいクレートは Trusted Publishing で
+#      出せず、API token が要る。"new crates can't be published with trusted publishing",
+#      release-plz, "Quickstart", https://release-plz.dev/docs/github/quickstart、
+#      取得 2026-11-28)
+#   3. crates.io の Trusted Publishing に release-plz.yml を登録する
+#   4. この git_only の行を消す(registry モードに戻す)
+# 4 を 2 より先にすると、tag はあるのに crates.io にその版が無い状態になり、
+# release-pr が "not found in the registry, but the git tag … exists" で止まる
+# (release-plz の crates/release_plz_core/src/command/update/updater.rs)。
 git_only = true
 git_release_enable = true
 git_tag_enable = true
