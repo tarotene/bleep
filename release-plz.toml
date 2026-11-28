@@ -20,27 +20,29 @@ pr_labels = ["release"]
 dependencies_update = false
 release_commits = "^(feat|fix|perf|refactor)"
 
+# 見出しの `[X.Y.Z](URL)` は 1 つのリンクにする。URL は release-plz が渡す
+# `release_link`(前の版との比較。tag 名は git_tag_name と同じ `v` 付き)を使う。
+# URL を直書きして `v` を付けない比較リンクを組むと、tag に当たらず切れていた。
+# 各行の PR 番号のリンクはテンプレートでは足さない。squash merge のコミット題名は
+# 末尾に `(#N)` を持ち、release-plz の既定の前処理が `([#N](…))` に直すので、
+# `commit.remote.pr_number` のリンクを足すと同じリンクが 2 つ並んだ(v0.2.1 のリリース
+# PR で確認)。`commit.remote` を使わないので、手元の `release-plz update` に GitHub の
+# token も要らない。
 [changelog]
 body = """
-{% if version %}\
-## [{{ version | trim_start_matches(pat="v") }}] \
-{%- if previous %}\
-{%- if previous.version %}\
-([`{{ version | trim_start_matches(pat="v") }}`](https://github.com/tarotene/bleep/compare/{{ previous.version }}..{{ version }}))\
-{% endif %}\
-{% endif %} — {{ timestamp | date(format="%Y-%m-%d") }}
+{% if version %}
+## [{{ version | trim_start_matches(pat="v") }}]\
+{% if release_link %}({{ release_link }}){% endif %} — {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
 ## [Unreleased]
 {% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | striptags | trim | upper_first }}
-{% for commit in commits | filter(attribute="merge_commit", value=false) %}
+
+{% for commit in commits | filter(attribute="merge_commit", value=false) %}\
 - {% if commit.breaking %}**[BREAKING]** {% endif %}\
 {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
-{{ commit.message | upper_first }}\
-{% if commit.remote.pr_number %} \
-([#{{ commit.remote.pr_number }}](https://github.com/tarotene/bleep/pull/{{ commit.remote.pr_number }}))\
-{% endif %}
-{% endfor %}
+{{ commit.message | upper_first }}
+{% endfor %}\
 {% endfor %}
 """
