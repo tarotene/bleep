@@ -604,6 +604,18 @@ limited to short `[A-Za-z0-9_-]` keys (anything else shows as `?`), and the fiel
 list reaches `bleep` in `BLEEP_FIELD_MAP`, dropped when it would exceed 32 KiB (the
 reason then says `入力の第 N 行`).
 
+For a push or a commit (`scan-push`, both the `--pre-push` path the git hooks use
+and the argument-less compatibility path; #128), the reason names the first
+commit that matched (`一致した commit: <short sha>`) and, inside that commit, where:
+`一致した場所: <path> の第 N 行` for an added line (N counts lines in the new
+version of the file), `ファイル名` when only a newly added file name matched, or
+`コミットメッセージ` when only the message did. The path is shown only when it is
+made of `[A-Za-z0-9_./-]` and does not itself match the denylist — otherwise the
+reason says `パスに一致を含むファイルの第 N 行` (no path) or `?`, so a private name
+in a directory name does not leak through the location. Without the location, an
+agent had to split a change into pieces and commit them one by one to find the
+offending line, which a permission check then read as an attempt to evade the check.
+
 ## Scope
 
 This repository owns the decision-engine CLI (`scan`/`scan-push`/
